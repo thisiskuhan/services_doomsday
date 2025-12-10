@@ -1,0 +1,76 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.js
+
+# Next.js
+app/web/.next/
+app/web/out/
+.next/
+out/
+
+# Production build
+build/
+dist/
+
+# Environment files
+.env
+.env.*
+!.env.example
+app/web/.env
+app/web/.env.*
+!app/web/.env.example
+
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# Testing
+coverage/
+.nyc_output/
+
+# Misc
+*.log
+*.pid
+*.seed
+*.pid.lock
+Thumbs.db
+
+# Certificates
+*.pem
+!*.example.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+.venv/
+venv/
+ENV/
+
+# Kestra
+app/kestra_workflows/.kestra/
+
+# Vercel
+.vercel
+
+
+services_doomsday/app/ca.pem
+services_doomsday/whiteboard
