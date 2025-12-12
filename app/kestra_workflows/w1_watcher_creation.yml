@@ -1,0 +1,1248 @@
+id: w1_watcher_creation
+namespace: doomsday.watchers
+
+description: |
+  Watcher Creation Workflow (W1)
+  
+  EXECUTION ORDER:
+  1. Clone repository and discover code entities (with unique IDs)
+  2. REPO-LEVEL LLM analysis (full codebase context via Repomix)
+  3. GREP + AST dependency detection (find what calls what)
+  4. PER-CANDIDATE LLM analysis (with repo context + dependencies + code snippet)
+  5. Store watcher and candidates with dependency signatures
+  
+  DB Schema Compliance:
+  - Watchers: llm_business_context (TEXT), llm_tech_stack (JSONB),
+              llm_architecture (TEXT), llm_health (JSONB), llm_zombie_risk (JSONB)
+  - Candidates: llm_purpose (TEXT), llm_risk_score (DECIMAL 0.00-1.00), 
+                llm_risk_reasoning (TEXT), depends_on_signatures (TEXT[]),
+                dependency_count, caller_count
+
+labels:
+  team: doomsday
+  category: watcher-management
+  stage: creation
+  version: "2.0"
+
+inputs:
+  - id: watcher_id
+    type: STRING
+    description: Unique watcher identifier (UUID from frontend)
+    required: true
+
+  - id: watcher_name
+    type: STRING
+    description: User-defined watcher name
+    required: true
+
+  - id: repo_url
+    type: STRING
+    description: GitHub repository URL
+    required: true
+
+  - id: repo_description
+    type: STRING
+    description: User-provided context for LLM analysis
+    required: true
+
+  - id: default_branch
+    type: STRING
+    description: Repository default branch
+    required: true
+    defaults: "main"
+
+  - id: user_id
+    type: STRING
+    description: User identifier from authentication
+    required: true
+
+  - id: github_token
+    type: STRING
+    description: GitHub PAT for private repos
+    required: false
+
+  - id: application_url
+    type: STRING
+    description: Application base URL for endpoint monitoring
+    required: false
+
+  - id: observability_urls
+    type: ARRAY
+    description: Observability source URLs
+    required: false
+    itemType: STRING
+
+variables:
+  repo_name: "{{ inputs.repo_url | replace({'https://github.com/': '', '.git': ''}) | trim('/') }}"
+  # Source: kestra_kv.yml → key: w1_llm
+  llm_model: "{{ kv('w1_llm') }}"
+
+tasks:
+  # ============================================================================
+  # STAGE 1: Clone Repository & Discover Code Entities
+  # ============================================================================
+  - id: clone_and_discover
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    description: Clone repository and discover all code entities with unique IDs
+    tasks:
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        description: Clone GitHub repository
+        retry:
+          type: exponential
+          maxAttempts: 3
+          interval: PT5S
+          maxInterval: PT1M
+        timeout: PT5M
+        url: "{{ inputs.repo_url }}"
+        username: "{{ inputs.github_token != null ? 'oauth2' : null }}"
+        password: "{{ inputs.github_token }}"
+        branch: "{{ inputs.default_branch }}"
+
+      - id: discover_entities
+        type: io.kestra.plugin.scripts.python.Script
+        description: Scan codebase for endpoints, crons, queues with unique IDs and code snippets
+        timeout: PT10M
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        outputFiles:
+          - discovery.json
+          - candidates_with_code.json
+        script: |
+          import os
+          import re
+          import json
+          import hashlib
+          from pathlib import Path
+          
+          REPO_DIR = "{{ outputs.clone_repo.directory }}"
+          
+          def extract_nextjs_route(file_path):
+              match = re.search(r'(?:src/)?app(/api/[^/]+(?:/[^/]+)*)/route\.[jt]sx?$', file_path)
+              if match:
+                  return match.group(1)
+              match = re.search(r'(?:src/)?pages(/api/[^/]+(?:/[^/]+)*)\.[jt]sx?$', file_path)
+              if match:
+                  return match.group(1)
+              return '/unknown'
+          
+          def generate_unique_id(entity_type, signature, file_path, line):
+              key = f"{entity_type}:{signature}:{file_path}:{line}"
+              return hashlib.md5(key.encode()).hexdigest()[:12]
+          
+          entities = {
+              "http_endpoints": [],
+              "grpc_services": [],
+              "graphql_resolvers": [],
+              "cron_jobs": [],
+              "queue_workers": [],
+              "serverless_functions": [],
+              "websockets": []
+          }
+          
+          candidates_with_code = []
+          
+          CODE_EXT = ('.py', '.js', '.ts', '.jsx', '.tsx', '.go', '.java', '.rb', '.php', '.rs', '.kt', '.cs')
+          SKIP_DIRS = {'node_modules', 'venv', '.venv', '__pycache__', '.git', 'dist', 'build', 'vendor', '.next', 'target', 'coverage'}
+          
+          PATTERNS = {
+              "http": [
+                  (r'@(?:app|router)\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)', 'fastapi'),
+                  (r'(?:app|router)\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)', 'express'),
+                  (r'@app\.route\s*\(\s*["\']([^"\']+)', 'flask'),
+                  (r'@(Get|Post|Put|Delete|Patch)\s*\(\s*["\']?([^"\'\)\s]*)', 'nestjs'),
+                  (r'export\s+(?:async\s+)?function\s+(GET|POST|PUT|DELETE|PATCH)', 'nextjs_api'),
+              ],
+              "grpc": [(r'service\s+(\w+)\s*\{', 'proto')],
+              "graphql": [(r'@Query\s*\(\s*\)', 'nestjs_gql'), (r'@Mutation\s*\(\s*\)', 'nestjs_gql')],
+              "cron": [
+                  (r'@(?:celery\.task|periodic_task|shared_task)', 'celery'),
+                  (r'cron\.schedule\s*\(\s*["\']([^"\']+)', 'node_cron'),
+                  (r'@Cron\s*\(\s*["\']([^"\']+)', 'nestjs_cron'),
+              ],
+              "queue": [
+                  (r'@(?:app\.task|shared_task)', 'celery'),
+                  (r'@Process\s*\(\s*["\']?([^"\']*)', 'bull'),
+              ],
+              "serverless": [
+                  (r'exports\.handler\s*=', 'aws_lambda'),
+                  (r'def\s+lambda_handler\s*\(', 'aws_lambda_py'),
+              ],
+              "websocket": [(r'@WebSocketGateway\s*\(\s*', 'nestjs_ws')],
+          }
+          
+          stats = {"files_scanned": 0, "total_entities": 0}
+          
+          for root, dirs, files in os.walk(REPO_DIR):
+              dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+              
+              for file in files:
+                  if not file.endswith(CODE_EXT):
+                      continue
+                  
+                  filepath = os.path.join(root, file)
+                  rel_path = os.path.relpath(filepath, REPO_DIR)
+                  
+                  try:
+                      with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                          content = f.read()
+                      
+                      stats["files_scanned"] += 1
+                      
+                      for category, patterns in PATTERNS.items():
+                          for pattern, framework in patterns:
+                              for match in re.finditer(pattern, content, re.MULTILINE | re.IGNORECASE):
+                                  line_num = content[:match.start()].count('\n') + 1
+                                  
+                                  lines = content.split('\n')
+                                  start_line = max(0, line_num - 10)
+                                  end_line = min(len(lines), line_num + 50)
+                                  code_snippet = '\n'.join(lines[start_line:end_line])
+                                  
+                                  entity = {
+                                      "source_file": rel_path,
+                                      "framework": framework,
+                                      "line": line_num,
+                                      "match": match.group(0)[:100]
+                                  }
+                                  
+                                  if category == "http":
+                                      groups = match.groups()
+                                      method = groups[0].upper() if groups else 'GET'
+                                      if framework == 'nextjs_api':
+                                          path = extract_nextjs_route(rel_path)
+                                      else:
+                                          path = groups[1] if len(groups) > 1 else '/'
+                                      entity.update({"method": method, "path": str(path)})
+                                      signature = f"{method}:{path}"
+                                      entities["http_endpoints"].append(entity)
+                                  elif category == "grpc":
+                                      entity["service_name"] = match.group(1) if match.groups() else "unknown"
+                                      signature = f"grpc:{entity['service_name']}"
+                                      entities["grpc_services"].append(entity)
+                                  elif category == "graphql":
+                                      entity["operation_type"] = "query" if "Query" in str(match.group(0)) else "mutation"
+                                      signature = f"gql:{entity['operation_type']}"
+                                      entities["graphql_resolvers"].append(entity)
+                                  elif category == "cron":
+                                      entity["schedule"] = match.group(1) if match.groups() else "scheduled"
+                                      signature = f"cron:{entity.get('schedule', 'unknown')}"
+                                      entities["cron_jobs"].append(entity)
+                                  elif category == "queue":
+                                      entity["queue_name"] = match.group(1) if match.groups() and match.group(1) else "default"
+                                      signature = f"queue:{entity['queue_name']}"
+                                      entities["queue_workers"].append(entity)
+                                  elif category == "serverless":
+                                      entity["function_name"] = match.group(1) if match.groups() and match.group(1) else rel_path
+                                      signature = f"fn:{entity.get('function_name', 'handler')}"
+                                      entities["serverless_functions"].append(entity)
+                                  elif category == "websocket":
+                                      entity["event_name"] = match.group(1) if match.groups() and match.group(1) else "connection"
+                                      signature = f"ws:{entity['event_name']}"
+                                      entities["websockets"].append(entity)
+                                  else:
+                                      signature = f"unknown:{rel_path}:{line_num}"
+                                  
+                                  unique_id = generate_unique_id(category, signature, rel_path, line_num)
+                                  entity["unique_id"] = unique_id
+                                  stats["total_entities"] += 1
+                                  
+                                  candidates_with_code.append({
+                                      "unique_id": unique_id,
+                                      "entity_type": category.rstrip('s') if category.endswith('s') else category,
+                                      "signature": signature,
+                                      "file_path": rel_path,
+                                      "line": line_num,
+                                      "framework": framework,
+                                      "code_snippet": code_snippet[:3000],
+                                      "entity_data": entity
+                                  })
+                  except Exception as e:
+                      print(f"Error processing {rel_path}: {e}")
+                      continue
+          
+          def dedupe(items):
+              seen = set()
+              unique = []
+              for item in items:
+                  key = f"{item.get('source_file')}:{item.get('line', 0)}"
+                  if key not in seen:
+                      seen.add(key)
+                      unique.append(item)
+              return unique
+          
+          for key in entities:
+              entities[key] = dedupe(entities[key])
+          
+          seen_ids = set()
+          unique_candidates = []
+          for c in candidates_with_code:
+              if c['unique_id'] not in seen_ids:
+                  seen_ids.add(c['unique_id'])
+                  unique_candidates.append(c)
+          candidates_with_code = unique_candidates
+          
+          result = {
+              "entities": entities,
+              "summary": {
+                  "files_scanned": stats["files_scanned"],
+                  "http_endpoints": len(entities["http_endpoints"]),
+                  "grpc_services": len(entities["grpc_services"]),
+                  "graphql_resolvers": len(entities["graphql_resolvers"]),
+                  "cron_jobs": len(entities["cron_jobs"]),
+                  "queue_workers": len(entities["queue_workers"]),
+                  "serverless_functions": len(entities["serverless_functions"]),
+                  "websockets": len(entities["websockets"]),
+                  "total": sum(len(v) for v in entities.values())
+              }
+          }
+          
+          with open('discovery.json', 'w') as f:
+              json.dump(result, f, indent=2)
+          
+          with open('candidates_with_code.json', 'w') as f:
+              json.dump(candidates_with_code, f, indent=2)
+          
+          print(f"Discovery: {stats['files_scanned']} files, {result['summary']['total']} entities")
+
+      - id: extract_git_metadata
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Extract git metadata from cloned repository
+        timeout: PT2M
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: alpine/git:latest
+        outputFiles:
+          - git_metadata.json
+        commands:
+          - |
+            cd {{ outputs.clone_repo.directory }}
+            
+            COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+            COMMIT_MSG=$(git log -1 --format='%s' 2>/dev/null | head -c 100 | tr '"' "'" || echo "")
+            COMMIT_AUTHOR=$(git log -1 --format='%an' 2>/dev/null || echo "unknown")
+            COMMIT_DATE=$(git log -1 --format='%aI' 2>/dev/null || echo "")
+            
+            cat > git_metadata.json << EOF
+            {
+              "last_commit_hash": "$COMMIT_HASH",
+              "last_commit_message": "$COMMIT_MSG",
+              "last_commit_author": "$COMMIT_AUTHOR",
+              "last_commit_date": "$COMMIT_DATE"
+            }
+            EOF
+            
+            echo "Git metadata extracted:"
+            cat git_metadata.json
+
+      - id: pack_codebase
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Pack entire codebase using Repomix for LLM analysis
+        timeout: PT5M
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: node:20-slim
+        outputFiles:
+          - repomix-output.txt
+        commands:
+          - |
+            npm install -g repomix 2>/dev/null || true
+            cd {{ outputs.clone_repo.directory }}
+            
+            repomix --output /tmp/repomix-output.txt \
+              --ignore "node_modules,dist,build,.next,coverage,*.lock,*.log" \
+              --style plain . 2>/dev/null || {
+              find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.py" \) \
+                ! -path "*/node_modules/*" ! -path "*/.git/*" \
+                -exec echo "--- {} ---" \; -exec head -100 {} \; > /tmp/repomix-output.txt 2>/dev/null
+            }
+            
+            head -c 500000 /tmp/repomix-output.txt > repomix-output.txt
+            echo "Codebase packed: $(wc -c < repomix-output.txt) bytes"
+
+  # ============================================================================
+  # STAGE 2: Repository-Level LLM Analysis (RUNS FIRST!)
+  # ============================================================================
+  - id: llm_repo_analysis
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      REPO-LEVEL LLM analysis - runs FIRST to get overall context.
+      Outputs: llm_business_context (TEXT), llm_tech_stack (JSONB), llm_architecture (TEXT),
+      llm_health (JSONB), llm_zombie_risk (JSONB)
+    timeout: PT10M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q google-genai
+    env:
+      REPO_DESCRIPTION: "{{ inputs.repo_description }}"
+      REPO_URL: "{{ inputs.repo_url }}"
+      WATCHER_NAME: "{{ inputs.watcher_name }}"
+      GOOGLE_API_KEY: "{{ secret('GOOGLE_AI_API_KEY') }}"
+      LLM_MODEL: "{{ vars.llm_model }}"
+    inputFiles:
+      discovery.json: "{{ outputs.discover_entities.outputFiles['discovery.json'] }}"
+      git_metadata.json: "{{ outputs.extract_git_metadata.outputFiles['git_metadata.json'] }}"
+      codebase.txt: "{{ outputs.pack_codebase.outputFiles['repomix-output.txt'] }}"
+    outputFiles:
+      - llm_repo_analysis.json
+    script: |
+      import os
+      import re
+      import json
+      
+      repo_description = os.environ.get('REPO_DESCRIPTION', '')
+      repo_url = os.environ.get('REPO_URL', '')
+      watcher_name = os.environ.get('WATCHER_NAME', '')
+      api_key = os.environ.get('GOOGLE_API_KEY')
+      llm_model = os.environ.get('LLM_MODEL')
+      
+      with open('discovery.json', 'r') as f:
+          discovery = json.load(f)
+      
+      with open('git_metadata.json', 'r') as f:
+          metadata = json.load(f)
+      
+      with open('codebase.txt', 'r', errors='ignore') as f:
+          codebase = f.read()
+      
+      result = {
+          "llm_enabled": False,
+          "llm_model": llm_model,
+          "llm_business_context": None,
+          "llm_tech_stack": {},
+          "llm_architecture": None,
+          "llm_health": {},
+          "llm_zombie_risk": {},
+          "llm_raw_response": {},
+          "error": None
+      }
+      
+      if not api_key:
+          result["error"] = "Google AI API key not configured"
+      else:
+          try:
+              from google import genai
+              client = genai.Client(api_key=api_key)
+              
+              summary = discovery.get("summary", {})
+              
+              system_prompt = """You are a senior software architect performing a comprehensive codebase audit. Your analysis will directly influence automated monitoring decisions, so precision and depth are critical.
+
+      CRITICAL CONSTRAINTS:
+      - Output MUST be valid, parseable JSON - no markdown, no explanations outside JSON
+      - NEVER expose secrets, credentials, API keys, tokens, or connection strings
+      - Base ALL assessments on concrete evidence from the code, not assumptions
+      
+      Analyze thoroughly and return this exact JSON structure:
+      {
+        "business_context": "Articulate the core business problem this software solves. Who are the end users? What value does it deliver? Be specific and actionable.",
+        "tech_stack": {
+          "languages": ["Primary and secondary languages detected"],
+          "frameworks": ["All frameworks, libraries, and major dependencies"],
+          "databases": ["Database systems, ORMs, caching layers"],
+          "infrastructure": ["Cloud services, containerization, CI/CD, monitoring tools"]
+        },
+        "architecture": "Describe the architectural pattern (monolith/microservices/serverless/hybrid). Explain data flow, key components, and how they interact. Highlight any architectural concerns.",
+        "health": {
+          "activity_level": "active|moderate|stale|abandoned - based on commit recency, open issues, dependency freshness",
+          "documentation_quality": "good|moderate|poor|none - README completeness, inline comments, API docs",
+          "test_coverage": "good|moderate|poor|unknown - presence of test files, test frameworks, coverage reports",
+          "code_quality": "good|moderate|poor|unknown - code organization, error handling, security practices, DRY principles"
+        },
+        "zombie_risk": {
+          "level": "low|medium|high",
+          "score": 0.0 to 1.0,
+          "reasoning": "Explain your risk assessment. Consider: Are there unused exports? Dead code paths? Deprecated patterns? Orphaned endpoints?",
+          "high_risk_areas": ["List specific files, functions, or modules that warrant close monitoring for potential zombie code"]
+        }
+      }"""
+              
+              user_prompt = f"""Perform a deep analysis of this repository. Your findings will be used to identify zombie (unused/dead) code.
+
+      📦 REPOSITORY METADATA
+      ├─ Name: {watcher_name}
+      ├─ URL: {repo_url}
+      └─ Owner's Description: {repo_description[:500]}
+
+      📊 GIT ACTIVITY
+      ├─ Latest Commit: {metadata.get('last_commit_hash', 'unknown')[:8]}
+      ├─ Author: {metadata.get('last_commit_author', 'unknown')}
+      └─ Date: {metadata.get('last_commit_date', 'unknown')}
+
+      🔍 AUTO-DISCOVERED CODE ENTITIES
+      ├─ HTTP Endpoints: {summary.get('http_endpoints', 0)}
+      ├─ Cron/Scheduled Jobs: {summary.get('cron_jobs', 0)}
+      ├─ Queue Workers: {summary.get('queue_workers', 0)}
+      ├─ Serverless Functions: {summary.get('serverless_functions', 0)}
+      └─ Total Monitored Entities: {summary.get('total', 0)}
+
+      ════════════════════════════════════════════════════════════════════════════════
+      COMPLETE CODEBASE (analyze every file for context)
+      ════════════════════════════════════════════════════════════════════════════════
+      {codebase[:350000]}
+      ════════════════════════════════════════════════════════════════════════════════
+
+      Respond with ONLY the JSON object. No preamble, no explanation, no markdown formatting."""
+              
+              response = client.models.generate_content(
+                  model=llm_model,
+                  contents=[
+                      {"role": "user", "parts": [{"text": system_prompt}]},
+                      {"role": "model", "parts": [{"text": "I will analyze and return valid JSON only."}]},
+                      {"role": "user", "parts": [{"text": user_prompt}]}
+                  ]
+              )
+              
+              if response.text:
+                  json_match = re.search(r'\{[\s\S]*\}', response.text)
+                  if json_match:
+                      llm_json = json.loads(json_match.group())
+                      result["llm_enabled"] = True
+                      result["llm_business_context"] = llm_json.get("business_context", "")
+                      result["llm_tech_stack"] = llm_json.get("tech_stack", {})
+                      result["llm_architecture"] = llm_json.get("architecture", "")
+                      result["llm_health"] = llm_json.get("health", {})
+                      result["llm_zombie_risk"] = llm_json.get("zombie_risk", {})
+                      result["llm_raw_response"] = llm_json
+                      print(f"[OK] LLM repo analysis complete (model: {llm_model})")
+          except Exception as e:
+              error_msg = str(e)[:500]
+              result["error"] = error_msg
+              print(f"[ERROR] LLM analysis failed: {error_msg}")
+              
+              # FAIL the task - don't silently continue with NULL data
+              import sys
+              sys.exit(1)
+      
+      # Only write output if we have valid LLM data
+      if not result["llm_enabled"]:
+          print(f"[ERROR] LLM analysis did not produce valid results")
+          if result["error"]:
+              print(f"[ERROR] Reason: {result['error']}")
+          import sys
+          sys.exit(1)
+      
+      with open('llm_repo_analysis.json', 'w') as f:
+          json.dump(result, f, indent=2)
+
+  # ============================================================================
+  # STAGE 3: GREP + AST Dependency Detection
+  # ============================================================================
+  - id: detect_dependencies
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      AST + Grep based dependency detection.
+      Finds what code calls each candidate and maps dependencies by signature.
+    timeout: PT15M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    env:
+      REPO_DIR: "{{ outputs.clone_repo.directory }}"
+    inputFiles:
+      candidates_with_code.json: "{{ outputs.discover_entities.outputFiles['candidates_with_code.json'] }}"
+    outputFiles:
+      - dependencies.json
+    script: |
+      import os
+      import re
+      import json
+      from pathlib import Path
+      
+      REPO_DIR = os.environ.get('REPO_DIR', '.')
+      
+      with open('candidates_with_code.json', 'r') as f:
+          candidates = json.load(f)
+      
+      CODE_EXT = ('.py', '.js', '.ts', '.jsx', '.tsx', '.go', '.java')
+      SKIP_DIRS = {'node_modules', 'venv', '.venv', '__pycache__', '.git', 'dist', 'build', '.next'}
+      
+      all_files = {}
+      for root, dirs, files in os.walk(REPO_DIR):
+          dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+          for file in files:
+              if file.endswith(CODE_EXT):
+                  filepath = os.path.join(root, file)
+                  rel_path = os.path.relpath(filepath, REPO_DIR)
+                  try:
+                      with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                          all_files[rel_path] = f.read()
+                  except:
+                      pass
+      
+      file_to_candidates = {}
+      for c in candidates:
+          fp = c['file_path']
+          if fp not in file_to_candidates:
+              file_to_candidates[fp] = []
+          file_to_candidates[fp].append(c)
+      
+      sig_to_id = {c['signature']: c['unique_id'] for c in candidates}
+      
+      dependencies = {}
+      
+      for candidate in candidates:
+          sig = candidate['signature']
+          entity_type = candidate['entity_type']
+          file_path = candidate['file_path']
+          unique_id = candidate['unique_id']
+          
+          callers = []
+          depends_on_signatures = []
+          
+          search_patterns = []
+          
+          if entity_type == 'http_endpoint':
+              entity_data = candidate.get('entity_data', {})
+              path = entity_data.get('path', '')
+              if path and path != '/unknown':
+                  clean_path = re.escape(path).replace(r'\[', '[^/]*').replace(r'\]', '')
+                  search_patterns.extend([
+                      rf'["\']({clean_path}|{path})["\']',
+                      rf'fetch\s*\(\s*[`"\'][^`"\']*{clean_path}',
+                      rf'axios\.[a-z]+\s*\(\s*[`"\'][^`"\']*{clean_path}',
+                  ])
+          
+          elif entity_type == 'cron_job':
+              snippet = candidate.get('code_snippet', '')
+              func_match = re.search(r'(?:def|function|const|async function)\s+(\w+)', snippet)
+              if func_match:
+                  func_name = func_match.group(1)
+                  search_patterns.append(rf'\b{func_name}\s*\(')
+          
+          elif entity_type == 'queue_worker':
+              entity_data = candidate.get('entity_data', {})
+              queue_name = entity_data.get('queue_name', '')
+              if queue_name:
+                  search_patterns.extend([
+                      rf'["\']({queue_name})["\']',
+                      rf'queue\s*\(\s*["\']({queue_name})["\']',
+                  ])
+          
+          for rel_path, content in all_files.items():
+              if rel_path == file_path:
+                  continue
+              
+              for pattern in search_patterns:
+                  try:
+                      for match in re.finditer(pattern, content, re.IGNORECASE):
+                          line_num = content[:match.start()].count('\n') + 1
+                          lines = content.split('\n')
+                          start = max(0, line_num - 2)
+                          end = min(len(lines), line_num + 2)
+                          context = '\n'.join(lines[start:end])
+                          
+                          callers.append({
+                              "file": rel_path,
+                              "line": line_num,
+                              "match": match.group(0)[:100],
+                              "context": context[:300]
+                          })
+                          
+                          if rel_path in file_to_candidates:
+                              for caller_candidate in file_to_candidates[rel_path]:
+                                  caller_line = caller_candidate.get('line', 0)
+                                  if abs(line_num - caller_line) < 60:
+                                      depends_on_signatures.append(caller_candidate['signature'])
+                  except re.error:
+                      pass
+          
+          seen_callers = set()
+          unique_callers = []
+          for c in callers:
+              key = f"{c['file']}:{c['line']}"
+              if key not in seen_callers:
+                  seen_callers.add(key)
+                  unique_callers.append(c)
+          
+          depends_on_signatures = list(set(depends_on_signatures))
+          
+          dependencies[sig] = {
+              "unique_id": unique_id,
+              "signature": sig,
+              "entity_type": entity_type,
+              "file_path": file_path,
+              "callers": unique_callers[:20],
+              "caller_count": len(unique_callers),
+              "depends_on_signatures": depends_on_signatures,
+              "dependency_count": len(depends_on_signatures),
+              "is_potentially_unused": len(unique_callers) == 0
+          }
+      
+      with open('dependencies.json', 'w') as f:
+          json.dump(dependencies, f, indent=2)
+      
+      unused = sum(1 for d in dependencies.values() if d['is_potentially_unused'])
+      print(f"Dependency analysis: {len(dependencies)} candidates, {unused} potentially unused")
+
+  # ============================================================================
+  # STAGE 4: Per-Candidate LLM Analysis
+  # ============================================================================
+  - id: llm_candidate_analysis
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Analyze each candidate with LLM using:
+      - Repo-level context (from Stage 2)
+      - Dependencies info (from Stage 3)
+      - Code snippet (from Stage 1)
+    timeout: PT30M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q google-genai
+    env:
+      GOOGLE_API_KEY: "{{ secret('GOOGLE_AI_API_KEY') }}"
+      REPO_DESCRIPTION: "{{ inputs.repo_description }}"
+      LLM_MODEL: "{{ vars.llm_model }}"
+    inputFiles:
+      candidates_with_code.json: "{{ outputs.discover_entities.outputFiles['candidates_with_code.json'] }}"
+      dependencies.json: "{{ outputs.detect_dependencies.outputFiles['dependencies.json'] }}"
+      llm_repo_analysis.json: "{{ outputs.llm_repo_analysis.outputFiles['llm_repo_analysis.json'] }}"
+    outputFiles:
+      - candidate_analysis.json
+    script: |
+      import os
+      import re
+      import json
+      import time
+      
+      # Escape braces for JSON template in prompt (Kestra Pebble conflict)
+      open_brace = "{"
+      close_brace = "}"
+      
+      api_key = os.environ.get('GOOGLE_API_KEY')
+      repo_context = os.environ.get('REPO_DESCRIPTION', '')
+      llm_model = os.environ.get('LLM_MODEL')
+      
+      with open('candidates_with_code.json', 'r') as f:
+          candidates = json.load(f)
+      
+      with open('dependencies.json', 'r') as f:
+          dependencies = json.load(f)
+      
+      with open('llm_repo_analysis.json', 'r') as f:
+          repo_analysis = json.load(f)
+      
+      repo_business = repo_analysis.get('llm_business_context', '') or ''
+      repo_tech = repo_analysis.get('llm_tech_stack', {})
+      repo_arch = repo_analysis.get('llm_architecture', '') or ''
+      
+      results = []
+      
+      if not api_key:
+          print("[FATAL] No GOOGLE_API_KEY configured - cannot perform LLM analysis")
+          import sys
+          sys.exit(1)
+      
+      from google import genai
+      client = genai.Client(api_key=api_key)
+      
+      for i, candidate in enumerate(candidates):
+          sig = candidate['signature']
+          deps = dependencies.get(sig, {})
+          caller_count = deps.get('caller_count', 0)
+          callers_info = deps.get('callers', [])[:5]
+          depends_on = deps.get('depends_on_signatures', [])
+          
+          try:
+              prompt = f"""You are a zombie code detective. Your mission: determine if this code entity is actively used or potentially dead/unused.
+
+      🏢 REPOSITORY CONTEXT (for understanding business relevance)
+      ├─ Business Purpose: {repo_business[:300]}
+      ├─ Tech Stack: {json.dumps(repo_tech)[:200]}
+      └─ Architecture: {repo_arch[:200]}
+
+      🎯 TARGET CODE ENTITY
+      ├─ Type: {candidate['entity_type']}
+      ├─ Signature: {sig}
+      ├─ Location: {candidate['file_path']}
+      └─ Framework: {candidate['framework']}
+
+      📝 SOURCE CODE
+      ┌────────────────────────────────────────────────────────────────────────────────
+      {candidate['code_snippet'][:2000]}
+      └────────────────────────────────────────────────────────────────────────────────
+
+      🔗 DEPENDENCY ANALYSIS (static analysis results)
+      ├─ Times called by other code: {caller_count}
+      ├─ Flagged as potentially unused: {deps.get('is_potentially_unused', 'unknown')}
+      ├─ Dependencies it relies on: {depends_on[:5] if depends_on else 'None detected'}
+      └─ Sample callers found: {json.dumps(callers_info, indent=2)[:400] if callers_info else 'No internal callers found'}
+
+      ⚠️ ZOMBIE DETECTION CRITERIA
+      Consider these signals when scoring:
+      • caller_count=0 is a STRONG indicator of potential zombie code
+      • But external APIs (called by browsers/clients) legitimately have 0 internal callers
+      • Look for: deprecated comments, TODO remove, dead code patterns, unused exports
+      • Business-critical code (auth, payments, metrics) should have LOW risk even if caller_count=0
+      • Generic CRUD or utility endpoints with no callers are HIGH risk
+
+      Return ONLY valid JSON (no markdown, no explanation):
+      {open_brace}
+        "purpose": "Describe what this code does and its business value. Be specific - what problem does it solve?",
+        "risk_score": 0.00 to 1.00,
+        "risk_reasoning": "Justify your score. Reference specific evidence: caller count, code patterns, business criticality, naming conventions, comments in code."
+      {close_brace}
+
+      SCORING GUIDE:
+      • 0.00-0.20: Definitely active (critical business logic, clear callers, essential functionality)
+      • 0.21-0.40: Likely active (useful utility, may be called externally)
+      • 0.41-0.60: Uncertain (no clear evidence either way)
+      • 0.61-0.80: Possibly zombie (no callers, generic code, low business value)
+      • 0.81-1.00: Likely zombie (deprecated markers, dead code patterns, truly orphaned)
+
+      JSON:"""
+              
+              response = client.models.generate_content(
+                  model=llm_model,
+                  contents=prompt
+              )
+              
+              if response.text:
+                  text = response.text.strip()
+                  
+                  # Remove markdown code blocks if present
+                  text = re.sub(r'^```(?:json)?\s*', '', text)
+                  text = re.sub(r'\s*```$', '', text)
+                  text = text.strip()
+                  
+                  # Try to find JSON object
+                  json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text)
+                  if json_match:
+                      try:
+                          llm_json = json.loads(json_match.group())
+                          
+                          risk_score = llm_json.get('risk_score', 0.5)
+                          if isinstance(risk_score, (int, float)):
+                              risk_score = max(0.0, min(1.0, float(risk_score)))
+                          else:
+                              risk_score = 0.5
+                          
+                          results.append({
+                              "signature": sig,
+                              "unique_id": candidate['unique_id'],
+                              "llm_purpose": llm_json.get('purpose', '')[:2000],
+                              "llm_risk_score": round(risk_score, 2),
+                              "llm_risk_reasoning": llm_json.get('risk_reasoning', '')[:2000],
+                              "depends_on_signatures": depends_on,
+                              "error": None
+                          })
+                          print(f"[{i+1}/{len(candidates)}] {sig}: risk={risk_score:.2f}")
+                      except json.JSONDecodeError as je:
+                          results.append({
+                              "signature": sig,
+                              "unique_id": candidate['unique_id'],
+                              "llm_purpose": None,
+                              "llm_risk_score": 0.5,
+                              "llm_risk_reasoning": f"JSON decode error: {str(je)[:100]}",
+                              "depends_on_signatures": depends_on,
+                              "error": "JSON parse failed"
+                          })
+                          print(f"[{i+1}/{len(candidates)}] {sig}: JSON decode failed")
+                  else:
+                      results.append({
+                          "signature": sig,
+                          "unique_id": candidate['unique_id'],
+                          "llm_purpose": None,
+                          "llm_risk_score": 0.5,
+                          "llm_risk_reasoning": "No JSON found in LLM response",
+                          "depends_on_signatures": depends_on,
+                          "error": "No JSON in response"
+                      })
+                      print(f"[{i+1}/{len(candidates)}] {sig}: No JSON found")
+              else:
+                  results.append({
+                      "signature": sig,
+                      "unique_id": candidate['unique_id'],
+                      "llm_purpose": None,
+                      "llm_risk_score": 0.5,
+                      "llm_risk_reasoning": None,
+                      "depends_on_signatures": depends_on,
+                      "error": "Empty response"
+                  })
+              
+              time.sleep(0.5)
+              
+          except Exception as e:
+              results.append({
+                  "signature": sig,
+                  "unique_id": candidate['unique_id'],
+                  "llm_purpose": None,
+                  "llm_risk_score": 0.5,
+                  "llm_risk_reasoning": None,
+                  "depends_on_signatures": depends_on,
+                  "error": str(e)[:200]
+              })
+              print(f"[ERROR] {sig}: {e}")
+              
+              # Check for rate limit errors - fail immediately if quota exhausted
+              error_str = str(e).lower()
+              if '429' in error_str or 'quota' in error_str or 'rate' in error_str:
+                  print(f"[FATAL] Rate limit or quota exceeded. Failing task.")
+                  import sys
+                  sys.exit(1)
+              
+              time.sleep(1)
+      
+      # Check if all candidates failed - that's a problem
+      successful = [r for r in results if r.get('llm_purpose') is not None]
+      failed = [r for r in results if r.get('error') is not None]
+      
+      if len(results) > 0 and len(successful) == 0:
+          print(f"[FATAL] All {len(failed)} candidates failed LLM analysis")
+          import sys
+          sys.exit(1)
+      
+      with open('candidate_analysis.json', 'w') as f:
+          json.dump(results, f, indent=2)
+      
+      print(f"[OK] Candidate analysis complete: {len(successful)}/{len(results)} successful")
+
+  # ============================================================================
+  # STAGE 5: Store Watcher in Database
+  # ============================================================================
+  - id: store_watcher
+    type: io.kestra.plugin.scripts.python.Script
+    description: Store watcher with LLM analysis in PostgreSQL
+    retry:
+      type: exponential
+      maxAttempts: 3
+      interval: PT2S
+      maxInterval: PT30S
+    timeout: PT3M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+      WATCHER_ID: "{{ inputs.watcher_id }}"
+      WATCHER_NAME: "{{ inputs.watcher_name }}"
+      USER_ID: "{{ inputs.user_id }}"
+      REPO_URL: "{{ inputs.repo_url }}"
+      REPO_NAME: "{{ vars.repo_name }}"
+      REPO_DESCRIPTION: "{{ inputs.repo_description }}"
+      DEFAULT_BRANCH: "{{ inputs.default_branch }}"
+      APPLICATION_URL: "{{ inputs.application_url ?? '' }}"
+      OBSERVABILITY_URLS: "{{ inputs.observability_urls | json ?? '[]' }}"
+    inputFiles:
+      discovery.json: "{{ outputs.discover_entities.outputFiles['discovery.json'] }}"
+      git_metadata.json: "{{ outputs.extract_git_metadata.outputFiles['git_metadata.json'] }}"
+      llm_repo_analysis.json: "{{ outputs.llm_repo_analysis.outputFiles['llm_repo_analysis.json'] }}"
+    outputFiles:
+      - storage_result.json
+    script: |
+      import json
+      import os
+      import psycopg2
+      
+      db_url = os.environ.get('DATABASE_URL')
+      
+      with open('discovery.json', 'r') as f:
+          discovery = json.load(f)
+      
+      with open('git_metadata.json', 'r') as f:
+          metadata = json.load(f)
+      
+      with open('llm_repo_analysis.json', 'r') as f:
+          llm = json.load(f)
+      
+      summary = discovery.get('summary', {})
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      obs_urls = os.environ.get('OBSERVABILITY_URLS', '[]')
+      try:
+          obs_urls = json.loads(obs_urls) if obs_urls else []
+      except:
+          obs_urls = []
+      
+      last_date = metadata.get('last_commit_date', '').strip()
+      if last_date:
+          try:
+              from datetime import datetime
+              last_date = datetime.fromisoformat(last_date.replace('Z', '+00:00'))
+          except:
+              last_date = None
+      else:
+          last_date = None
+      
+      cur.execute("""
+          INSERT INTO watchers (
+              watcher_id, watcher_name, user_id, repo_url, repo_name, repo_description,
+              default_branch, application_url, observability_urls,
+              total_candidates, http_endpoints, cron_jobs, queue_workers,
+              serverless_functions, websockets, grpc_services, graphql_resolvers,
+              last_commit_hash, last_commit_message, last_commit_author, last_commit_date,
+              llm_business_context, llm_tech_stack, llm_architecture, llm_health,
+              llm_zombie_risk, llm_raw_response, status
+          ) VALUES (
+              %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+              %s, %s, %s, %s, %s, %s, 'pending_schedule'
+          )
+          ON CONFLICT (watcher_id) DO UPDATE SET
+              watcher_name = EXCLUDED.watcher_name,
+              total_candidates = EXCLUDED.total_candidates,
+              http_endpoints = EXCLUDED.http_endpoints,
+              cron_jobs = EXCLUDED.cron_jobs,
+              queue_workers = EXCLUDED.queue_workers,
+              serverless_functions = EXCLUDED.serverless_functions,
+              websockets = EXCLUDED.websockets,
+              grpc_services = EXCLUDED.grpc_services,
+              graphql_resolvers = EXCLUDED.graphql_resolvers,
+              last_commit_hash = EXCLUDED.last_commit_hash,
+              last_commit_message = EXCLUDED.last_commit_message,
+              last_commit_author = EXCLUDED.last_commit_author,
+              last_commit_date = EXCLUDED.last_commit_date,
+              llm_business_context = EXCLUDED.llm_business_context,
+              llm_tech_stack = EXCLUDED.llm_tech_stack,
+              llm_architecture = EXCLUDED.llm_architecture,
+              llm_health = EXCLUDED.llm_health,
+              llm_zombie_risk = EXCLUDED.llm_zombie_risk,
+              llm_raw_response = EXCLUDED.llm_raw_response,
+              scan_count = watchers.scan_count + 1,
+              updated_at = NOW()
+      """, (
+          os.environ.get('WATCHER_ID'),
+          os.environ.get('WATCHER_NAME'),
+          os.environ.get('USER_ID'),
+          os.environ.get('REPO_URL'),
+          os.environ.get('REPO_NAME'),
+          os.environ.get('REPO_DESCRIPTION', '')[:500],
+          os.environ.get('DEFAULT_BRANCH', 'main'),
+          os.environ.get('APPLICATION_URL') or None,
+          json.dumps(obs_urls),
+          summary.get('total', 0),
+          summary.get('http_endpoints', 0),
+          summary.get('cron_jobs', 0),
+          summary.get('queue_workers', 0),
+          summary.get('serverless_functions', 0),
+          summary.get('websockets', 0),
+          summary.get('grpc_services', 0),
+          summary.get('graphql_resolvers', 0),
+          metadata.get('last_commit_hash'),
+          metadata.get('last_commit_message', '')[:100],
+          metadata.get('last_commit_author'),
+          last_date,
+          llm.get('llm_business_context')[:2000] if llm.get('llm_business_context') else None,
+          json.dumps(llm.get('llm_tech_stack', {})),
+          llm.get('llm_architecture')[:2000] if llm.get('llm_architecture') else None,
+          json.dumps(llm.get('llm_health', {})),
+          json.dumps(llm.get('llm_zombie_risk', {})),
+          json.dumps(llm.get('llm_raw_response', {}))
+      ))
+      
+      conn.commit()
+      cur.close()
+      conn.close()
+      
+      result = {
+          "watcher_id": os.environ.get('WATCHER_ID'),
+          "status": "success",
+          "total_candidates": summary.get('total', 0),
+          "llm_enabled": llm.get('llm_enabled', False)
+      }
+      
+      with open('storage_result.json', 'w') as f:
+          json.dump(result, f, indent=2)
+      
+      print(f"Watcher stored: {result['watcher_id']}")
+
+  # ============================================================================
+  # STAGE 6: Store Candidates with Dependencies
+  # ============================================================================
+  - id: store_candidates
+    type: io.kestra.plugin.scripts.python.Script
+    description: Store zombie candidates with LLM analysis and dependency signatures
+    retry:
+      type: exponential
+      maxAttempts: 3
+      interval: PT2S
+      maxInterval: PT30S
+    timeout: PT5M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+      WATCHER_ID: "{{ inputs.watcher_id }}"
+    inputFiles:
+      discovery.json: "{{ outputs.discover_entities.outputFiles['discovery.json'] }}"
+      candidate_analysis.json: "{{ outputs.llm_candidate_analysis.outputFiles['candidate_analysis.json'] }}"
+      dependencies.json: "{{ outputs.detect_dependencies.outputFiles['dependencies.json'] }}"
+    outputFiles:
+      - candidates_result.json
+    script: |
+      import json
+      import os
+      import psycopg2
+      
+      db_url = os.environ.get('DATABASE_URL')
+      watcher_id = os.environ.get('WATCHER_ID', '')
+      
+      with open('discovery.json', 'r') as f:
+          discovery = json.load(f)
+      entities = discovery.get('entities', {})
+      
+      with open('candidate_analysis.json', 'r') as f:
+          llm_analysis = json.load(f)
+      llm_by_sig = {a['signature']: a for a in llm_analysis}
+      
+      with open('dependencies.json', 'r') as f:
+          dependencies = json.load(f)
+      
+      type_mapping = {
+          'http_endpoints': 'http_endpoint',
+          'grpc_services': 'grpc_service',
+          'graphql_resolvers': 'graphql_resolver',
+          'cron_jobs': 'cron_job',
+          'queue_workers': 'queue_worker',
+          'serverless_functions': 'serverless_function',
+          'websockets': 'websocket'
+      }
+      
+      def build_signature(etype, entity):
+          if etype == 'http_endpoints':
+              return f"{entity.get('method', 'GET')}:{entity.get('path', '/')}"
+          elif etype == 'cron_jobs':
+              return f"cron:{entity.get('schedule', 'unknown')}"
+          elif etype == 'queue_workers':
+              return f"queue:{entity.get('queue_name', 'default')}"
+          elif etype == 'serverless_functions':
+              return f"fn:{entity.get('function_name', 'handler')}"
+          elif etype == 'grpc_services':
+              return f"grpc:{entity.get('service_name', 'unknown')}"
+          elif etype == 'graphql_resolvers':
+              return f"gql:{entity.get('operation_type', 'query')}"
+          elif etype == 'websockets':
+              return f"ws:{entity.get('event_name', 'connection')}"
+          return f"unknown:{entity.get('source_file', '')}"
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      seen = set()
+      count = 0
+      
+      for etype, elist in entities.items():
+          db_type = type_mapping.get(etype, etype.rstrip('s'))
+          
+          for e in elist:
+              sig = build_signature(etype, e)
+              
+              key = (db_type, sig)
+              if key in seen:
+                  continue
+              seen.add(key)
+              
+              llm_data = llm_by_sig.get(sig, {})
+              deps_data = dependencies.get(sig, {})
+              
+              if etype == 'http_endpoints':
+                  name = f"{e.get('method', 'GET')} {e.get('path', '/')}"
+                  method = e.get('method')
+                  route = e.get('path')
+              else:
+                  name = sig
+                  method = None
+                  route = None
+              
+              caller_count = deps_data.get('caller_count', 0)
+              dependency_count = deps_data.get('dependency_count', 0)
+              depends_on_sigs = deps_data.get('depends_on_signatures', [])
+              
+              llm_risk = llm_data.get('llm_risk_score', 0.5) or 0.5
+              if caller_count == 0:
+                  zombie_score = int(min(100, (llm_risk * 100) + 20))
+              else:
+                  zombie_score = int(max(0, (llm_risk * 100) - (caller_count * 5)))
+              
+              cur.execute("""
+                  INSERT INTO zombie_candidates (
+                      watcher_id, entity_type, entity_signature, entity_name,
+                      file_path, method, route_path, schedule, queue_name, framework,
+                      llm_purpose, llm_risk_score, llm_risk_reasoning,
+                      depends_on_signatures, dependency_count, caller_count, zombie_score
+                  ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                  ON CONFLICT (watcher_id, entity_type, entity_signature) DO UPDATE SET
+                      entity_name = EXCLUDED.entity_name,
+                      llm_purpose = EXCLUDED.llm_purpose,
+                      llm_risk_score = EXCLUDED.llm_risk_score,
+                      llm_risk_reasoning = EXCLUDED.llm_risk_reasoning,
+                      depends_on_signatures = EXCLUDED.depends_on_signatures,
+                      dependency_count = EXCLUDED.dependency_count,
+                      caller_count = EXCLUDED.caller_count,
+                      zombie_score = EXCLUDED.zombie_score,
+                      scan_count = zombie_candidates.scan_count + 1,
+                      updated_at = NOW()
+              """, (
+                  watcher_id,
+                  db_type,
+                  sig,
+                  name,
+                  e.get('source_file', ''),
+                  method,
+                  route,
+                  e.get('schedule') if etype == 'cron_jobs' else None,
+                  e.get('queue_name') if etype == 'queue_workers' else None,
+                  e.get('framework'),
+                  llm_data.get('llm_purpose'),
+                  llm_data.get('llm_risk_score'),
+                  llm_data.get('llm_risk_reasoning'),
+                  depends_on_sigs if depends_on_sigs else None,
+                  dependency_count,
+                  caller_count,
+                  zombie_score
+              ))
+              count += 1
+      
+      conn.commit()
+      cur.close()
+      conn.close()
+      
+      result = {"candidates_stored": count, "watcher_id": watcher_id}
+      with open('candidates_result.json', 'w') as f:
+          json.dump(result, f, indent=2)
+      
+      print(f"Candidates stored: {count}")
+
+  # ============================================================================
+  # OUTPUT
+  # ============================================================================
+  - id: output_success
+    type: io.kestra.plugin.core.output.OutputValues
+    description: Return creation results
+    values:
+      watcher_id: "{{ inputs.watcher_id }}"
+      watcher_name: "{{ inputs.watcher_name }}"
+      repo_url: "{{ inputs.repo_url }}"
+      status: "created"
+      execution_id: "{{ execution.id }}"
+
+errors:
+  - id: creation_failed
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      watcher_id: "{{ inputs.watcher_id }}"
+      status: "creation_failed"
+      error: "Watcher creation workflow failed"
+      execution_id: "{{ execution.id }}"
+
+triggers: []
+
+pluginDefaults:
+  - type: io.kestra.plugin.scripts.python.Script
+    values:
+      docker:
+        pullPolicy: IF_NOT_PRESENT
+  - type: io.kestra.plugin.git.Clone
+    values:
+      depth: 1

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { auth } from "@/lib/firebase";
 import { GithubAuthProvider, signInWithPopup } from "firebase/auth";
@@ -10,11 +10,21 @@ import { TextGenerateEffect } from "@/components/ui/text-generate-effect";
 import { HoverBorderGradient } from "@/components/ui/hover-border-gradient";
 import { Github } from "lucide-react";
 import { CustomCursor } from "@/components/ui/CustomCursor";
+import { DoomLoader } from "@/components/ui/DoomLoader";
 
 export default function LoginPage() {
   const router = useRouter();
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [showLoader, setShowLoader] = useState(true);
+
+  // Show DoomLoader for 1.5 seconds on initial load
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setShowLoader(false);
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, []);
 
   const handleGithubLogin = async () => {
     setError("");
@@ -47,6 +57,11 @@ export default function LoginPage() {
       setLoading(false);
     }
   };
+
+  // Show DoomLoader during initial 1.5s with full screen spotlight background
+  if (showLoader) {
+    return <DoomLoader fullScreen text="Doom is coming..." />;
+  }
 
   return (
     <div className="min-h-screen w-full bg-[#0a0a0a] relative overflow-hidden flex flex-col items-center justify-center antialiased cursor-none">

@@ -1,17 +1,28 @@
 import { NextRequest, NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
+import { pool } from "@/lib/db";
 
 /**
  * Watcher Creation API
  *
- * Validates inputs and GitHub repository, then triggers the Kestra
- * watcher creation workflow (w1_watcher_creation).
+ * Validates inputs, GitHub repository, application URL, and observability sources,
+ * then triggers the Kestra watcher creation workflow (w1_watcher_creation).
  *
  * Flow:
  * 1. Validate inputs (name, URL format, description)
- * 2. Validate GitHub repository via API
- * 3. Trigger Kestra workflow for discovery, LLM analysis, and storage
+ * 2. Check for duplicate watchers (name or repo URL)
+ * 3. Validate GitHub repository via API
+ * 4. Validate Application URL (if provided)
+ * 5. Validate Observability Sources with tokens
+ * 6. Trigger Kestra workflow for discovery, LLM analysis, and storage
  */
+
+interface ObservabilitySource {
+  url: string;
+  type?: string;
+  token?: string;
+  userId?: string; // Optional: override user ID for Basic Auth (e.g., Grafana Cloud)
+}
 
 interface CreateWatcherRequest {
   name: string;
@@ -20,7 +31,7 @@ interface CreateWatcherRequest {
   applicationUrl?: string;
   userId: string;
   githubToken?: string;
-  observabilitySources?: Array<{ url: string; type?: string }>;
+  observabilitySources?: ObservabilitySource[];
 }
 
 interface GitHubRepoDetails {
@@ -31,7 +42,63 @@ interface GitHubRepoDetails {
   language: string | null;
 }
 
+interface ValidationResult {
+  valid: boolean;
+  error?: string;
+}
+
 const GITHUB_REPO_REGEX = /^https:\/\/github\.com\/[\w\-.]+\/[\w\-.]+\/?$/;
+const URL_REGEX = /^https?:\/\/[^\s/$.?#].[^\s]*$/i;
+
+/**
+ * Check for duplicate watcher name or repository URL for the same user
+ */
+async function checkDuplicates(
+  name: string,
+  repoUrl: string,
+  userId: string
+): Promise<{ isDuplicate: boolean; error?: string }> {
+  try {
+    // Normalize repo URL (remove trailing slash for comparison)
+    const normalizedRepoUrl = repoUrl.replace(/\/$/, "").toLowerCase();
+
+    // Check for duplicate name (case-insensitive) for this user
+    const nameCheck = await pool.query(
+      `SELECT watcher_name FROM watchers 
+       WHERE LOWER(watcher_name) = LOWER($1) AND user_id = $2 
+       LIMIT 1`,
+      [name, userId]
+    );
+
+    if (nameCheck.rows.length > 0) {
+      return {
+        isDuplicate: true,
+        error: `A watcher named "${nameCheck.rows[0].watcher_name}" already exists. Please choose a different name.`,
+      };
+    }
+
+    // Check for duplicate repo URL for this user
+    const repoCheck = await pool.query(
+      `SELECT watcher_name, repo_url FROM watchers 
+       WHERE LOWER(REPLACE(repo_url, '/', '')) = LOWER(REPLACE($1, '/', '')) AND user_id = $2
+       LIMIT 1`,
+      [normalizedRepoUrl, userId]
+    );
+
+    if (repoCheck.rows.length > 0) {
+      return {
+        isDuplicate: true,
+        error: `This repository is already being watched by "${repoCheck.rows[0].watcher_name}". Each repository can only have one watcher per user.`,
+      };
+    }
+
+    return { isDuplicate: false };
+  } catch (error) {
+    console.error("[api/watchers/create] Duplicate check error:", error);
+    // Don't block creation if duplicate check fails
+    return { isDuplicate: false };
+  }
+}
 
 /**
  * Validate request inputs (synchronous checks)
@@ -49,7 +116,180 @@ function validateInputs(body: CreateWatcherRequest): string | null {
   if (!body.userId) {
     return "User ID is required";
   }
+  if (body.applicationUrl && !URL_REGEX.test(body.applicationUrl)) {
+    return "Invalid Application URL format";
+  }
   return null;
+}
+
+/**
+ * Validate Application URL is reachable
+ */
+async function validateApplicationUrl(url: string): Promise<ValidationResult> {
+  try {
+    const response = await fetch(url, {
+      method: "HEAD",
+      signal: AbortSignal.timeout(10000),
+      redirect: "follow",
+    });
+    
+    // Accept any 2xx or 3xx response, also 405 (method not allowed) since some servers don't support HEAD
+    if (response.ok || response.status === 405 || (response.status >= 300 && response.status < 400)) {
+      return { valid: true };
+    }
+    
+    // Try GET if HEAD failed with 4xx (some servers don't support HEAD)
+    if (response.status >= 400 && response.status < 500) {
+      const getResponse = await fetch(url, {
+        method: "GET",
+        signal: AbortSignal.timeout(10000),
+        redirect: "follow",
+      });
+      if (getResponse.ok) {
+        return { valid: true };
+      }
+    }
+    
+    return { valid: false, error: `Application URL returned HTTP ${response.status}` };
+  } catch (error) {
+    if (error instanceof Error) {
+      if (error.name === "AbortError" || error.name === "TimeoutError") {
+        return { valid: false, error: "Application URL request timed out" };
+      }
+      return { valid: false, error: `Cannot reach Application URL: ${error.message.slice(0, 100)}` };
+    }
+    return { valid: false, error: "Cannot reach Application URL" };
+  }
+}
+
+/**
+ * Validate Observability Source based on type
+ */
+async function validateObservabilitySource(source: ObservabilitySource): Promise<ValidationResult> {
+  const { url, type = "prometheus", token, userId: overrideUserId } = source;
+  
+  if (!url || !URL_REGEX.test(url)) {
+    return { valid: false, error: `Invalid URL format: ${url}` };
+  }
+
+  const headers: HeadersInit = {
+    "User-Agent": "Doomsday-Watcher/1.0",
+  };
+
+  // Add authentication based on type
+  if (token) {
+    // Check if it's a Grafana Cloud token (starts with glc_)
+    const isGrafanaCloudToken = token.startsWith("glc_");
+    
+    // Extract user ID from Grafana Cloud token for Basic Auth
+    let grafanaUserId = overrideUserId || ""; // Use override if provided
+    if (isGrafanaCloudToken && !grafanaUserId) {
+      try {
+        // Grafana Cloud tokens are base64 encoded JSON after "glc_"
+        const tokenData = JSON.parse(atob(token.substring(4)));
+        // Use override userId if provided, otherwise fall back to token's "o" field
+        grafanaUserId = tokenData.o || "";
+      } catch {
+        // If parsing fails, userId stays empty
+      }
+    }
+
+    switch (type) {
+      case "prometheus":
+      case "loki":
+        // Grafana Cloud uses Basic Auth with user ID and the FULL token (not just API key)
+        if (isGrafanaCloudToken && grafanaUserId) {
+          headers["Authorization"] = `Basic ${btoa(`${grafanaUserId}:${token}`)}`;
+        } else {
+          headers["Authorization"] = `Bearer ${token}`;
+        }
+        break;
+      case "grafana":
+        headers["Authorization"] = `Bearer ${token}`;
+        break;
+      case "datadog":
+        headers["DD-API-KEY"] = token;
+        break;
+      case "newrelic":
+        headers["Api-Key"] = token;
+        break;
+      default:
+        headers["Authorization"] = `Bearer ${token}`;
+    }
+  }
+
+  try {
+    // Build test endpoint based on type
+    let testUrl = url;
+    switch (type) {
+      case "prometheus":
+        // Test Prometheus API with a simple query
+        testUrl = url.includes("/api/v1") ? url : `${url.replace(/\/$/, "")}/api/v1/status/config`;
+        break;
+      case "loki":
+        // Test Loki API
+        testUrl = url.includes("/loki/api") ? url : `${url.replace(/\/$/, "")}/loki/api/v1/labels`;
+        break;
+      case "grafana":
+        // Test Grafana health endpoint
+        testUrl = `${url.replace(/\/$/, "")}/api/health`;
+        break;
+      case "datadog":
+        // Datadog validate endpoint
+        testUrl = `${url.replace(/\/$/, "")}/api/v1/validate`;
+        break;
+      case "newrelic":
+        // New Relic doesn't have a simple health check, just verify URL format
+        return { valid: true };
+      case "cloudwatch":
+        // CloudWatch ARN format validation only
+        if (url.startsWith("arn:aws:logs:")) {
+          return { valid: true };
+        }
+        return { valid: false, error: "Invalid CloudWatch ARN format" };
+      default:
+        // For unknown types, just check if URL is reachable
+        break;
+    }
+
+    const response = await fetch(testUrl, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(10000),
+    });
+
+    if (response.ok) {
+      return { valid: true };
+    }
+
+    // Check specific error codes
+    switch (response.status) {
+      case 401:
+        return { valid: false, error: `${type}: Invalid or missing authentication token` };
+      case 403:
+        return { valid: false, error: `${type}: Access forbidden - check token permissions` };
+      case 404:
+        // 404 might be okay for some endpoints (Prometheus query without params)
+        if (type === "prometheus" || type === "loki") {
+          return { valid: true };
+        }
+        return { valid: false, error: `${type}: Endpoint not found (HTTP 404)` };
+      default:
+        return { valid: false, error: `${type}: HTTP ${response.status}` };
+    }
+  } catch (error) {
+    if (error instanceof Error) {
+      if (error.name === "AbortError" || error.name === "TimeoutError") {
+        return { valid: false, error: `${type}: Request timed out` };
+      }
+      // Connection refused or network error - endpoint might be internal
+      if (error.message.includes("ECONNREFUSED") || error.message.includes("ENOTFOUND")) {
+        return { valid: false, error: `${type}: Cannot connect - verify URL is accessible` };
+      }
+      return { valid: false, error: `${type}: ${error.message.slice(0, 100)}` };
+    }
+    return { valid: false, error: `${type}: Connection failed` };
+  }
 }
 
 /**
@@ -128,7 +368,16 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: inputError, stage: "validation" }, { status: 400 });
     }
 
-    // Step 2: Validate GitHub repository
+    // Step 2: Check for duplicate watchers (name or repo URL)
+    const duplicateCheck = await checkDuplicates(body.name, body.repoUrl, body.userId);
+    if (duplicateCheck.isDuplicate) {
+      return NextResponse.json(
+        { error: duplicateCheck.error, stage: "duplicate_check" },
+        { status: 409 }
+      );
+    }
+
+    // Step 3: Validate GitHub repository
     const githubValidation = await validateGitHubRepo(body.repoUrl, body.githubToken);
     if (!githubValidation.valid) {
       return NextResponse.json(
@@ -137,7 +386,58 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Step 3: Prepare Kestra workflow trigger
+    // Step 4: Validate Application URL (if provided)
+    if (body.applicationUrl && body.applicationUrl.trim() !== "") {
+      const appUrlValidation = await validateApplicationUrl(body.applicationUrl);
+      if (!appUrlValidation.valid) {
+        return NextResponse.json(
+          { error: appUrlValidation.error, stage: "application_url_validation" },
+          { status: 400 }
+        );
+      }
+    }
+
+    // Step 5: Validate Observability Sources (if provided)
+    const validObservabilitySources: ObservabilitySource[] = [];
+    if (body.observabilitySources && body.observabilitySources.length > 0) {
+      // Check for duplicate type+url combinations
+      const seenSources = new Set<string>();
+      for (const source of body.observabilitySources) {
+        // Skip empty URLs
+        if (!source.url || source.url.trim() === "") continue;
+        
+        // Check for duplicates (same type and url)
+        const sourceKey = `${source.type || "prometheus"}:${source.url.toLowerCase().replace(/\/$/, "")}`;
+        if (seenSources.has(sourceKey)) {
+          return NextResponse.json(
+            {
+              error: `Duplicate observability source: ${source.type || "prometheus"} with URL ${source.url}`,
+              stage: "observability_validation",
+              sourceUrl: source.url,
+              sourceType: source.type || "prometheus"
+            },
+            { status: 400 }
+          );
+        }
+        seenSources.add(sourceKey);
+        
+        const sourceValidation = await validateObservabilitySource(source);
+        if (!sourceValidation.valid) {
+          return NextResponse.json(
+            { 
+              error: sourceValidation.error, 
+              stage: "observability_validation",
+              sourceUrl: source.url,
+              sourceType: source.type || "prometheus"
+            },
+            { status: 400 }
+          );
+        }
+        validObservabilitySources.push(source);
+      }
+    }
+
+    // Step 5: Prepare Kestra workflow trigger
     const kestraUrl = process.env.KESTRA_URL || "http://localhost:8080";
     const kestraToken = process.env.KESTRA_API_TOKEN;
 
@@ -149,7 +449,11 @@ export async function POST(req: NextRequest) {
     }
 
     const watcherId = uuidv4();
-    const observabilityUrls = body.observabilitySources?.map((s) => ({ url: s.url, type: s.type || 'prometheus' })) || [];
+    const observabilityUrls = validObservabilitySources.map((s) => ({ 
+      url: s.url, 
+      type: s.type || 'prometheus',
+      token: s.token || null
+    }));
     const defaultBranch = githubValidation.details?.defaultBranch ?? "main";
 
     // Build payload for w1_watcher_creation workflow

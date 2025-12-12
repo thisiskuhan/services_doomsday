@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Staatliches, Dancing_Script, Cinzel_Decorative } from "next/font/google";
 import { AuthProvider } from "@/contexts/AuthContext";
+import MusicPlayer from "@/components/ui/MusicPlayer";
 import "./globals.css";
 
 const staatliches = Staatliches({
@@ -43,6 +44,7 @@ export default function RootLayout({
       >
         <AuthProvider>
           {children}
+          <MusicPlayer />
         </AuthProvider>
       </body>
     </html>

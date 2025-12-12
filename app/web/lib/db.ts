@@ -2,27 +2,65 @@ import { Pool, PoolConfig } from "pg";
 import fs from "fs";
 import path from "path";
 
-// ============================================================================
-// DATABASE INITIALIZATION CONFIG
-// ============================================================================
-// Set to TRUE to drop all tables and recreate from schema
-// Set to FALSE to skip if tables already exist (preserve data)
-const REPLACE_ALL = true;
-// ============================================================================
-
-// Allow self-signed certificates for Aiven PostgreSQL
-if (process.env.DATABASE_URL?.includes("aivencloud.com")) {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-}
-
 const getSslConfig = (): PoolConfig["ssl"] => {
-  // For Aiven, just use ssl: true since we've disabled TLS verification above
+  const caPath = process.env.PGSQL_CA_PATH;
+  
+  if (caPath) {
+    // Try multiple possible locations for the CA file
+    const cwd = process.cwd();
+    const possiblePaths = [
+      path.isAbsolute(caPath) ? caPath : path.resolve(cwd, caPath),
+      path.resolve(cwd, "pgsql_ca.pem"),
+      path.resolve(cwd, "..", "pgsql_ca.pem"),
+    ];
+    
+    for (const testPath of possiblePaths) {
+      try {
+        if (fs.existsSync(testPath)) {
+          console.log(`[db] Using CA certificate from: ${testPath}`);
+          return {
+            rejectUnauthorized: true,
+            ca: fs.readFileSync(testPath).toString(),
+          };
+        }
+      } catch {
+        // Continue to next path
+      }
+    }
+    console.warn(`[db] CA certificate not found, tried: ${possiblePaths.join(", ")}`);
+  }
+  
+  // Allow self-signed certificates when no CA is provided or not found
+  console.log(`[db] Using SSL with rejectUnauthorized: false`);
   return { rejectUnauthorized: false };
 };
 
+const requiresSsl = (): boolean => {
+  const dbUrl = process.env.DATABASE_URL || "";
+  return (
+    dbUrl.includes("sslmode=require") ||
+    dbUrl.includes("sslmode=verify") ||
+    dbUrl.includes("aivencloud.com") ||
+    dbUrl.includes("neon.tech") ||
+    dbUrl.includes("supabase.") ||
+    dbUrl.includes("render.com") ||
+    dbUrl.includes("railway.app")
+  );
+};
+
+// Remove sslmode from connection string to avoid conflicts with our SSL config
+const getConnectionString = (): string => {
+  const dbUrl = process.env.DATABASE_URL || "";
+  // Remove sslmode parameter from URL as we handle SSL separately
+  return dbUrl.replace(/[?&]sslmode=[^&]*/g, "").replace(/\?$/, "");
+};
+
+// Get SSL configuration at initialization time
+const sslConfig = requiresSsl() ? getSslConfig() : false;
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL?.includes("sslmode=require") ? getSslConfig() : false,
+  connectionString: getConnectionString(),
+  ssl: sslConfig,
   max: 10,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
@@ -86,25 +124,12 @@ export async function initializeDatabase(): Promise<void> {
       ) as exists
     `);
     
-    const hasExistingData = tablesExist.rows[0]?.exists === true;
-
-    if (hasExistingData && !REPLACE_ALL) {
-      // Tables exist and REPLACE_ALL is false - don't disturb existing data
-      console.log("[db] Tables already exist, skipping initialization (REPLACE_ALL=false)");
+    if (tablesExist.rows[0]?.exists === true) {
+      console.log("[db] Tables already exist, skipping initialization");
       return;
     }
 
-    if (REPLACE_ALL) {
-      // Clear all tables if REPLACE_ALL is true
-      console.log("[db] Dropping existing tables (REPLACE_ALL=true)...");
-      await client.query(`
-        DROP TABLE IF EXISTS zombie_candidates CASCADE;
-        DROP TABLE IF EXISTS watchers CASCADE;
-      `);
-      console.log("[db] Tables dropped, recreating schema...");
-    }
-
-    // Create/recreate tables from schema
+    // Create tables from schema
     const schema = fs.readFileSync(schemaPath, "utf-8");
     for (const statement of parseSqlStatements(schema)) {
       await client.query(statement);

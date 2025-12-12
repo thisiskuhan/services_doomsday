@@ -1,7 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
 
-const KESTRA_BASE_URL = process.env.KESTRA_BASE_URL || 'http://localhost:8080';
-
 interface KestraExecution {
   id: string;
   namespace: string;
@@ -36,16 +34,30 @@ export async function GET(request: NextRequest) {
       );
     }
 
+    // Read token fresh in case it wasn't available at module load time
+    const kestraToken = process.env.KESTRA_API_TOKEN;
+    const kestraUrl = process.env.KESTRA_URL || process.env.KESTRA_BASE_URL || 'http://localhost:8080';
+
+    if (!kestraToken) {
+      console.error('[status] KESTRA_API_TOKEN not found in environment');
+      return NextResponse.json(
+        { error: 'Kestra API token not configured' },
+        { status: 500 }
+      );
+    }
+
     // Fetch execution status from Kestra
-    const response = await fetch(`${KESTRA_BASE_URL}/api/v1/executions/${executionId}`, {
+    const response = await fetch(`${kestraUrl}/api/v1/executions/${executionId}`, {
       method: 'GET',
       headers: {
         'Content-Type': 'application/json',
         'User-Agent': 'Doomsday-Watcher/1.0',
+        'Authorization': `Basic ${Buffer.from(kestraToken).toString('base64')}`,
       },
     });
 
     if (!response.ok) {
+      console.error(`[status] Kestra API returned ${response.status}`);
       if (response.status === 404) {
         return NextResponse.json(
           { error: 'Execution not found' },

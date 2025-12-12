@@ -65,12 +65,8 @@ __pycache__/
 venv/
 ENV/
 
-# Kestra
-app/kestra_workflows/.kestra/
-
 # Vercel
 .vercel
 
 
-services_doomsday/app/ca.pem
-services_doomsday/whiteboard
+whiteboard/

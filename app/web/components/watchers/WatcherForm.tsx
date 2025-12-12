@@ -1,15 +1,57 @@
 "use client";
 
-import { useState } from "react";
-import { motion } from "framer-motion";
-import { X, Plus, Clock, Skull } from "lucide-react";
+import { useState, useEffect } from "react";
+import { motion, AnimatePresence, useMotionTemplate, useMotionValue } from "framer-motion";
+import { X, Plus, Clock, Trash2, ChevronDown, AlertCircle } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { LokiIcon } from "@/components/ui/CustomCursor";
 import { cn } from "@/lib/utils";
+
+// Animated border glow component for the modal
+type Direction = "TOP" | "LEFT" | "BOTTOM" | "RIGHT";
+
+const AnimatedBorderGlow = ({ duration = 2 }: { duration?: number }) => {
+  const [direction, setDirection] = useState<Direction>("TOP");
+
+  const rotateDirection = (currentDirection: Direction): Direction => {
+    const directions: Direction[] = ["TOP", "LEFT", "BOTTOM", "RIGHT"];
+    const currentIndex = directions.indexOf(currentDirection);
+    const nextIndex = (currentIndex + 1) % directions.length;
+    return directions[nextIndex];
+  };
+
+  const movingMap: Record<Direction, string> = {
+    TOP: "radial-gradient(30% 70% at 50% 0%, hsl(50, 100%, 50%) 0%, rgba(234, 179, 8, 0) 100%)",
+    LEFT: "radial-gradient(25% 60% at 0% 50%, hsl(50, 100%, 50%) 0%, rgba(234, 179, 8, 0) 100%)",
+    BOTTOM: "radial-gradient(30% 70% at 50% 100%, hsl(50, 100%, 50%) 0%, rgba(234, 179, 8, 0) 100%)",
+    RIGHT: "radial-gradient(25% 60% at 100% 50%, hsl(50, 100%, 50%) 0%, rgba(234, 179, 8, 0) 100%)",
+  };
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setDirection((prevState) => rotateDirection(prevState));
+    }, duration * 1000);
+    return () => clearInterval(interval);
+  }, [duration]);
+
+  return (
+    <motion.div
+      className="absolute inset-0 overflow-hidden rounded-2xl pointer-events-none z-0"
+      style={{
+        filter: "blur(3px)",
+      }}
+      initial={{ background: movingMap[direction] }}
+      animate={{ background: movingMap[direction] }}
+      transition={{ ease: "linear", duration: duration }}
+    />
+  );
+};
 
 interface ObservabilitySource {
   url: string;
   type: string;
+  token: string;
 }
 
 interface WatcherFormData {
@@ -19,26 +61,24 @@ interface WatcherFormData {
   applicationUrl: string;
   githubToken: string;
   observabilitySources: ObservabilitySource[];
-  observabilityAuth: string;
 }
 
 interface WatcherFormProps {
   onSubmit: (data: WatcherFormData) => void;
   onClose: () => void;
   isCreating: boolean;
+  validationError?: string | null;
 }
 
-// Bottom gradient effect for buttons
 const BottomGradient = () => {
   return (
     <>
-      <span className="absolute inset-x-0 -bottom-px block h-px w-full bg-gradient-to-r from-transparent via-emerald-500 to-transparent opacity-0 transition duration-500 group-hover/btn:opacity-100" />
-      <span className="absolute inset-x-10 -bottom-px mx-auto block h-px w-1/2 bg-gradient-to-r from-transparent via-emerald-400 to-transparent opacity-0 blur-sm transition duration-500 group-hover/btn:opacity-100" />
+      <span className="absolute inset-x-0 -bottom-px block h-px w-full bg-gradient-to-r from-transparent via-yellow-500 to-transparent opacity-0 transition duration-500 group-hover/btn:opacity-100" />
+      <span className="absolute inset-x-10 -bottom-px mx-auto block h-px w-1/2 bg-gradient-to-r from-transparent via-yellow-400 to-transparent opacity-0 blur-sm transition duration-500 group-hover/btn:opacity-100" />
     </>
   );
 };
 
-// Label + Input container
 const LabelInputContainer = ({
   children,
   className,
@@ -53,49 +93,116 @@ const LabelInputContainer = ({
   );
 };
 
-export function WatcherForm({ onSubmit, onClose, isCreating }: WatcherFormProps) {
+// Textarea with animated glow border (matching Input component)
+const TextareaWithGlow = ({
+  className,
+  ...props
+}: React.TextareaHTMLAttributes<HTMLTextAreaElement>) => {
+  const radius = 100;
+  const [visible, setVisible] = useState(false);
+
+  const mouseX = useMotionValue(0);
+  const mouseY = useMotionValue(0);
+
+  function handleMouseMove({ currentTarget, clientX, clientY }: React.MouseEvent) {
+    const { left, top } = currentTarget.getBoundingClientRect();
+    mouseX.set(clientX - left);
+    mouseY.set(clientY - top);
+  }
+
+  return (
+    <motion.div
+      style={{
+        background: useMotionTemplate`
+          radial-gradient(
+            ${visible ? radius + "px" : "0px"} circle at ${mouseX}px ${mouseY}px,
+            rgba(16, 185, 129, 0.6),
+            transparent 80%
+          )
+        `,
+      }}
+      onMouseMove={handleMouseMove}
+      onMouseEnter={() => setVisible(true)}
+      onMouseLeave={() => setVisible(false)}
+      className="group/input rounded-lg p-[2px] transition duration-300"
+    >
+      <textarea
+        className={cn(
+          "shadow-input flex w-full rounded-lg border-none bg-zinc-800 px-4 py-3 text-sm text-white transition duration-400 group-hover/input:shadow-none placeholder:text-zinc-500 focus-visible:ring-[2px] focus-visible:ring-emerald-500/50 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 shadow-[0px_0px_1px_1px_#27272a] resize-none",
+          className
+        )}
+        {...props}
+      />
+    </motion.div>
+  );
+};
+
+const OBSERVABILITY_TYPES = [
+  { value: "prometheus", label: "Prometheus", placeholder: "https://prometheus.example.com/api/v1/query" },
+  { value: "grafana", label: "Grafana", placeholder: "https://grafana.example.com" },
+  { value: "loki", label: "Loki", placeholder: "https://loki.example.com/loki/api/v1/query" },
+  { value: "datadog", label: "Datadog", placeholder: "https://api.datadoghq.com" },
+  { value: "cloudwatch", label: "CloudWatch", placeholder: "arn:aws:logs:region:account:log-group" },
+  { value: "newrelic", label: "New Relic", placeholder: "https://api.newrelic.com" },
+];
+
+export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: WatcherFormProps) {
   const [formData, setFormData] = useState<WatcherFormData>({
     name: "",
     repo: "",
     repoDescription: "",
     applicationUrl: "",
     githubToken: "",
-    observabilitySources: [],
-    observabilityAuth: "",
+    observabilitySources: [{ url: "", type: "prometheus", token: "" }],
   });
-  const [newObservabilityUrl, setNewObservabilityUrl] = useState("");
-  const [newObservabilityType, setNewObservabilityType] = useState("prometheus");
+  const [expandedSource, setExpandedSource] = useState<number | null>(0);
 
-  const handleAddObservabilitySource = () => {
-    if (newObservabilityUrl.trim()) {
-      setFormData({
-        ...formData,
-        observabilitySources: [
-          ...formData.observabilitySources,
-          { url: newObservabilityUrl.trim(), type: newObservabilityType },
-        ],
-      });
-      setNewObservabilityUrl("");
-      setNewObservabilityType("prometheus");
+  const handleAddSource = () => {
+    setFormData({
+      ...formData,
+      observabilitySources: [
+        ...formData.observabilitySources,
+        { url: "", type: "prometheus", token: "" },
+      ],
+    });
+    setExpandedSource(formData.observabilitySources.length);
+  };
+
+  const handleRemoveSource = (index: number) => {
+    if (formData.observabilitySources.length <= 1) return;
+    const newSources = formData.observabilitySources.filter((_, i) => i !== index);
+    setFormData({ ...formData, observabilitySources: newSources });
+    if (expandedSource === index) {
+      setExpandedSource(null);
+    } else if (expandedSource !== null && expandedSource > index) {
+      setExpandedSource(expandedSource - 1);
     }
   };
 
-  const handleRemoveObservabilitySource = (index: number) => {
-    setFormData({
-      ...formData,
-      observabilitySources: formData.observabilitySources.filter((_, i) => i !== index),
-    });
+  const handleSourceChange = (index: number, field: keyof ObservabilitySource, value: string) => {
+    const newSources = [...formData.observabilitySources];
+    newSources[index] = { ...newSources[index], [field]: value };
+    setFormData({ ...formData, observabilitySources: newSources });
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.name || !formData.repo || !formData.repoDescription) {
-      return;
-    }
+    if (!isValid) return;
     onSubmit(formData);
   };
 
-  const isValid = formData.name && formData.repo && formData.repoDescription;
+  const hasValidObservabilitySource = formData.observabilitySources.some(
+    (source) => source.url.trim() !== ""
+  );
+
+  const isValid =
+    formData.name.trim() !== "" &&
+    formData.repo.trim() !== "" &&
+    formData.repoDescription.trim() !== "" &&
+    hasValidObservabilitySource;
+
+  const getTypeConfig = (type: string) =>
+    OBSERVABILITY_TYPES.find((t) => t.value === type) || OBSERVABILITY_TYPES[0];
 
   return (
     <motion.div
@@ -110,17 +217,22 @@ export function WatcherForm({ onSubmit, onClose, isCreating }: WatcherFormProps)
         animate={{ scale: 1, y: 0 }}
         exit={{ scale: 0.95, y: 20 }}
         onClick={(e) => e.stopPropagation()}
-        className="shadow-input bg-zinc-900 border border-zinc-800 rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden"
+        className="relative shadow-input max-w-5xl w-full h-[78vh] overflow-visible p-px rounded-2xl"
       >
+        {/* Animated glowing border */}
+        <AnimatedBorderGlow duration={1.5} />
+        
+        {/* Inner modal content */}
+        <div className="relative bg-zinc-900 border border-zinc-800/50 rounded-2xl overflow-hidden z-10 h-full flex flex-col">
         {/* Header */}
-        <div className="flex items-center justify-between p-6 border-b border-zinc-800/50">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-lg flex items-center justify-center shadow-lg shadow-emerald-500/20">
-              <Skull className="text-white" size={20} strokeWidth={2} />
-            </div>
+        <div className="flex items-center justify-between p-5 border-b border-zinc-800/50 shrink-0">
+          <div className="flex items-center gap-4">
+            <LokiIcon className="w-12 h-12" />
             <div>
-              <h2 className="text-xl font-bold text-white">Add New Watcher</h2>
-              <p className="text-sm text-zinc-500">Create a zombie hunter for your repository</p>
+              <h2 className="text-lg font-bold text-white">Add New Watcher</h2>
+              <p className="text-xs text-zinc-500">
+                Watchers are observators with glorious purpose that look for service zombies
+              </p>
             </div>
           </div>
           <button
@@ -133,196 +245,278 @@ export function WatcherForm({ onSubmit, onClose, isCreating }: WatcherFormProps)
         </div>
 
         {/* Form */}
-        <form onSubmit={handleSubmit} className="p-6 md:p-8">
-          <div className="space-y-5 max-h-[calc(90vh-220px)] overflow-y-auto pr-2">
-            {/* Watcher Name & Repository - Side by Side on Desktop */}
-            <div className="flex flex-col space-y-4 md:flex-row md:space-y-0 md:space-x-4">
-              <LabelInputContainer>
-                <Label htmlFor="name">
-                  Watcher Name <span className="text-red-400">*</span>
-                </Label>
-                <Input
-                  id="name"
-                  type="text"
-                  value={formData.name}
-                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                  placeholder="Payment Service Watcher"
-                  disabled={isCreating}
-                />
-              </LabelInputContainer>
-              <LabelInputContainer>
-                <Label htmlFor="repo">
-                  GitHub Repository <span className="text-red-400">*</span>
-                </Label>
-                <Input
-                  id="repo"
-                  type="text"
-                  value={formData.repo}
-                  onChange={(e) => setFormData({ ...formData, repo: e.target.value })}
-                  placeholder="owner/repo-name"
-                  disabled={isCreating}
-                  className="font-mono"
-                />
-              </LabelInputContainer>
-            </div>
+        <form onSubmit={handleSubmit} className="p-5 flex-1 flex flex-col overflow-hidden">
+          <div className="flex-1 overflow-y-auto pr-2 scrollbar-thin scrollbar-thumb-zinc-700 scrollbar-track-transparent">
+            {/* Two Column Layout: Basic Info | Observability Sources */}
+            <div className="flex flex-row gap-6 h-full">
+              {/* Left Column: Basic Info */}
+              <div className="w-1/2 space-y-4">
+                <h3 className="text-sm font-semibold text-zinc-400 uppercase tracking-wider">
+                  Basic Information
+                </h3>
 
-            {/* Repository Description */}
-            <LabelInputContainer>
-              <Label htmlFor="description">
-                Describe this repository <span className="text-red-400">*</span>
-              </Label>
-              <motion.div
-                className="group/input rounded-lg p-[2px] transition duration-300"
-                whileHover={{
-                  background: "radial-gradient(100px circle at var(--mouse-x, 50%) var(--mouse-y, 50%), rgba(16, 185, 129, 0.6), transparent 80%)",
-                }}
-              >
-                <textarea
-                  id="description"
-                  value={formData.repoDescription}
-                  onChange={(e) => setFormData({ ...formData, repoDescription: e.target.value })}
-                  placeholder="E-commerce backend API handling payments, inventory, and order processing"
-                  disabled={isCreating}
-                  rows={3}
-                  className="shadow-input flex w-full rounded-lg border-none bg-zinc-800 px-4 py-3 text-sm text-white transition duration-400 placeholder:text-zinc-500 focus-visible:ring-[2px] focus-visible:ring-emerald-500/50 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 shadow-[0px_0px_1px_1px_#27272a] resize-none"
-                />
-              </motion.div>
-            </LabelInputContainer>
-
-            {/* Application Base URL */}
-            <LabelInputContainer>
-              <Label htmlFor="appUrl">
-                Application Base URL <span className="text-zinc-600">(Optional)</span>
-              </Label>
-              <Input
-                id="appUrl"
-                type="url"
-                value={formData.applicationUrl}
-                onChange={(e) => setFormData({ ...formData, applicationUrl: e.target.value })}
-                placeholder="https://api.myapp.com"
-                disabled={isCreating}
-                className="font-mono"
-              />
-              <p className="text-xs text-zinc-600">Where discovered endpoints can be tested</p>
-            </LabelInputContainer>
-
-            {/* GitHub Token */}
-            <LabelInputContainer>
-              <Label htmlFor="token">
-                GitHub Personal Access Token <span className="text-zinc-600">(Optional)</span>
-              </Label>
-              <Input
-                id="token"
-                type="password"
-                value={formData.githubToken}
-                onChange={(e) => setFormData({ ...formData, githubToken: e.target.value })}
-                placeholder="ghp_xxxxxxxxxxxxx"
-                disabled={isCreating}
-                className="font-mono"
-              />
-              <p className="text-xs text-zinc-600">Required for private repositories</p>
-            </LabelInputContainer>
-
-            {/* Divider */}
-            <div className="h-px w-full bg-gradient-to-r from-transparent via-zinc-700 to-transparent" />
-
-            {/* Observability Sources */}
-            <LabelInputContainer>
-              <Label>
-                Observability Sources <span className="text-zinc-600">(Optional)</span>
-              </Label>
-              <div className="flex gap-2">
-                <div className="flex-1">
+                {/* Watcher Name */}
+                <LabelInputContainer>
+                  <Label htmlFor="name">
+                    Watcher Name <span className="text-red-400">*</span>
+                  </Label>
                   <Input
+                    id="name"
                     type="text"
-                    value={newObservabilityUrl}
-                    onChange={(e) => setNewObservabilityUrl(e.target.value)}
-                    onKeyPress={(e) => e.key === "Enter" && (e.preventDefault(), handleAddObservabilitySource())}
-                    placeholder="http://prometheus:9090/api/v1/query"
+                    value={formData.name}
+                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                    placeholder="Payment Service Watcher"
                     disabled={isCreating}
-                    className="font-mono"
                   />
-                </div>
-                <select
-                  value={newObservabilityType}
-                  onChange={(e) => setNewObservabilityType(e.target.value)}
-                  disabled={isCreating}
-                  className="bg-zinc-800 border border-zinc-700 text-white px-3 py-2 rounded-lg text-sm focus:outline-none focus:border-emerald-500 transition-all disabled:opacity-50"
-                >
-                  <option value="prometheus">Prometheus</option>
-                  <option value="grafana">Grafana</option>
-                  <option value="loki">Loki</option>
-                  <option value="datadog">Datadog</option>
-                  <option value="cloudwatch">CloudWatch</option>
-                </select>
-                <button
-                  type="button"
-                  onClick={handleAddObservabilitySource}
-                  disabled={isCreating || !newObservabilityUrl.trim()}
-                  className="group/btn relative bg-emerald-500 hover:bg-emerald-400 text-black p-2.5 rounded-lg transition-colors disabled:opacity-50 cursor-hover"
-                >
-                  <Plus size={20} strokeWidth={2.5} />
-                  <BottomGradient />
-                </button>
+                </LabelInputContainer>
+
+                {/* Application URL */}
+                <LabelInputContainer>
+                  <Label htmlFor="appUrl">
+                    Application URL <span className="text-zinc-600">(Optional)</span>
+                  </Label>
+                  <Input
+                    id="appUrl"
+                    type="url"
+                    value={formData.applicationUrl}
+                    onChange={(e) => setFormData({ ...formData, applicationUrl: e.target.value })}
+                    placeholder="https://api.myapp.com"
+                    disabled={isCreating}
+                    className="font-mono text-sm"
+                  />
+                </LabelInputContainer>
+
+                {/* Repository Description */}
+                <LabelInputContainer>
+                  <Label htmlFor="description">
+                    Describe this repository <span className="text-red-400">*</span>
+                  </Label>
+                  <TextareaWithGlow
+                    id="description"
+                    value={formData.repoDescription}
+                    onChange={(e) => setFormData({ ...formData, repoDescription: e.target.value })}
+                    placeholder="E-commerce backend API handling payments, inventory, and order processing..."
+                    disabled={isCreating}
+                    rows={2}
+                  />
+                </LabelInputContainer>
+
+                {/* GitHub Repository */}
+                <LabelInputContainer>
+                  <Label htmlFor="repo">
+                    GitHub Repository <span className="text-red-400">*</span>
+                  </Label>
+                  <Input
+                    id="repo"
+                    type="text"
+                    value={formData.repo}
+                    onChange={(e) => setFormData({ ...formData, repo: e.target.value })}
+                    placeholder="https://github.com/owner/repo"
+                    disabled={isCreating}
+                    className="font-mono text-sm"
+                  />
+                </LabelInputContainer>
+
+                {/* GitHub Token */}
+                <LabelInputContainer>
+                  <Label htmlFor="token">
+                    GitHub Token <span className="text-zinc-600">(Private repos)</span>
+                  </Label>
+                  <Input
+                    id="token"
+                    type="password"
+                    value={formData.githubToken}
+                    onChange={(e) => setFormData({ ...formData, githubToken: e.target.value })}
+                    placeholder="ghp_xxxxxxxxxxxxx"
+                    disabled={isCreating}
+                    className="font-mono text-sm"
+                  />
+                </LabelInputContainer>
               </div>
-              {formData.observabilitySources.length > 0 && (
-                <div className="space-y-2 mt-3">
-                  {formData.observabilitySources.map((source, index) => (
-                    <div
-                      key={index}
-                      className="flex items-center justify-between bg-zinc-800/50 px-4 py-2.5 rounded-lg group border border-zinc-700/50"
-                    >
-                      <div className="flex items-center gap-3 flex-1 min-w-0">
-                        <span className="text-xs text-emerald-400 font-semibold uppercase px-2 py-1 bg-emerald-500/10 rounded flex-shrink-0">
-                          {source.type}
-                        </span>
-                        <code className="text-sm text-zinc-300 truncate">{source.url}</code>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => handleRemoveObservabilitySource(index)}
-                        disabled={isCreating}
-                        className="text-zinc-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-all disabled:opacity-0 ml-2 cursor-hover"
-                      >
-                        <X size={16} />
-                      </button>
-                    </div>
-                  ))}
+
+              {/* Vertical Divider */}
+              <div className="w-px bg-gradient-to-b from-transparent via-zinc-700 to-transparent shrink-0" />
+
+              {/* Right Column: Observability Sources */}
+              <div className="w-1/2 flex flex-col">
+                <div className="space-y-4 flex-1">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <h3 className="text-sm font-semibold text-zinc-400 uppercase tracking-wider">
+                      Observability Sources
+                    </h3>
+                    <p className="text-xs text-zinc-600 mt-1">
+                      At least one source required
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleAddSource}
+                    disabled={isCreating}
+                    className="flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300 transition-colors disabled:opacity-50 cursor-hover"
+                  >
+                    <Plus size={14} />
+                    Add Source
+                  </button>
                 </div>
-              )}
-              <p className="text-xs text-zinc-600">Add Prometheus, Grafana, or other observability sources</p>
-            </LabelInputContainer>
 
-            {/* Observability Auth Token */}
-            {formData.observabilitySources.length > 0 && (
-              <LabelInputContainer>
-                <Label htmlFor="obsAuth">
-                  Observability API Token <span className="text-zinc-600">(Optional)</span>
-                </Label>
-                <Input
-                  id="obsAuth"
-                  type="password"
-                  value={formData.observabilityAuth}
-                  onChange={(e) => setFormData({ ...formData, observabilityAuth: e.target.value })}
-                  placeholder="Bearer token or API key"
-                  disabled={isCreating}
-                  className="font-mono"
-                />
-              </LabelInputContainer>
-            )}
+                {/* Validation Warning */}
+                {!hasValidObservabilitySource && (
+                  <motion.div 
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    className="flex items-center gap-2 text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded-lg px-3 py-2"
+                  >
+                    <AlertCircle size={16} />
+                    <span className="text-xs">Add at least one observability source URL</span>
+                  </motion.div>
+                )}
 
-            {/* Info Box */}
-            <div className="bg-zinc-800/30 border border-zinc-700/50 rounded-lg p-4">
-              <div className="flex items-start gap-3">
-                <Clock size={18} className="text-emerald-400 mt-0.5 flex-shrink-0" />
-                <div>
-                  <p className="text-sm font-medium text-zinc-300">
-                    Observation scheduling comes next
-                  </p>
-                  <p className="text-xs text-zinc-500 mt-1">
-                    After creating the watcher, you&apos;ll configure scan frequency and
-                    analysis period from the dashboard.
-                  </p>
+                {/* Sources List */}
+                <div className="space-y-3">
+                  <AnimatePresence mode="popLayout">
+                    {formData.observabilitySources.map((source, index) => (
+                      <motion.div
+                        key={index}
+                        layout
+                        initial={{ opacity: 0, scale: 0.95 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.95 }}
+                        transition={{ type: "spring", stiffness: 300, damping: 30 }}
+                        className="bg-zinc-800/50 rounded-xl border border-zinc-700/50 overflow-hidden"
+                      >
+                        {/* Source Header */}
+                        <div
+                          className="flex items-center justify-between p-3 cursor-pointer hover:bg-zinc-800/80 transition-colors"
+                          onClick={() => setExpandedSource(expandedSource === index ? null : index)}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span
+                              className={cn(
+                                "text-xs font-semibold uppercase px-2 py-1 rounded",
+                                source.type === "prometheus" && "text-orange-400 bg-orange-500/10",
+                                source.type === "grafana" && "text-yellow-400 bg-yellow-500/10",
+                                source.type === "loki" && "text-cyan-400 bg-cyan-500/10",
+                                source.type === "datadog" && "text-purple-400 bg-purple-500/10",
+                                source.type === "cloudwatch" && "text-blue-400 bg-blue-500/10",
+                                source.type === "newrelic" && "text-green-400 bg-green-500/10"
+                              )}
+                            >
+                              {getTypeConfig(source.type).label}
+                            </span>
+                            <span className="text-xs text-zinc-400 truncate max-w-[120px] font-mono">
+                              {source.url || "No URL"}
+                            </span>
+                            {source.token && (
+                              <span className="text-xs text-emerald-400 bg-emerald-500/10 px-1.5 py-0.5 rounded">
+                                ✓
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            {formData.observabilitySources.length > 1 && (
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleRemoveSource(index);
+                                }}
+                                disabled={isCreating}
+                                className="text-zinc-500 hover:text-red-400 p-1 transition-colors disabled:opacity-50 cursor-hover"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            )}
+                            <ChevronDown
+                              size={16}
+                              className={cn(
+                                "text-zinc-500 transition-transform",
+                                expandedSource === index && "rotate-180"
+                              )}
+                            />
+                          </div>
+                        </div>
+
+                        {/* Expanded Content */}
+                        <AnimatePresence initial={false}>
+                          {expandedSource === index && (
+                            <motion.div
+                              initial={{ opacity: 0 }}
+                              animate={{ opacity: 1 }}
+                              exit={{ opacity: 0 }}
+                              transition={{ duration: 0.2 }}
+                              className="border-t border-zinc-700/50"
+                            >
+                              <div className="p-3 space-y-3">
+                                {/* Type Selector */}
+                                <LabelInputContainer>
+                                  <Label>Source Type</Label>
+                                  <select
+                                    value={source.type}
+                                    onChange={(e) => handleSourceChange(index, "type", e.target.value)}
+                                    disabled={isCreating}
+                                    className="bg-zinc-800 border border-zinc-700 text-white px-3 py-2 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50 transition-all disabled:opacity-50 w-full"
+                                  >
+                                    {OBSERVABILITY_TYPES.map((type) => (
+                                      <option key={type.value} value={type.value}>
+                                        {type.label}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </LabelInputContainer>
+
+                                {/* URL */}
+                                <LabelInputContainer>
+                                  <Label>
+                                    Endpoint URL <span className="text-red-400">*</span>
+                                  </Label>
+                                  <Input
+                                    type="url"
+                                    value={source.url}
+                                    onChange={(e) => handleSourceChange(index, "url", e.target.value)}
+                                    placeholder={getTypeConfig(source.type).placeholder}
+                                    disabled={isCreating}
+                                    className="font-mono text-sm"
+                                  />
+                                </LabelInputContainer>
+
+                                {/* Token */}
+                                <LabelInputContainer>
+                                  <Label>
+                                    Access Token <span className="text-zinc-600">(if required)</span>
+                                  </Label>
+                                  <Input
+                                    type="password"
+                                    value={source.token}
+                                    onChange={(e) => handleSourceChange(index, "token", e.target.value)}
+                                    placeholder="Bearer token or API key"
+                                    disabled={isCreating}
+                                    className="font-mono text-sm"
+                                  />
+                                </LabelInputContainer>
+                              </div>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </motion.div>
+                    ))}
+                  </AnimatePresence>
+                </div>
+                </div>
+
+                {/* Info Box - pushed to bottom */}
+                <div className="mt-auto bg-zinc-800/30 border border-zinc-700/50 rounded-lg p-3">
+                  <div className="flex items-start gap-2">
+                    <Clock size={16} className="text-emerald-400 mt-0.5 flex-shrink-0" />
+                    <div>
+                      <p className="text-xs font-medium text-zinc-300">
+                        Scheduling comes next
+                      </p>
+                      <p className="text-xs text-zinc-500 mt-0.5">
+                        Configure scan frequency from the dashboard after creation.
+                      </p>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -331,10 +525,24 @@ export function WatcherForm({ onSubmit, onClose, isCreating }: WatcherFormProps)
           {/* Divider */}
           <div className="h-px w-full bg-gradient-to-r from-transparent via-zinc-700 to-transparent my-6" />
 
+          {/* Validation Error */}
+          {validationError && (
+            <div className="bg-red-500/10 border border-red-500/30 rounded-lg p-4 mb-4">
+              <div className="flex items-start gap-3">
+                <AlertCircle size={18} className="text-red-400 mt-0.5 flex-shrink-0" />
+                <div>
+                  <p className="text-sm font-medium text-red-400">Validation Failed</p>
+                  <p className="text-xs text-red-300/80 mt-1">{validationError}</p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Footer */}
           <div className="flex items-center justify-between">
             <p className="text-sm text-zinc-500 hidden sm:block">
-              Watcher will analyze code patterns
+              {formData.observabilitySources.filter((s) => s.url).length} source
+              {formData.observabilitySources.filter((s) => s.url).length !== 1 ? "s" : ""} configured
             </p>
             <div className="flex items-center gap-3 w-full sm:w-auto">
               <button
@@ -348,15 +556,17 @@ export function WatcherForm({ onSubmit, onClose, isCreating }: WatcherFormProps)
               <button
                 type="submit"
                 disabled={!isValid || isCreating}
-                className="group/btn relative flex-1 sm:flex-none flex items-center justify-center gap-2 bg-gradient-to-br from-emerald-500 to-emerald-600 hover:from-emerald-400 hover:to-emerald-500 text-white px-6 py-2.5 rounded-lg font-semibold text-sm transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-[0px_1px_0px_0px_rgba(255,255,255,0.1)_inset,0px_-1px_0px_0px_rgba(255,255,255,0.1)_inset] cursor-hover"
+                data-variant="watcher"
+                className="group/btn relative flex-1 sm:flex-none flex items-center justify-center gap-2 bg-gradient-to-br from-yellow-500 to-yellow-600 hover:from-yellow-400 hover:to-yellow-500 text-zinc-900 px-6 py-2.5 rounded-lg font-semibold text-sm transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-[0px_1px_0px_0px_rgba(255,255,255,0.2)_inset,0px_-1px_0px_0px_rgba(0,0,0,0.1)_inset] cursor-hover"
               >
                 <Plus size={16} strokeWidth={2.5} />
-                Add Watcher
+                Create Watcher
                 <BottomGradient />
               </button>
             </div>
           </div>
         </form>
+        </div>
       </motion.div>
     </motion.div>
   );

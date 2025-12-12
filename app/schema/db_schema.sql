@@ -22,10 +22,10 @@ CREATE TABLE IF NOT EXISTS watchers (
     last_commit_date TIMESTAMPTZ,
     
     llm_business_context TEXT,
-    llm_tech_stack TEXT,
+    llm_tech_stack JSONB,
     llm_architecture TEXT,
-    llm_health TEXT,
-    llm_zombie_risk TEXT,
+    llm_health JSONB,
+    llm_zombie_risk JSONB,
     llm_raw_response JSONB,
     
     status VARCHAR(50) DEFAULT 'pending_schedule',
@@ -37,8 +37,8 @@ CREATE TABLE IF NOT EXISTS watchers (
     observability_urls JSONB,
     
     observation_type VARCHAR(20),
-    scan_frequency_minutes INTEGER,
-    analysis_period_days INTEGER,
+    scan_frequency_minutes DECIMAL(10, 4),
+    analysis_period_hours DECIMAL(10, 4),
     next_observation_at TIMESTAMPTZ
 );
 
@@ -64,11 +64,16 @@ CREATE TABLE IF NOT EXISTS zombie_candidates (
     scan_count INTEGER DEFAULT 1,
     
     llm_purpose TEXT,
-    llm_risk_score INTEGER,
+    llm_risk_score DECIMAL(3, 2),
     llm_risk_reasoning TEXT,
     
-    scan_frequency_minutes INTEGER,
-    analysis_period_days INTEGER,
+    depends_on_ids INTEGER[],
+    depends_on_signatures TEXT[],
+    dependency_count INTEGER DEFAULT 0,
+    caller_count INTEGER DEFAULT 0,
+    
+    scan_frequency_minutes DECIMAL(10, 4),
+    analysis_period_hours DECIMAL(10, 4),
     
     has_traffic BOOLEAN,
     last_traffic_at TIMESTAMPTZ,

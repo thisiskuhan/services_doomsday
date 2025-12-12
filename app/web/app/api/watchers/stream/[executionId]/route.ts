@@ -21,6 +21,10 @@ export async function GET(
   const stream = new ReadableStream({
     async start(controller) {
       let lastState = "";
+      let lastTaskId = "";
+
+      // Send initial connection message
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ connected: true, executionId })}\n\n`));
 
       const pollInterval = setInterval(async () => {
         try {
@@ -29,6 +33,8 @@ export async function GET(
           });
 
           if (!response.ok) {
+            console.error(`[api/watchers/stream] Kestra returned ${response.status} for execution ${executionId}`);
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: `Kestra error: ${response.status}`, state: "FAILED" })}\n\n`));
             clearInterval(pollInterval);
             controller.close();
             return;
@@ -36,12 +42,23 @@ export async function GET(
 
           const execution = await response.json();
           const currentState = execution.state.current;
+          
+          // Get the latest task that's currently running or most recently completed
+          const taskRunList = execution.taskRunList || [];
+          const latestTask = taskRunList.length > 0 
+            ? taskRunList[taskRunList.length - 1]
+            : null;
+          const currentTaskId = latestTask?.taskId || "";
 
-          if (currentState !== lastState) {
+          // Send update if state OR task changed
+          if (currentState !== lastState || currentTaskId !== lastTaskId) {
             lastState = currentState;
+            lastTaskId = currentTaskId;
+            
             const data = {
               state: currentState,
-              taskId: execution.taskRunList?.[execution.taskRunList.length - 1]?.taskId || "",
+              taskId: currentTaskId,
+              taskState: latestTask?.state?.current || "",
               duration: execution.state.duration,
               outputs: execution.outputs,
             };
@@ -69,8 +86,9 @@ export async function GET(
   return new NextResponse(stream, {
     headers: {
       "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
+      "Cache-Control": "no-cache, no-transform",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
     },
   });
 }

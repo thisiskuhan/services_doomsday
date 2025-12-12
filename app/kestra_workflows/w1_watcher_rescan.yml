@@ -1,0 +1,886 @@
+id: w1_watcher_rescan
+namespace: doomsday.watchers
+
+description: |
+  Watcher Rescan Workflow (W1-Rescan)
+  
+  Triggered by GitHub webhook on push/PR merge to default branch.
+  Re-scans the repository and performs smart candidate sync:
+  - Updates existing candidates (same endpoint, code changed)
+  - Adds new candidates (new endpoints discovered)
+  - Marks removed candidates (endpoints deleted from code)
+  
+  Database updates per candidate:
+  - file_path, framework, last_seen_commit, scan_count
+  - Preserves: first_seen_commit, llm_purpose, llm_risk_score
+
+labels:
+  team: doomsday
+  category: watcher-management
+  stage: rescan
+  version: "1.1"
+
+inputs:
+  - id: repository_url
+    type: STRING
+    description: Repository URL from webhook payload
+    required: false
+
+  - id: repository_name
+    type: STRING
+    description: Repository name (owner/repo) from webhook payload
+    required: false
+
+  - id: ref
+    type: STRING
+    description: Git ref from webhook (refs/heads/main)
+    required: false
+
+  - id: commit_sha
+    type: STRING
+    description: Commit SHA that triggered this rescan
+    required: false
+
+  - id: commit_message
+    type: STRING
+    description: Commit message from push event
+    required: false
+
+  - id: commit_author
+    type: STRING
+    description: Commit author name
+    required: false
+
+  - id: pusher
+    type: STRING
+    description: Who pushed the commit
+    required: false
+
+  - id: watcher_id
+    type: STRING
+    description: Watcher ID for manual rescan trigger
+    required: false
+
+  - id: github_token
+    type: STRING
+    description: GitHub PAT for private repos
+    required: false
+
+tasks:
+  # ============================================================================
+  # STAGE 0: Validate Webhook & Find Watcher
+  # ============================================================================
+  - id: validate_and_find_watcher
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate webhook payload and find matching watcher in database
+    timeout: PT1M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+      # Support both manual inputs and webhook trigger
+      REPO_NAME: "{{ inputs.repository_name ?? trigger.body.repository.full_name ?? '' }}"
+      REPO_URL: "{{ inputs.repository_url ?? trigger.body.repository.clone_url ?? '' }}"
+      WATCHER_ID: "{{ inputs.watcher_id ?? '' }}"
+      REF: "{{ inputs.ref ?? trigger.body.ref ?? '' }}"
+      COMMIT_SHA: "{{ inputs.commit_sha ?? trigger.body.after ?? trigger.body.head_commit.id ?? '' }}"
+      COMMIT_MESSAGE: "{{ inputs.commit_message ?? trigger.body.head_commit.message ?? '' }}"
+      COMMIT_AUTHOR: "{{ inputs.commit_author ?? trigger.body.head_commit.author.name ?? '' }}"
+      PUSHER: "{{ inputs.pusher ?? trigger.body.pusher.name ?? '' }}"
+    outputFiles:
+      - watcher_config.json
+      - status.txt
+    script: |
+      import json
+      import os
+      import psycopg2
+      
+      db_url = os.environ.get('DATABASE_URL')
+      repo_name = os.environ.get('REPO_NAME', '')
+      repo_url = os.environ.get('REPO_URL', '')
+      watcher_id = os.environ.get('WATCHER_ID', '')
+      ref = os.environ.get('REF', '')
+      commit_sha = os.environ.get('COMMIT_SHA', '')
+      
+      # Validate: either watcher_id or repo info required
+      if not watcher_id and not repo_name and not repo_url:
+          result = {"watcher_id": "", "skip_reason": "No watcher_id or repository info provided"}
+          with open('watcher_config.json', 'w') as f:
+              json.dump(result, f)
+          with open('status.txt', 'w') as f:
+              f.write('skip')
+          print("[SKIP] No watcher identification provided")
+          exit(0)
+      
+      # Check if this is a push to default branch
+      if ref and not (ref.endswith('/main') or ref.endswith('/master')):
+          branch = ref.split('/')[-1] if '/' in ref else ref
+          result = {"watcher_id": "", "skip_reason": f"Push to non-default branch: {branch}"}
+          with open('watcher_config.json', 'w') as f:
+              json.dump(result, f)
+          with open('status.txt', 'w') as f:
+              f.write('skip')
+          print(f"[SKIP] Push to non-default branch: {branch}")
+          exit(0)
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      # Find watcher by ID or repo name
+      if watcher_id:
+          cur.execute("""
+              SELECT watcher_id, watcher_name, repo_url, repo_name, default_branch,
+                     user_id, repo_description
+              FROM watchers 
+              WHERE watcher_id = %s AND status = 'active'
+          """, (watcher_id,))
+      else:
+          cur.execute("""
+              SELECT watcher_id, watcher_name, repo_url, repo_name, default_branch,
+                     user_id, repo_description
+              FROM watchers 
+              WHERE (repo_name = %s OR repo_url = %s OR repo_url = %s)
+                AND status = 'active'
+          """, (repo_name, repo_url, f"https://github.com/{repo_name}"))
+      
+      row = cur.fetchone()
+      cur.close()
+      conn.close()
+      
+      if not row:
+          result = {"watcher_id": "", "skip_reason": "No active watcher found"}
+          with open('watcher_config.json', 'w') as f:
+              json.dump(result, f)
+          with open('status.txt', 'w') as f:
+              f.write('skip')
+          print(f"[SKIP] No watcher found for repo: {repo_name or repo_url or watcher_id}")
+          exit(0)
+      
+      result = {
+          "watcher_id": row[0],
+          "watcher_name": row[1],
+          "repo_url": row[2],
+          "repo_name": row[3],
+          "default_branch": row[4],
+          "user_id": row[5],
+          "repo_description": row[6] or "",
+          "trigger_commit": commit_sha[:7] if commit_sha else "manual"
+      }
+      
+      with open('watcher_config.json', 'w') as f:
+          json.dump(result, f, indent=2)
+      
+      with open('status.txt', 'w') as f:
+          f.write('proceed')
+      
+      print(f"[OK] Found watcher: {result['watcher_name']}")
+      print(f"[OK] Repository: {result['repo_name']}")
+
+  # ============================================================================
+  # CONDITIONAL: Check if watcher was found
+  # ============================================================================
+  - id: check_should_proceed
+    type: io.kestra.plugin.core.flow.If
+    description: Check if we found a valid watcher
+    condition: "{{ read(outputs.validate_and_find_watcher.outputFiles['status.txt']) | startsWith('proceed') }}"
+    then:
+      # ========================================================================
+      # STAGE 1: Clone Repository & Discover Entities
+      # ========================================================================
+      - id: clone_and_discover
+        type: io.kestra.plugin.core.flow.WorkingDirectory
+        description: Clone repository and perform code analysis
+        tasks:
+          - id: clone_repo
+            type: io.kestra.plugin.git.Clone
+            description: Clone GitHub repository
+            retry:
+              type: exponential
+              maxAttempts: 3
+              interval: PT5S
+              maxInterval: PT1M
+            timeout: PT5M
+            url: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).repo_url }}"
+            username: "{{ inputs.github_token != null ? 'oauth2' : null }}"
+            password: "{{ inputs.github_token }}"
+            branch: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).default_branch }}"
+
+          - id: discover_entities
+            type: io.kestra.plugin.scripts.python.Script
+            description: Scan codebase for code entities
+            timeout: PT10M
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            outputFiles:
+              - discovery.json
+              - code_samples.json
+            script: |
+              import os
+              import re
+              import json
+              from pathlib import Path
+              
+              REPO_DIR = "{{ outputs.clone_repo.directory }}"
+              
+              # Helper: Extract route path from Next.js App Router file path
+              def extract_nextjs_route(file_path):
+                  match = re.search(r'(?:src/)?app(/api/[^/]+(?:/[^/]+)*)/route\.[jt]sx?$', file_path)
+                  if match:
+                      return match.group(1)
+                  match = re.search(r'(?:src/)?pages(/api/[^/]+(?:/[^/]+)*)\..[jt]sx?$', file_path)
+                  if match:
+                      return match.group(1)
+                  return '/unknown'
+              
+              entities = {
+                  "http_endpoints": [],
+                  "grpc_services": [],
+                  "graphql_resolvers": [],
+                  "cron_jobs": [],
+                  "queue_workers": [],
+                  "serverless_functions": [],
+                  "websockets": []
+              }
+              
+              code_samples = []
+              
+              CODE_EXT = (
+                  '.py', '.js', '.ts', '.jsx', '.tsx', '.go',
+                  '.java', '.rb', '.php', '.rs', '.kt', '.cs'
+              )
+              
+              SKIP_DIRS = {
+                  'node_modules', 'venv', '.venv', '__pycache__',
+                  '.git', 'dist', 'build', 'vendor', '.next', 'target',
+                  'coverage', '.cache', 'tmp', 'temp'
+              }
+              
+              PATTERNS = {
+                  "http": [
+                      (r'@(?:app|router)\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)', 'fastapi'),
+                      (r'(?:app|router)\.(get|post|put|delete|patch)\s*\(\s*["\']([^"\']+)', 'express'),
+                      (r'@app\.route\s*\(\s*["\']([^"\']+)', 'flask'),
+                      (r'path\s*\(\s*["\']([^"\']+)', 'django'),
+                      (r'@(Get|Post|Put|Delete|Patch)\s*\(\s*["\']?([^"\'\)\s]*)', 'nestjs'),
+                      (r'@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*\(\s*["\']([^"\']+)', 'spring'),
+                      (r'export\s+(?:async\s+)?function\s+(GET|POST|PUT|DELETE|PATCH)', 'nextjs_api'),
+                  ],
+                  "grpc": [
+                      (r'service\s+(\w+)\s*\{', 'proto'),
+                      (r'@GrpcMethod\s*\(\s*["\'](\w+)', 'nestjs_grpc'),
+                  ],
+                  "graphql": [
+                      (r'@Query\s*\(\s*\)', 'nestjs_gql'),
+                      (r'@Mutation\s*\(\s*\)', 'nestjs_gql'),
+                      (r'type\s+(Query|Mutation)\s*\{', 'schema'),
+                  ],
+                  "cron": [
+                      (r'@(?:celery\.task|periodic_task|shared_task)', 'celery'),
+                      (r'@scheduler\.scheduled_job', 'apscheduler'),
+                      (r'cron\.schedule\s*\(\s*["\']([^"\']+)', 'node_cron'),
+                      (r'@Cron\s*\(\s*["\']([^"\']+)', 'nestjs_cron'),
+                      (r'@Scheduled\s*\(cron\s*=\s*["\']([^"\']+)', 'spring_scheduled'),
+                  ],
+                  "queue": [
+                      (r'@(?:app\.task|shared_task)', 'celery'),
+                      (r'@Process\s*\(\s*["\']?([^"\']*)', 'bull'),
+                      (r'channel\.consume\s*\(\s*["\']([^"\']+)', 'rabbitmq'),
+                      (r'@SqsMessageHandler\s*\(', 'aws_sqs'),
+                  ],
+                  "serverless": [
+                      (r'exports\.handler\s*=', 'aws_lambda'),
+                      (r'def\s+lambda_handler\s*\(', 'aws_lambda_py'),
+                      (r'\[FunctionName\s*\(\s*["\']([^"\']+)', 'azure_function'),
+                      (r'@cloud_function', 'gcp_function'),
+                  ],
+                  "websocket": [
+                      (r'@WebSocketGateway\s*\(\s*', 'nestjs_ws'),
+                      (r'ws\.on\s*\(\s*["\']message', 'nodejs_ws'),
+                      (r'@OnMessage\s*\(\s*\)', 'socketio'),
+                  ],
+              }
+              
+              stats = {"files_scanned": 0, "total_entities": 0}
+              
+              for root, dirs, files in os.walk(REPO_DIR):
+                  dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+                  
+                  for file in files:
+                      if not file.endswith(CODE_EXT):
+                          continue
+                      
+                      filepath = os.path.join(root, file)
+                      rel_path = os.path.relpath(filepath, REPO_DIR)
+                      
+                      try:
+                          with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                              content = f.read()
+                          
+                          stats["files_scanned"] += 1
+                          
+                          for category, patterns in PATTERNS.items():
+                              for pattern, framework in patterns:
+                                  for match in re.finditer(pattern, content, re.MULTILINE | re.IGNORECASE):
+                                      start = max(0, match.start() - 50)
+                                      end = min(len(content), match.end() + 100)
+                                      snippet = content[start:end].strip()
+                                      
+                                      line_num = content[:match.start()].count('\n') + 1
+                                      
+                                      entity = {
+                                          "source_file": rel_path,
+                                          "framework": framework,
+                                          "line": line_num,
+                                          "match": match.group(0)[:100],
+                                          "code_snippet": snippet[:500]
+                                      }
+                                      
+                                      if category == "http":
+                                          groups = match.groups()
+                                          method = groups[0].upper() if groups else 'GET'
+                                          if framework == 'nextjs_api':
+                                              path = extract_nextjs_route(rel_path)
+                                          else:
+                                              path = groups[1] if len(groups) > 1 else '/'
+                                          entity.update({"method": method, "path": str(path)})
+                                          entities["http_endpoints"].append(entity)
+                                      elif category == "grpc":
+                                          entity["service_name"] = match.group(1) if match.groups() else "unknown"
+                                          entities["grpc_services"].append(entity)
+                                      elif category == "graphql":
+                                          entity["operation_type"] = "query" if "Query" in str(match.group(0)) else "mutation"
+                                          entities["graphql_resolvers"].append(entity)
+                                      elif category == "cron":
+                                          entity["schedule"] = match.group(1) if match.groups() else "scheduled"
+                                          entities["cron_jobs"].append(entity)
+                                      elif category == "queue":
+                                          entity["queue_name"] = match.group(1) if match.groups() and match.group(1) else "default"
+                                          entities["queue_workers"].append(entity)
+                                      elif category == "serverless":
+                                          entity["function_name"] = match.group(1) if match.groups() and match.group(1) else rel_path
+                                          entities["serverless_functions"].append(entity)
+                                      elif category == "websocket":
+                                          entity["event_name"] = match.group(1) if match.groups() and match.group(1) else "connection"
+                                          entities["websockets"].append(entity)
+                                      
+                                      stats["total_entities"] += 1
+                                      
+                                      if len(code_samples) < 50:
+                                          code_samples.append({
+                                              "file": rel_path,
+                                              "line": line_num,
+                                              "type": category,
+                                              "framework": framework,
+                                              "snippet": snippet[:300]
+                                          })
+                      except Exception as e:
+                          continue
+              
+              def dedupe(items):
+                  seen = set()
+                  unique = []
+                  for item in items:
+                      key = f"{item.get('source_file')}:{item.get('line', 0)}"
+                      if key not in seen:
+                          seen.add(key)
+                          unique.append(item)
+                  return unique
+              
+              for key in entities:
+                  entities[key] = dedupe(entities[key])
+              
+              result = {
+                  "entities": entities,
+                  "summary": {
+                      "files_scanned": stats["files_scanned"],
+                      "http_endpoints": len(entities["http_endpoints"]),
+                      "grpc_services": len(entities["grpc_services"]),
+                      "graphql_resolvers": len(entities["graphql_resolvers"]),
+                      "cron_jobs": len(entities["cron_jobs"]),
+                      "queue_workers": len(entities["queue_workers"]),
+                      "serverless_functions": len(entities["serverless_functions"]),
+                      "websockets": len(entities["websockets"]),
+                      "total": sum(len(v) for v in entities.values())
+                  }
+              }
+              
+              with open('discovery.json', 'w') as f:
+                  json.dump(result, f, indent=2)
+              
+              with open('code_samples.json', 'w') as f:
+                  json.dump(code_samples, f, indent=2)
+              
+              print(f"[RESCAN] Discovery: {stats['files_scanned']} files, {result['summary']['total']} entities")
+
+          - id: extract_git_metadata
+            type: io.kestra.plugin.scripts.shell.Commands
+            description: Extract git metadata
+            timeout: PT2M
+            taskRunner:
+              type: io.kestra.plugin.core.runner.Process
+            outputFiles:
+              - git_metadata.json
+            commands:
+              - |
+                cd {{ outputs.clone_repo.directory }}
+                
+                COMMIT_HASH=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+                COMMIT_MSG=$(git log -1 --format='%s' 2>/dev/null | head -c 100 | tr '"' "'" || echo "")
+                COMMIT_AUTHOR=$(git log -1 --format='%an' 2>/dev/null || echo "unknown")
+                COMMIT_DATE=$(git log -1 --format='%aI' 2>/dev/null || echo "")
+                TOTAL_COMMITS=$(git rev-list --count HEAD 2>/dev/null || echo "0")
+                
+                cat > git_metadata.json << METADATA_EOF
+                {
+                  "last_commit_hash": "${COMMIT_HASH}",
+                  "last_commit_message": "${COMMIT_MSG}",
+                  "last_commit_author": "${COMMIT_AUTHOR}",
+                  "last_commit_date": "${COMMIT_DATE}",
+                  "total_commits": ${TOTAL_COMMITS},
+                  "source": "git_cli"
+                }
+                METADATA_EOF
+                
+                echo "Git metadata extracted"
+
+      # ========================================================================
+      # STAGE 2: LLM Analysis
+      # ========================================================================
+      - id: llm_analysis
+        type: io.kestra.plugin.scripts.python.Script
+        description: Re-analyze repository with LLM
+        timeout: PT5M
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install -q google-genai
+        env:
+          REPO_DESCRIPTION: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).repo_description }}"
+          REPO_URL: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).repo_url }}"
+          WATCHER_NAME: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).watcher_name }}"
+          GOOGLE_API_KEY: "{{ secret('GOOGLE_AI_API_KEY') }}"
+        inputFiles:
+          discovery.json: "{{ outputs.discover_entities.outputFiles['discovery.json'] }}"
+          code_samples.json: "{{ outputs.discover_entities.outputFiles['code_samples.json'] }}"
+          git_metadata.json: "{{ outputs.extract_git_metadata.outputFiles['git_metadata.json'] }}"
+        outputFiles:
+          - llm_analysis.json
+        script: |
+          import os
+          import re
+          import json
+          
+          repo_description = os.environ.get('REPO_DESCRIPTION', '')
+          repo_url = os.environ.get('REPO_URL', '')
+          watcher_name = os.environ.get('WATCHER_NAME', '')
+          api_key = os.environ.get('GOOGLE_API_KEY', '')
+          
+          with open('discovery.json', 'r') as f:
+              discovery = json.load(f)
+          
+          with open('git_metadata.json', 'r') as f:
+              metadata = json.load(f)
+          
+          with open('code_samples.json', 'r') as f:
+              code_samples = json.load(f)
+          
+          analysis_result = {
+              "llm_enabled": False,
+              "repo_intelligence": {},
+              "zombie_risk_assessment": {},
+              "tech_stack": {},
+              "architecture_summary": "",
+              "business_context": "",
+              "error": None
+          }
+          
+          if not api_key:
+              analysis_result["error"] = "Google AI API key not configured"
+              print("[RESCAN] LLM analysis skipped - no API key")
+          else:
+              try:
+                  from google import genai
+                  client = genai.Client(api_key=api_key)
+                  
+                  entities_summary = discovery.get("summary", {})
+                  
+                  SENSITIVE_PATTERNS = [
+                      r'(?i)(api[_-]?key|secret|password|token|auth|credential)\s*[:=]\s*["\'][^"\']+["\']',
+                      r'Bearer\s+[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+\.[A-Za-z0-9\-_]+',
+                  ]
+                  
+                  def sanitize_snippet(snippet):
+                      for pattern in SENSITIVE_PATTERNS:
+                          snippet = re.sub(pattern, '[REDACTED]', snippet)
+                      return snippet
+                  
+                  sanitized_samples = []
+                  for sample in code_samples[:15]:
+                      sanitized_samples.append({
+                          "file": sample.get("file", ""),
+                          "type": sample.get("type", ""),
+                          "snippet": sanitize_snippet(sample.get("snippet", ""))[:200]
+                      })
+                  
+                  prompt = f"""Analyze this repository (RESCAN):
+
+          Repository: {watcher_name}
+          URL: {repo_url}
+          Context: {repo_description[:300]}
+
+          Latest Commit: {metadata.get('last_commit_hash', 'unknown')[:8]}
+          Author: {metadata.get('last_commit_author', 'unknown')}
+
+          Discovered Entities:
+          - HTTP endpoints: {entities_summary.get('http_endpoints', 0)}
+          - Cron jobs: {entities_summary.get('cron_jobs', 0)}
+          - Queue workers: {entities_summary.get('queue_workers', 0)}
+          - Serverless: {entities_summary.get('serverless_functions', 0)}
+
+          Sample Code:
+          {json.dumps(sanitized_samples[:10], indent=2)[:1500]}
+
+          Return JSON with: business_context, tech_stack, zombie_risk (level, reasoning), architecture_summary"""
+                  
+                  response = client.models.generate_content(
+                      model="gemini-2.5-flash",
+                      contents=prompt
+                  )
+                  
+                  if response.text:
+                      json_match = re.search(r'\{[\s\S]*\}', response.text)
+                      if json_match:
+                          llm_json = json.loads(json_match.group())
+                          analysis_result["llm_enabled"] = True
+                          analysis_result["business_context"] = llm_json.get("business_context", "")
+                          analysis_result["tech_stack"] = llm_json.get("tech_stack", {})
+                          analysis_result["architecture_summary"] = llm_json.get("architecture_summary", "")
+                          
+                          risk_data = llm_json.get("zombie_risk", {})
+                          analysis_result["zombie_risk_assessment"] = {
+                              "overall_risk": risk_data.get("level", "unknown"),
+                              "reasoning": risk_data.get("reasoning", "")
+                          }
+                          
+                          analysis_result["repo_intelligence"] = {
+                              "business_context": analysis_result["business_context"],
+                              "tech_stack": analysis_result["tech_stack"],
+                              "architecture": analysis_result["architecture_summary"]
+                          }
+                          
+                          print("[RESCAN] LLM analysis completed")
+              except Exception as e:
+                  analysis_result["error"] = str(e)[:200]
+                  print(f"[RESCAN] LLM failed: {str(e)[:100]}")
+          
+          with open('llm_analysis.json', 'w') as f:
+              json.dump(analysis_result, f, indent=2)
+
+      # ========================================================================
+      # STAGE 3: Smart Candidate Sync
+      # ========================================================================
+      - id: sync_candidates
+        type: io.kestra.plugin.scripts.python.Script
+        description: |
+          Smart sync: Upsert candidates using ON CONFLICT.
+          - Existing candidates: update file_path, scan_count
+          - New candidates: insert with signature
+          - Missing candidates: mark as removed
+        retry:
+          type: exponential
+          maxAttempts: 3
+          interval: PT2S
+          maxInterval: PT30S
+        timeout: PT5M
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install -q psycopg2-binary
+        env:
+          DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+          COMMIT_SHA: "{{ inputs.commit_sha ?? '' }}"
+        inputFiles:
+          watcher_config.json: "{{ outputs.validate_and_find_watcher.outputFiles['watcher_config.json'] }}"
+          discovery.json: "{{ outputs.discover_entities.outputFiles['discovery.json'] }}"
+          llm_analysis.json: "{{ outputs.llm_analysis.outputFiles['llm_analysis.json'] }}"
+          git_metadata.json: "{{ outputs.extract_git_metadata.outputFiles['git_metadata.json'] }}"
+        outputFiles:
+          - sync_result.json
+        script: |
+          import json
+          import os
+          import re
+          import psycopg2
+          
+          db_url = os.environ.get('DATABASE_URL')
+          commit_sha = os.environ.get('COMMIT_SHA', '')[:40] or None
+          
+          with open('watcher_config.json', 'r') as f:
+              config = json.load(f)
+          watcher_id = config['watcher_id']
+          
+          with open('discovery.json', 'r') as f:
+              discovery = json.load(f)
+          
+          with open('llm_analysis.json', 'r') as f:
+              llm_analysis = json.load(f)
+          
+          with open('git_metadata.json', 'r') as f:
+              git_metadata = json.load(f)
+          
+          entities = discovery.get('entities', {})
+          summary = discovery.get('summary', {})
+          
+          def extract_nextjs_route(file_path):
+              """Extract route path from Next.js app router file structure"""
+              if not file_path:
+                  return '/'
+              match = re.search(r'app(/api)?(/.*?)?/route\.(ts|js)', file_path)
+              if match:
+                  path = (match.group(1) or '') + (match.group(2) or '')
+                  return path if path else '/'
+              return '/'
+          
+          def build_signature(entity_type, entity):
+              if entity_type == 'http_endpoints':
+                  method = entity.get('method', 'GET')
+                  path = entity.get('path', '')
+                  if path == method or not path or path == '/':
+                      path = extract_nextjs_route(entity.get('source_file', ''))
+                  return f"{method}:{path}"
+              elif entity_type == 'grpc_services':
+                  return f"grpc:{entity.get('service_name', 'unknown')}"
+              elif entity_type == 'graphql_resolvers':
+                  return f"gql:{entity.get('operation_type', 'query')}:{entity.get('name', 'unknown')}"
+              elif entity_type == 'cron_jobs':
+                  return f"cron:{entity.get('schedule', 'unknown')}"
+              elif entity_type == 'queue_workers':
+                  return f"queue:{entity.get('queue_name', 'default')}"
+              elif entity_type == 'serverless_functions':
+                  return f"fn:{entity.get('function_name', 'handler')}"
+              elif entity_type == 'websockets':
+                  return f"ws:{entity.get('event_name', 'connection')}"
+              return f"unknown:{entity.get('source_file', '')}"
+          
+          type_mapping = {
+              'http_endpoints': 'http_endpoint',
+              'grpc_services': 'grpc_service',
+              'graphql_resolvers': 'graphql_resolver',
+              'cron_jobs': 'cron_job',
+              'queue_workers': 'queue_worker',
+              'serverless_functions': 'serverless_function',
+              'websockets': 'websocket'
+          }
+          
+          conn = psycopg2.connect(db_url, sslmode='require')
+          cur = conn.cursor()
+          
+          # Get all current signatures for this watcher
+          cur.execute("SELECT entity_type, entity_signature FROM zombie_candidates WHERE watcher_id = %s AND status = 'active'", (watcher_id,))
+          existing_sigs = set((r[0], r[1]) for r in cur.fetchall())
+          
+          discovered_sigs = set()
+          seen_signatures = set()
+          stats = {'upserted': 0, 'removed': 0, 'skipped': 0}
+          
+          # Process each discovered entity - UPSERT
+          for entity_type, entity_list in entities.items():
+              db_type = type_mapping.get(entity_type, entity_type.rstrip('s'))
+              
+              for entity in entity_list:
+                  sig = build_signature(entity_type, entity)
+                  
+                  # Skip duplicates within this scan
+                  if sig in seen_signatures:
+                      stats['skipped'] += 1
+                      continue
+                  seen_signatures.add(sig)
+                  discovered_sigs.add((db_type, sig))
+                  
+                  # Build entity name and route_path
+                  route_path = None
+                  if entity_type == 'http_endpoints':
+                      method = entity.get('method', 'GET')
+                      path = entity.get('path', '')
+                      if path == method or not path or path == '/':
+                          path = extract_nextjs_route(entity.get('source_file', ''))
+                      route_path = path
+                      name = f"{method} {path}"
+                  elif entity_type == 'cron_jobs':
+                      name = entity.get('schedule', 'cron')[:50]
+                  elif entity_type == 'queue_workers':
+                      name = entity.get('queue_name', 'default')
+                  elif entity_type == 'serverless_functions':
+                      name = entity.get('function_name', 'handler')
+                  else:
+                      name = sig
+                  
+                  # UPSERT using ON CONFLICT - v4 schema
+                  cur.execute("""
+                      INSERT INTO zombie_candidates (
+                          watcher_id, entity_type, entity_signature, entity_name,
+                          file_path, method, route_path, schedule, queue_name,
+                          framework, status, first_seen_commit, last_seen_commit, scan_count
+                      ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, 1)
+                      ON CONFLICT (watcher_id, entity_type, entity_signature) 
+                      DO UPDATE SET
+                          file_path = EXCLUDED.file_path,
+                          framework = EXCLUDED.framework,
+                          last_seen_commit = EXCLUDED.last_seen_commit,
+                          status = 'active',
+                          removed_in_commit = NULL,
+                          scan_count = zombie_candidates.scan_count + 1,
+                          updated_at = NOW()
+                  """, (
+                      watcher_id, db_type, sig, name,
+                      entity.get('source_file', ''),
+                      entity.get('method') if entity_type == 'http_endpoints' else None,
+                      route_path,
+                      entity.get('schedule') if entity_type == 'cron_jobs' else None,
+                      entity.get('queue_name') if entity_type == 'queue_workers' else None,
+                      entity.get('framework'),
+                      commit_sha, commit_sha
+                  ))
+                  stats['upserted'] += 1
+          
+          # Mark removed candidates (existed before but not discovered now)
+          for (etype, sig) in existing_sigs:
+              if (etype, sig) not in discovered_sigs:
+                  cur.execute("""
+                      UPDATE zombie_candidates SET status = 'removed', removed_in_commit = %s, updated_at = NOW()
+                      WHERE watcher_id = %s AND entity_type = %s AND entity_signature = %s
+                  """, (commit_sha, watcher_id, etype, sig))
+                  stats['removed'] += 1
+          
+          # Extract git metadata
+          last_hash = git_metadata.get('last_commit_hash')
+          last_msg = git_metadata.get('last_commit_message', '')[:500] if git_metadata.get('last_commit_message') else None
+          last_author = git_metadata.get('last_commit_author')
+          last_date = git_metadata.get('last_commit_date')
+          
+          if last_hash == 'unknown' or last_hash == '': last_hash = None
+          if last_author == 'unknown' or last_author == '': last_author = None
+          if last_date == 'unknown' or last_date == '' or not last_date: last_date = None
+          
+          # Extract LLM data
+          repo_intel = llm_analysis.get('repo_intelligence', {})
+          
+          # Update watcher metadata - v4 schema
+          cur.execute("""
+              UPDATE watchers SET
+                  total_candidates = %s,
+                  http_endpoints = %s,
+                  cron_jobs = %s,
+                  queue_workers = %s,
+                  serverless_functions = %s,
+                  websockets = %s,
+                  grpc_services = %s,
+                  graphql_resolvers = %s,
+                  last_commit_hash = %s,
+                  last_commit_message = %s,
+                  last_commit_author = %s,
+                  last_commit_date = %s,
+                  llm_business_context = %s,
+                  llm_tech_stack = %s,
+                  llm_architecture = %s,
+                  llm_health = %s,
+                  llm_zombie_risk = %s,
+                  llm_raw_response = %s,
+                  scan_count = scan_count + 1,
+                  updated_at = NOW()
+              WHERE watcher_id = %s
+          """, (
+              summary.get('total', 0),
+              summary.get('http_endpoints', 0),
+              summary.get('cron_jobs', 0),
+              summary.get('queue_workers', 0),
+              summary.get('serverless_functions', 0),
+              summary.get('websockets', 0),
+              summary.get('grpc_services', 0),
+              summary.get('graphql_resolvers', 0),
+              last_hash,
+              last_msg,
+              last_author,
+              last_date,
+              repo_intel.get('business_context', '')[:1000] if repo_intel else None,
+              json.dumps(llm_analysis.get('tech_stack', {})),
+              repo_intel.get('architecture_summary', '')[:1000] if repo_intel else None,
+              json.dumps(llm_analysis.get('codebase_health', {})),
+              json.dumps(llm_analysis.get('zombie_risk_assessment', {})),
+              json.dumps(llm_analysis),
+              watcher_id
+          ))
+          
+          conn.commit()
+          cur.close()
+          conn.close()
+          
+          result = {
+              "watcher_id": watcher_id,
+              "watcher_name": config['watcher_name'],
+              "commit": commit_sha[:7] if commit_sha else "manual",
+              "candidates_upserted": stats['upserted'],
+              "candidates_removed": stats['removed'],
+              "total_discovered": summary.get('total', 0)
+          }
+          
+          with open('sync_result.json', 'w') as f:
+              json.dump(result, f, indent=2)
+          
+          print(f"[RESCAN] Sync complete for {config['watcher_name']}")
+          print(f"[RESCAN] Upserted: {stats['upserted']}, Removed: {stats['removed']}")
+
+      # Output success result
+      - id: output_success
+        type: io.kestra.plugin.core.output.OutputValues
+        description: Return rescan results
+        values:
+          status: "rescan_complete"
+          watcher_id: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).watcher_id }}"
+          watcher_name: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).watcher_name }}"
+          trigger_commit: "{{ inputs.commit_sha ?? 'manual' }}"
+          execution_id: "{{ execution.id }}"
+
+    else:
+      # No watcher found - output skip message
+      - id: output_skipped
+        type: io.kestra.plugin.core.output.OutputValues
+        description: Return skip reason
+        values:
+          status: "skipped"
+          reason: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).skip_reason ?? 'No matching watcher found' }}"
+          execution_id: "{{ execution.id }}"
+
+errors:
+  - id: rescan_failed
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      status: "rescan_failed"
+      error: "Watcher rescan workflow failed"
+      execution_id: "{{ execution.id }}"
+
+# ============================================================================
+# TRIGGER: GitHub Webhook
+# ============================================================================
+triggers:
+  - id: github_push_webhook
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: devgraveyard-rescan-webhook-2024
+    conditions:
+      - type: io.kestra.plugin.core.condition.ExpressionCondition
+        expression: "{{ trigger.body.ref ends with '/main' or trigger.body.ref ends with '/master' }}"
+
+pluginDefaults:
+  - type: io.kestra.plugin.scripts.python.Script
+    values:
+      docker:
+        pullPolicy: IF_NOT_PRESENT
+  - type: io.kestra.plugin.git.Clone
+    values:
+      depth: 1

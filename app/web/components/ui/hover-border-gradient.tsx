@@ -24,21 +24,7 @@ export function HoverBorderGradient({
   } & React.HTMLAttributes<HTMLElement>
 >) {
   const [hovered, setHovered] = useState<boolean>(false);
-  const [delayedHover, setDelayedHover] = useState<boolean>(false);
   const [direction, setDirection] = useState<Direction>("TOP");
-
-  // Delay the color change by 500ms to sync with cursor
-  useEffect(() => {
-    let timer: NodeJS.Timeout;
-    if (hovered) {
-      timer = setTimeout(() => {
-        setDelayedHover(true);
-      }, 500);
-    } else {
-      setDelayedHover(false);
-    }
-    return () => clearTimeout(timer);
-  }, [hovered]);
 
   const rotateDirection = (currentDirection: Direction): Direction => {
     const directions: Direction[] = ["TOP", "LEFT", "BOTTOM", "RIGHT"];
@@ -77,7 +63,7 @@ export function HoverBorderGradient({
       onMouseLeave={() => setHovered(false)}
       className={cn(
         "relative flex rounded-full border content-center transition duration-300 items-center flex-col flex-nowrap gap-10 h-min justify-center overflow-visible p-px decoration-clone w-fit",
-        delayedHover 
+        hovered 
           ? "bg-emerald-950/30 border-emerald-500/50" 
           : "bg-zinc-800/20 border-zinc-600/50",
         containerClassName
@@ -104,7 +90,7 @@ export function HoverBorderGradient({
         }}
         initial={{ background: movingMap[direction] }}
         animate={{
-          background: delayedHover
+          background: hovered
             ? [movingMap[direction], highlight]
             : movingMap[direction],
         }}

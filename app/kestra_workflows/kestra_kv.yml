@@ -1,0 +1,5 @@
+# Kestra KV Store Source Data
+# Namespace: doomsday.watchers
+
+w1_llm: "gemini-2.5-flash-lite"
+

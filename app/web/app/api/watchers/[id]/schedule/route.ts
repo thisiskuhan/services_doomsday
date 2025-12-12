@@ -6,14 +6,15 @@ import { pool } from "@/lib/db";
  * 
  * Updates watcher and candidates with observation settings.
  * Called from the Schedule modal after watcher creation.
+ * Supports both initial scheduling and editing of existing schedules.
  * 
  * POST /api/watchers/[id]/schedule
- * Body: { scanFrequencyMinutes, analysisPeriodDays, forAllServices }
+ * Body: { scanFrequencySeconds, analysisPeriodHours, forAllServices }
  */
 
 interface ScheduleRequest {
-  scanFrequencyMinutes: number;
-  analysisPeriodDays: number;
+  scanFrequencySeconds: number;
+  analysisPeriodHours: number;
   forAllServices: boolean;
 }
 
@@ -28,22 +29,23 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     const { id: watcherId } = await params;
     const body: ScheduleRequest = await req.json();
 
-    // Validate inputs
-    if (!body.scanFrequencyMinutes || body.scanFrequencyMinutes < 5 || body.scanFrequencyMinutes > 1440) {
+    // Validate inputs (minimum 1 second, max 24 hours for scan)
+    if (!body.scanFrequencySeconds || body.scanFrequencySeconds < 1 || body.scanFrequencySeconds > 86400) {
       return NextResponse.json(
-        { error: "Scan frequency must be between 5 and 1440 minutes" },
+        { error: "Scan frequency must be between 1 second and 24 hours" },
         { status: 400 }
       );
     }
 
-    if (!body.analysisPeriodDays || body.analysisPeriodDays < 7 || body.analysisPeriodDays > 365) {
+    // Validate analysis period (minimum 1 minute = 1/60 hour, max 365 days = 8760 hours)
+    if (!body.analysisPeriodHours || body.analysisPeriodHours < 1/60 || body.analysisPeriodHours > 8760) {
       return NextResponse.json(
-        { error: "Analysis period must be between 7 and 365 days" },
+        { error: "Analysis period must be between 1 minute and 365 days" },
         { status: 400 }
       );
     }
 
-    // Check watcher exists and is pending_schedule
+    // Check watcher exists (allow both pending_schedule and scheduled for editing)
     const watcherResult = await client.query(
       "SELECT watcher_id, status FROM watchers WHERE watcher_id = $1",
       [watcherId]
@@ -54,15 +56,21 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     }
 
     const watcher = watcherResult.rows[0];
-    if (watcher.status !== "pending_schedule") {
+    
+    // Allow scheduling for pending_schedule or re-scheduling for already scheduled watchers
+    if (watcher.status !== "pending_schedule" && watcher.status !== "scheduled") {
       return NextResponse.json(
-        { error: `Watcher is already ${watcher.status}. Cannot reschedule.` },
+        { error: `Cannot modify schedule for watcher with status: ${watcher.status}` },
         { status: 400 }
       );
     }
 
-    // Calculate next observation time
-    const nextObservationAt = new Date(Date.now() + body.scanFrequencyMinutes * 60 * 1000);
+    // Convert seconds to minutes for database storage (period already in hours)
+    const scanFrequencyMinutes = body.scanFrequencySeconds / 60;
+    const analysisPeriodHours = body.analysisPeriodHours;
+
+    // Calculate next observation time (using seconds for precision)
+    const nextObservationAt = new Date(Date.now() + body.scanFrequencySeconds * 1000);
 
     // Determine observation type
     const observationType = body.forAllServices ? "uniform" : "varied";
@@ -75,40 +83,52 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
         status = 'scheduled',
         observation_type = $1,
         scan_frequency_minutes = $2,
-        analysis_period_days = $3,
+        analysis_period_hours = $3,
         next_observation_at = $4,
         updated_at = NOW()
       WHERE watcher_id = $5`,
-      [observationType, body.scanFrequencyMinutes, body.analysisPeriodDays, nextObservationAt, watcherId]
+      [observationType, scanFrequencyMinutes, analysisPeriodHours, nextObservationAt, watcherId]
     );
 
-    // If forAllServices is true, we don't need to set per-candidate settings
-    // If false, candidates keep NULL values (inherit from watcher by default)
-    // Per-endpoint customization can be done later via another API
-
-    if (!body.forAllServices) {
-      // For 'varied' type, we'll set default values on candidates too
+    // Always propagate schedule to candidates when forAllServices is true
+    // This ensures candidates have the same schedule settings as the watcher
+    if (body.forAllServices) {
+      await client.query(
+        `UPDATE zombie_candidates SET
+          scan_frequency_minutes = $1,
+          analysis_period_hours = $2,
+          updated_at = NOW()
+        WHERE watcher_id = $3`,
+        [scanFrequencyMinutes, analysisPeriodHours, watcherId]
+      );
+    } else {
+      // For 'varied' type, also set default values on candidates
       // This allows the user to later customize individual endpoints
       await client.query(
         `UPDATE zombie_candidates SET
           scan_frequency_minutes = $1,
-          analysis_period_days = $2,
+          analysis_period_hours = $2,
           updated_at = NOW()
         WHERE watcher_id = $3`,
-        [body.scanFrequencyMinutes, body.analysisPeriodDays, watcherId]
+        [scanFrequencyMinutes, analysisPeriodHours, watcherId]
       );
     }
 
     await client.query("COMMIT");
+
+    const isUpdate = watcher.status === "scheduled";
 
     return NextResponse.json({
       success: true,
       watcherId,
       status: "scheduled",
       observationType,
-      scanFrequencyMinutes: body.scanFrequencyMinutes,
-      analysisPeriodDays: body.analysisPeriodDays,
+      scanFrequencySeconds: body.scanFrequencySeconds,
+      analysisPeriodHours: body.analysisPeriodHours,
       nextObservationAt: nextObservationAt.toISOString(),
+      message: isUpdate 
+        ? "Schedule updated successfully. Observation data preserved."
+        : "Observation scheduled successfully.",
     });
   } catch (error) {
     await client.query("ROLLBACK");

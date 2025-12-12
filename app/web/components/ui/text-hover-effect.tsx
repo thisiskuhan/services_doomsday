@@ -66,7 +66,7 @@ export const TextHoverEffect = ({
           animate={maskPosition}
           transition={{ duration: duration ?? 0, ease: "easeOut" }}
 
-          // example for a smoother animation below
+          // for a smoother animation
 
           //   transition={{
           //     type: "spring",

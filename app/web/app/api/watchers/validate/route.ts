@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { pool } from "@/lib/db";
 
 /**
  * Watcher Validation API
@@ -9,6 +10,8 @@ import { NextRequest, NextResponse } from "next/server";
  * Validation includes:
  * - Watcher name format and length
  * - GitHub repository URL format
+ * - Duplicate watcher name check (per user)
+ * - Duplicate GitHub repository check (per user)
  * - GitHub API accessibility (public/private with token)
  * - Repository description presence
  */
@@ -36,6 +39,13 @@ interface GitHubRepoDetails {
   description: string | null;
 }
 
+interface DuplicateCheckResult {
+  hasDuplicateName: boolean;
+  hasDuplicateRepo: boolean;
+  existingWatcherName?: string;
+  existingRepoUrl?: string;
+}
+
 interface ValidationResult {
   valid: boolean;
   errors: string[];
@@ -46,6 +56,7 @@ interface ValidationResult {
     details?: GitHubRepoDetails;
   };
   inputs?: InputValidationResult;
+  duplicates?: DuplicateCheckResult;
 }
 
 interface InputValidationResult {
@@ -83,6 +94,60 @@ function validateInputs(body: ValidateWatcherRequest): InputValidationResult {
       error: !body.repoDescription ? "Repository description is required" : undefined,
     },
   };
+}
+
+/**
+ * Check for duplicate watcher name or repository URL for the same user
+ */
+async function checkDuplicates(
+  name: string,
+  repoUrl: string,
+  userId: string
+): Promise<DuplicateCheckResult> {
+  const result: DuplicateCheckResult = {
+    hasDuplicateName: false,
+    hasDuplicateRepo: false,
+  };
+
+  try {
+    // Normalize repo URL (remove trailing slash for comparison)
+    const normalizedRepoUrl = repoUrl.replace(/\/$/, "").toLowerCase();
+
+    // Check for duplicate name (case-insensitive) for this user
+    const nameCheck = await pool.query(
+      `SELECT watcher_name FROM watchers 
+       WHERE LOWER(watcher_name) = LOWER($1) AND user_id = $2 
+       LIMIT 1`,
+      [name, userId]
+    );
+
+    if (nameCheck.rows.length > 0) {
+      result.hasDuplicateName = true;
+      result.existingWatcherName = nameCheck.rows[0].watcher_name;
+    }
+
+    // Check for duplicate repo URL for this user
+    const repoCheck = await pool.query(
+      `SELECT watcher_name, repo_url FROM watchers 
+       WHERE LOWER(REPLACE(repo_url, '/', '')) = LOWER(REPLACE($1, '/', '')) AND user_id = $2
+       LIMIT 1`,
+      [normalizedRepoUrl, userId]
+    );
+
+    if (repoCheck.rows.length > 0) {
+      result.hasDuplicateRepo = true;
+      result.existingRepoUrl = repoCheck.rows[0].repo_url;
+      // If name wasn't duplicate, include the watcher name that has this repo
+      if (!result.existingWatcherName) {
+        result.existingWatcherName = repoCheck.rows[0].watcher_name;
+      }
+    }
+  } catch (error) {
+    console.error("[api/watchers/validate] Duplicate check error:", error);
+    // Don't fail validation if duplicate check fails - just log and continue
+  }
+
+  return result;
 }
 
 async function validateGitHubRepo(
@@ -177,7 +242,29 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(result, { status: 400 });
     }
 
-    // 2. Validate GitHub repository (only if URL format is valid)
+    // 2. Check for duplicates in database (same name or repo for this user)
+    if (body.userId) {
+      const duplicates = await checkDuplicates(body.name, body.repoUrl, body.userId);
+      result.duplicates = duplicates;
+
+      if (duplicates.hasDuplicateName) {
+        result.errors.push(
+          `A watcher with the name "${duplicates.existingWatcherName}" already exists. Please choose a different name.`
+        );
+      }
+
+      if (duplicates.hasDuplicateRepo) {
+        result.errors.push(
+          `This repository is already being watched by "${duplicates.existingWatcherName}". Each repository can only have one watcher per user.`
+        );
+      }
+
+      if (duplicates.hasDuplicateName || duplicates.hasDuplicateRepo) {
+        return NextResponse.json(result, { status: 409 }); // 409 Conflict
+      }
+    }
+
+    // 3. Validate GitHub repository (only if URL format is valid)
     if (inputs.repoUrl.valid) {
       result.github = await validateGitHubRepo(body.repoUrl, body.githubToken);
 
@@ -192,7 +279,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 3. Optional: Validate application URL format (basic check)
+    // 4. Optional: Validate application URL format (basic check)
     if (body.applicationUrl) {
       try {
         new URL(body.applicationUrl);
@@ -201,7 +288,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 4. Optional: Validate observability sources format
+    // 5. Optional: Validate observability sources format
     if (body.observabilitySources && body.observabilitySources.length > 0) {
       const invalidUrls = body.observabilitySources.filter((s) => {
         try {

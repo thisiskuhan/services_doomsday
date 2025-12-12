@@ -8,6 +8,7 @@ import { auth } from "@/lib/firebase";
 import { Spotlight } from "@/components/ui/spotlight-new";
 import { FloatingDock } from "@/components/ui/floating-dock";
 import { CustomCursor } from "@/components/ui/CustomCursor";
+import { DoomLoader } from "@/components/ui/DoomLoader";
 import { Home, Eye, LogOut } from "lucide-react";
 
 export default function DashboardLayout({
@@ -57,11 +58,11 @@ export default function DashboardLayout({
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-[#0a0a0a] flex items-center justify-center">
-        <div className="flex flex-col items-center gap-4">
-          <div className="w-12 h-12 border-2 border-emerald-500/30 border-t-emerald-500 rounded-full animate-spin" />
-          <p className="text-zinc-500 text-sm">Loading...</p>
-        </div>
+      <div className="min-h-screen bg-[#0a0a0a]">
+        <DoomLoader 
+          text="Initializing..." 
+          subText="Dr. Doom is verifying your identity"
+        />
       </div>
     );
   }
