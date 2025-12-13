@@ -4,20 +4,22 @@ import { useState, useEffect, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import {
-  X,
-  GitBranch,
-  AlertTriangle,
-  Shield,
-  Server,
-  Cpu,
-  MessageSquare, ExternalLink,
-  Trash2,
-  Link2
+    X,
+    GitBranch,
+    Shield,
+    Server,
+    Cpu,
+    MessageSquare,
+    ExternalLink,
+    Trash2,
+    Link2,
+    AlertTriangle
 } from "lucide-react";
 import { ObservationSources } from "./ObservationSources";
 import { CandidateList } from "./CandidateList";
 import { CandidateScheduleModal } from "./CandidateScheduleModal";
 import { ScarletWitchIcon } from "@/components/ui/CustomCursor";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { formatDate, formatRelativeTime } from "@/lib/utils";
 import { AnimatedBorderGlow, WatcherStatusBadge } from "@/components/ui/shared";
 
@@ -272,70 +274,18 @@ export function WatcherDetailModal({
       className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4"
       onClick={onClose}
     >
-      {/* Delete Confirmation Modal */}
-      <AnimatePresence>
-        {showDeleteConfirm && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0 z-60 flex items-center justify-center bg-black/50"
-            onClick={(e) => {
-              e.stopPropagation();
-              if (!isDeleting) setShowDeleteConfirm(false);
-            }}
-          >
-            <motion.div
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.9, opacity: 0 }}
-              className="bg-zinc-900 border border-zinc-800 rounded-2xl p-6 max-w-md w-full mx-4 shadow-2xl"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <div className="flex items-center gap-3 mb-4">
-                <div className="p-2 bg-red-500/20 rounded-lg">
-                  <AlertTriangle className="w-6 h-6 text-red-500" />
-                </div>
-                <h3 className="text-lg font-semibold text-white">Delete Watcher</h3>
-              </div>
-              
-              <p className="text-zinc-400 mb-2">
-                Are you sure you want to delete <span className="text-white font-medium">{watcher.watcher_name}</span>?
-              </p>
-              <p className="text-zinc-500 text-sm mb-6">
-                This will permanently remove the watcher and all {watcher.total_candidates} zombie candidates. This action cannot be undone.
-              </p>
-              
-              <div className="flex gap-3 justify-end">
-                <button
-                  onClick={() => setShowDeleteConfirm(false)}
-                  disabled={isDeleting}
-                  className="px-4 py-2 text-sm font-medium text-zinc-400 hover:text-white bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors disabled:opacity-50"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={handleDelete}
-                  disabled={isDeleting}
-                  className="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors flex items-center gap-2 disabled:opacity-50"
-                >
-                  {isDeleting ? (
-                    <>
-                      <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                      Deleting...
-                    </>
-                  ) : (
-                    <>
-                      <Trash2 className="w-4 h-4" />
-                      Delete
-                    </>
-                  )}
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* Delete Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={showDeleteConfirm}
+        onClose={() => !isDeleting && setShowDeleteConfirm(false)}
+        onConfirm={handleDelete}
+        title="Delete Watcher"
+        message={`Are you sure you want to delete "${watcher.watcher_name}"? This will permanently remove the watcher and all ${watcher.total_candidates} zombie candidates. This action cannot be undone.`}
+        confirmText="Delete"
+        cancelText="Cancel"
+        variant="danger"
+        isLoading={isDeleting}
+      />
 
       <motion.div
         initial={{ scale: 0.95, y: 20 }}
@@ -533,6 +483,16 @@ export function WatcherDetailModal({
 
             {activeTab === "analysis" && (
               <div className="space-y-6">
+                {/* Disclaimer Note */}
+                <div className="flex items-start gap-2 p-3 bg-blue-500/10 border border-blue-500/20 rounded-lg">
+                  <svg className="w-4 h-4 text-blue-400 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <p className="text-xs text-blue-300">
+                    This is the <span className="font-medium">preliminary analysis</span> based on code structure. For current observation-based risk scores, check individual candidates.
+                  </p>
+                </div>
+
                 {/* Health & Risk Overview */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   {/* Project Health Card */}

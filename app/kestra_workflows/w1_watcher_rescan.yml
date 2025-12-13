@@ -475,6 +475,10 @@ tasks:
           import re
           import json
           
+          # Escape braces for JSON template in prompt (Kestra Pebble conflict)
+          open_brace = "{"
+          close_brace = "}"
+          
           repo_description = os.environ.get('REPO_DESCRIPTION', '')
           repo_url = os.environ.get('REPO_URL', '')
           watcher_name = os.environ.get('WATCHER_NAME', '')
@@ -548,16 +552,16 @@ tasks:
           {json.dumps(sanitized_samples[:10], indent=2)[:1500]}
 
           Return ONLY valid JSON (no markdown):
-          {{
+          {open_brace}
             "business_context": "What business problem does this application solve? Who are the users?",
-            "tech_stack": {{"languages": [], "frameworks": [], "databases": [], "infrastructure": []}},
+            "tech_stack": {open_brace}"languages": [], "frameworks": [], "databases": [], "infrastructure": []{close_brace},
             "architecture_summary": "Describe the architecture pattern and how services interact",
-            "zombie_risk": {{
+            "zombie_risk": {open_brace}
               "level": "low|medium|high",
               "reasoning": "Focus on SERVICE-LEVEL concerns: Are any API endpoints potentially unused? Any cron jobs that might be orphaned? Queue workers with unclear purpose?",
               "high_risk_areas": ["List SERVICE CATEGORIES at risk - e.g., 'Legacy API Routes', 'Deprecated Cron Jobs', 'Unused Queue Workers'. DO NOT list individual files."]
-            }}
-          }}"""
+            {close_brace}
+          {close_brace}"""
                   
                   response = client.models.generate_content(
                       model="gemini-2.5-flash",

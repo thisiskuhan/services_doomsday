@@ -562,6 +562,10 @@ tasks:
       import json
       from pathlib import Path
       
+      # Escape braces for Kestra Pebble template engine
+      OPEN_BRACE = "{"
+      CLOSE_BRACE = "}"
+      
       REPO_DIR = os.environ.get('REPO_DIR', '.')
       
       with open('candidates_with_code.json', 'r') as f:
@@ -601,98 +605,115 @@ tasks:
           
           patterns = []
           
-          # Clean path for regex - handle dynamic segments
-          # /api/currency/[country] -> /api/currency/[^/]+
-          # /api/users/:id -> /api/users/[^/]+
-          path_regex = path
-          path_regex = re.sub(r'\[(\w+)\]', r'[^/]+', path_regex)  # [param]
-          path_regex = re.sub(r':(\w+)', r'[^/]+', path_regex)      # :param
-          path_regex = re.sub(r'\{(\w+)\}', r'[^/]+', path_regex)   # {param}
-          path_escaped = re.escape(path_regex).replace(r'\[\^/\]\+', '[^/]+')
-          
-          # Also create a version without escaping for literal matches
-          path_literal = re.escape(path)
-          
           # Extract key path segments for flexible matching
           # /api/currency/[country] -> ['api', 'currency']
           segments = [s for s in path.split('/') if s and not s.startswith('[') and not s.startswith(':') and not s.startswith('{')]
+          
+          # Get the distinctive segment (usually the resource name like 'currency', 'animal', 'capital')
           key_segment = segments[-1] if segments else ''
           
-          # 1. Direct string literals (single quotes, double quotes)
-          patterns.append(rf'["\']({path_escaped}|{path_literal})["\']')
+          # Get path without dynamic segments for exact matching
+          # /api/currency/[country] -> /api/currency
+          static_path = '/'.join([''] + [s for s in path.split('/') if s and not s.startswith('[') and not s.startswith(':') and not s.startswith('{')])
+          static_path_escaped = re.escape(static_path)
           
-          # 2. Template literals with backticks - COMPREHENSIVE
-          # fetch(`/api/currency/${country}`)
-          # fetch(`${baseUrl}/api/currency/${country}`)
-          if key_segment:
-              patterns.append(rf'`[^`]*/{key_segment}[^`]*`')
-          patterns.append(rf'`[^`]*{path_escaped}[^`]*`')
+          print(f"  Building patterns for: {path}")
+          print(f"    key_segment: {key_segment}")
+          print(f"    static_path: {static_path}")
           
-          # 3. Fetch API - all variations
-          patterns.extend([
-              rf'fetch\s*\(\s*[`"\'][^`"\']*{path_escaped}',
-              rf'fetch\s*\(\s*[`"\'][^`"\']*/{key_segment}[/\s`"\']' if key_segment else None,
-              rf'fetch\s*\([^)]*{path_escaped}',
-          ])
-          
-          # 4. Axios - all methods
-          for method in ['get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'request']:
+          # PATTERN GROUP 1: Match the key segment in any URL context (ALL LANGUAGES)
+          # This catches /api/currency, /currency, currency in URLs
+          if key_segment and len(key_segment) > 2:
               patterns.extend([
-                  rf'axios\.{method}\s*\(\s*[`"\'][^`"\']*{path_escaped}',
-                  rf'axios\.{method}\s*\(\s*[`"\'][^`"\']*/{key_segment}[/\s`"\']' if key_segment else None,
-              ])
-          # axios({ url: '/api/...' })
-          patterns.append(rf'axios\s*\(\s*\{{[^}}]*url\s*:\s*[`"\'][^`"\']*{path_escaped}')
-          
-          # 5. Other HTTP clients (got, ky, superagent, request, ofetch, $fetch)
-          for client in ['got', 'ky', 'superagent', 'request', 'ofetch', r'\$fetch', 'http', 'api']:
-              patterns.extend([
-                  rf'{client}\s*\(\s*[`"\'][^`"\']*{path_escaped}',
-                  rf'{client}\s*\.\s*\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
-                  rf'{client}\s*\(\s*[`"\'][^`"\']*/{key_segment}[/\s`"\']' if key_segment else None,
+                  # In JS/TS template literals: `.../${baseUrl}/api/currency/${country}...`
+                  rf'`[^`]*/{key_segment}[^`]*`',
+                  
+                  # In string literals (all languages) - match /key_segment anywhere
+                  rf'["\'][^"\']*/{key_segment}[^"\']*["\']',
               ])
           
-          # 6. URL construction patterns
-          # new URL('/api/currency', baseUrl)
-          # URL.resolve(base, '/api/currency')
-          patterns.extend([
-              rf'new\s+URL\s*\(\s*[`"\'][^`"\']*{path_escaped}',
-              rf'URL\.resolve\s*\([^,]+,\s*[`"\'][^`"\']*{path_escaped}',
-          ])
-          
-          # 7. String concatenation patterns
-          # baseUrl + '/api/currency'
-          # '/api' + '/currency'
-          if key_segment:
-              patterns.append(rf'[\+\s][`"\'][^`"\']*/{key_segment}[`"\']')
-          
-          # 8. Object property patterns (route configs, API maps)
-          # { currency: '/api/currency' }
-          # routes.currency = '/api/currency'
-          if key_segment:
+          # PATTERN GROUP 2: Match static path prefix (ALL LANGUAGES)
+          if static_path and static_path != '/':
               patterns.extend([
-                  rf'{key_segment}\s*:\s*[`"\'][^`"\']*{path_escaped}',
-                  rf'{key_segment}\s*=\s*[`"\'][^`"\']*{path_escaped}',
+                  # JS/TS template literals
+                  rf'`[^`]*{static_path_escaped}[^`]*`',
+                  
+                  # Universal string literals (all languages)
+                  rf'["\'][^"\']*{static_path_escaped}[^"\']*["\']',
+                  
+                  # JavaScript/TypeScript: fetch/axios
+                  rf'fetch\s*\([^)]*{static_path_escaped}',
+                  rf'axios[.\w]*\([^)]*{static_path_escaped}',
+                  
+                  # Python: requests, httpx, aiohttp, urllib
+                  rf'requests\.\w+\s*\([^)]*{static_path_escaped}',
+                  rf'httpx\.\w+\s*\([^)]*{static_path_escaped}',
+                  rf'aiohttp\.\w+\s*\([^)]*{static_path_escaped}',
+                  rf'urlopen\s*\([^)]*{static_path_escaped}',
+                  rf'urllib\.\w+\.\w+\s*\([^)]*{static_path_escaped}',
+                  
+                  # Go: http.Get, http.Post, http.NewRequest
+                  rf'http\.\w+\s*\([^)]*{static_path_escaped}',
+                  rf'http\.NewRequest\s*\([^)]*{static_path_escaped}',
+                  
+                  # Java: HttpClient, RestTemplate, WebClient
+                  rf'HttpClient[^)]*{static_path_escaped}',
+                  rf'RestTemplate[^)]*{static_path_escaped}',
+                  rf'WebClient[^)]*{static_path_escaped}',
+                  rf'\.uri\s*\([^)]*{static_path_escaped}',
+                  rf'\.url\s*\([^)]*{static_path_escaped}',
+                  
+                  # Ruby: Net::HTTP, HTTParty, Faraday
+                  rf'Net::HTTP[^)]*{static_path_escaped}',
+                  rf'HTTParty\.\w+\s*\([^)]*{static_path_escaped}',
+                  rf'Faraday\.\w+\s*\([^)]*{static_path_escaped}',
+                  
+                  # PHP: curl, Guzzle, file_get_contents
+                  rf'curl_\w+\s*\([^)]*{static_path_escaped}',
+                  rf'Guzzle[^)]*{static_path_escaped}',
+                  rf'file_get_contents\s*\([^)]*{static_path_escaped}',
+                  
+                  # C#/.NET: HttpClient
+                  rf'HttpClient[^)]*{static_path_escaped}',
+                  rf'\.GetAsync\s*\([^)]*{static_path_escaped}',
+                  rf'\.PostAsync\s*\([^)]*{static_path_escaped}',
               ])
           
-          # 9. Next.js specific patterns
-          # router.push('/api/currency')
-          # Link href="/api/currency"
+          # PATTERN GROUP 3: API endpoint references in config objects
+          if key_segment:
+              patterns.extend([
+                  # { endpoint: '/api/currency' } or routes: { currency: '...' }
+                  rf'{key_segment}\s*[=:]\s*[`"\'][^`"\']*{static_path_escaped}' if static_path else None,
+                  
+                  # apiEndpoints.currency or routes['currency']
+                  rf'\.{key_segment}\b' if len(key_segment) > 3 else None,
+                  rf'\[[\'"]{key_segment}[\'"]\]',
+              ])
+          
+          # PATTERN GROUP 4: Internal API calls / String interpolation (multiple languages)
+          if static_path:
+              patterns.extend([
+                  # JS/TS: `${origin}/api/currency...`
+                  rf'\$\{{[^}}]*\}}{static_path_escaped}',
+                  # String concatenation: baseUrl + '/api/currency'
+                  rf'\+\s*[`"\'][^`"\']*{static_path_escaped}',
+                  # Python f-strings: f"{base_url}/api/currency"
+                  rf'\{{[^}}]*\}}{static_path_escaped}',
+                  # Python .format(): "{}/api/currency".format(...)
+                  rf'\.format\s*\([^)]*\)[^"\']*{static_path_escaped}',
+              ])
+          
+          # PATTERN GROUP 5: Route/path declarations (ALL LANGUAGES)
           patterns.extend([
-              rf'router\.\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
-              rf'href\s*=\s*[`"\'][^`"\']*{path_escaped}',
-              rf'redirect\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+              # path: '/api/currency' or route: '/api/currency'
+              rf'(?:path|route|url|endpoint|uri)\s*[=:]\s*[`"\'][^`"\']*{static_path_escaped}' if static_path else None,
           ])
           
-          # 10. Python requests library
-          patterns.extend([
-              rf'requests\.\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
-              rf'httpx\.\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
-              rf'aiohttp\.\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
-          ])
+          # Filter out None patterns
+          valid_patterns = [p for p in patterns if p]
+          print(f"    Generated {len(valid_patterns)} patterns")
           
-          # Filter out None patterns and empty ones
-          return [p for p in patterns if p]
+          return valid_patterns
       
       def build_function_patterns(snippet, entity_name):
           """Build patterns for function/method calls."""
@@ -798,25 +819,33 @@ tasks:
           }
       
       # Scan all files for dependency relationships
-      print(f"Scanning {len(all_files)} files for dependencies...")
+      print(f"\nScanning {len(all_files)} files for dependencies...")
+      print(f"Looking for patterns in {len(sig_to_patterns)} candidates")
       
+      matches_found = 0
       for rel_path, content in all_files.items():
           candidates_in_file = file_to_candidates.get(rel_path, [])
           candidate_sigs_in_file = {c['signature'] for c in candidates_in_file}
           
           for target_sig, patterns in sig_to_patterns.items():
-              # Skip self-references
+              # Skip self-references (don't look for calls to an endpoint IN the same file that defines it)
               if target_sig in candidate_sigs_in_file:
                   continue
               
               for pattern in patterns:
                   try:
                       for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
+                          matches_found += 1
                           line_num = content[:match.start()].count('\n') + 1
                           lines = content.split('\n')
                           start = max(0, line_num - 2)
                           end = min(len(lines), line_num + 2)
                           context = '\n'.join(lines[start:end])
+                          
+                          print(f"  MATCH FOUND: {target_sig}")
+                          print(f"    File: {rel_path}:{line_num}")
+                          print(f"    Pattern: {pattern[:60]}...")
+                          print(f"    Match: {match.group(0)[:80]}")
                           
                           caller_info = {
                               "file": rel_path,
@@ -843,7 +872,9 @@ tasks:
                                   if caller_sig not in dependencies[target_sig]["called_by_signatures"]:
                                       dependencies[target_sig]["called_by_signatures"].append(caller_sig)
                   except re.error as e:
-                      pass
+                      print(f"  REGEX ERROR: {pattern[:50]}... -> {e}")
+      
+      print(f"\nTotal matches found: {matches_found}")
       
       # Finalize counts
       for sig in dependencies:

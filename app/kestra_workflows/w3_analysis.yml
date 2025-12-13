@@ -294,6 +294,10 @@ tasks:
               import json
               import re
               
+              # Escape braces for JSON template in prompt (Kestra Pebble conflict)
+              open_brace = "{"
+              close_brace = "}"
+              
               api_key = os.environ.get('GOOGLE_API_KEY')
               llm_model = os.environ.get('LLM_MODEL', 'gemini-2.0-flash')
               zombie_threshold = int(os.environ.get('ZOMBIE_THRESHOLD', '70'))
@@ -337,18 +341,18 @@ tasks:
 
               ## Task
               Based on the REAL TRAFFIC DATA from the observation period, provide your analysis:
-              {{
+              {open_brace}
                 "verdict": "zombie" | "healthy" | "inconclusive",
                 "confidence": <0-100>,
                 "zombie_score": <0-100>,
                 "reasoning": "<2-3 sentences explaining your verdict based on TRAFFIC EVIDENCE>",
                 "recommendation": "<what should be done with this service>",
-                "blast_radius": {{
+                "blast_radius": {open_brace}
                   "risk_level": "low" | "medium" | "high",
                   "affected_count": <number of potentially affected services if removed>,
                   "concerns": ["<list of concerns if this service is removed>"]
-                }}
-              }}
+                {close_brace}
+              {close_brace}
 
               Rules:
               - If NO traffic detected over the observation period AND caller_count is 0 → likely zombie SERVICE
@@ -704,9 +708,9 @@ tasks:
 
     else:
       - id: no_candidates_ready
-        type: io.kestra.plugin.core.debug.Echo
+        type: io.kestra.plugin.core.log.Log
         level: INFO
-        format: "[W3] No candidates ready for analysis"
+        message: "[W3] No candidates ready for analysis"
 
   # ============================================================================
   # STAGE 4: Output Summary

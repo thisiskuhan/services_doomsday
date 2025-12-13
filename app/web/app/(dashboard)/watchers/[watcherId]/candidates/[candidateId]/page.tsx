@@ -43,6 +43,8 @@ import {
   Skull,
   Loader2,
 } from "lucide-react";
+import { TrafficChart } from "@/components/ui/TrafficChart";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 
 // Types
 interface CandidateDetails {
@@ -117,10 +119,14 @@ export default function CandidateDetailPage() {
   const [candidate, setCandidate] = useState<CandidateDetails | null>(null);
   const [stats, setStats] = useState<ObservationStats | null>(null);
   const [events, setEvents] = useState<ObservationEvent[]>([]);
+  const [showAllEvents, setShowAllEvents] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [actionLoading, setActionLoading] = useState(false);
   const [killLoading, setKillLoading] = useState(false);
   const [showGithubTokenModal, setShowGithubTokenModal] = useState(false);
   const [githubToken, setGithubToken] = useState("");
+  const [showOptOutConfirm, setShowOptOutConfirm] = useState(false);
+  const [showKillConfirm, setShowKillConfirm] = useState(false);
   const hasAnimated = useRef(false);
 
   const fetchCandidate = useCallback(async (isRefresh = false) => {
@@ -128,6 +134,7 @@ export default function CandidateDetailPage() {
 
     try {
       if (!isRefresh) setLoading(true);
+      if (isRefresh) setRefreshing(true);
       const response = await fetch(`/api/candidates/${candidateId}?userId=${user.uid}`);
       const data = await response.json();
 
@@ -143,6 +150,7 @@ export default function CandidateDetailPage() {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }, [candidateId, user?.uid]);
 
@@ -197,12 +205,7 @@ export default function CandidateDetailPage() {
   const handleOptOut = async () => {
     if (!candidate || !user?.uid) return;
 
-    const confirmed = window.confirm(
-      "Are you sure you want to opt this service out from observation? You can re-enable observation from the Watcher settings."
-    );
-
-    if (!confirmed) return;
-
+    setShowOptOutConfirm(false);
     setActionLoading(true);
     try {
       const response = await fetch(`/api/candidates/${candidateId}/schedule`, {
@@ -233,12 +236,7 @@ export default function CandidateDetailPage() {
   const handleKillZombie = async (token?: string) => {
     if (!candidate || !user?.uid) return;
 
-    const confirmed = window.confirm(
-      `KILL ZOMBIE: This will create a Pull Request to remove "${candidate.entitySignature}" from your codebase.\n\nAre you sure this code is dead and should be removed?`
-    );
-
-    if (!confirmed) return;
-
+    setShowKillConfirm(false);
     setKillLoading(true);
     try {
       const response = await fetch(`/api/candidates/${candidateId}/kill`, {
@@ -404,7 +402,7 @@ export default function CandidateDetailPage() {
               )}
               {candidate.status !== "inactive" ? (
                 <button
-                  onClick={handleOptOut}
+                  onClick={() => setShowOptOutConfirm(true)}
                   disabled={actionLoading}
                   data-variant="wanda"
                   className="px-3 py-2 text-sm font-medium text-red-400 bg-red-500/5 hover:bg-red-500/10 border border-red-500/20 rounded-lg transition-colors flex items-center gap-2 disabled:opacity-50"
@@ -427,7 +425,7 @@ export default function CandidateDetailPage() {
                 candidate.status === "confirmed_zombie" ||
                 (candidate.status === "active" && candidate.zombieScore >= 70)) && (
                 <button
-                  onClick={() => handleKillZombie()}
+                  onClick={() => setShowKillConfirm(true)}
                   disabled={killLoading || actionLoading}
                   data-variant="wanda"
                   className="px-4 py-2 text-sm font-medium text-red-500 bg-red-500/10 hover:bg-red-500/20 border border-red-500/40 rounded-lg transition-colors flex items-center gap-2 disabled:opacity-50"
@@ -651,10 +649,34 @@ export default function CandidateDetailPage() {
               </AnimatedCard>
             )}
 
-            {/* LLM Analysis */}
+            {/* Traffic Overview */}
             <AnimatedCard
               initialAnimation={!hasAnimated.current}
               delay={0.3}
+            >
+              <div className="flex items-center justify-between mb-4">
+                <div className="flex items-center gap-2">
+                  <Activity className="w-5 h-5 text-blue-400" />
+                  <h2 className="font-semibold text-white">Traffic Overview</h2>
+                </div>
+                <button
+                  onClick={() => fetchCandidate(true)}
+                  disabled={refreshing}
+                  className="p-1.5 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-lg transition-colors disabled:opacity-50"
+                  title="Refresh"
+                >
+                  <RefreshCw className={`w-4 h-4 ${refreshing ? "animate-spin" : ""}`} />
+                </button>
+              </div>
+
+              {/* Traffic Chart */}
+              <TrafficChart events={events} zombieScore={candidate.zombieScore} />
+            </AnimatedCard>
+
+            {/* LLM Analysis */}
+            <AnimatedCard
+              initialAnimation={!hasAnimated.current}
+              delay={0.4}
             >
               <div className="flex items-center gap-2 mb-4">
                 <TrendingUp className="w-5 h-5 text-purple-400" />
@@ -663,8 +685,15 @@ export default function CandidateDetailPage() {
 
               <div className="space-y-4">
                 <div>
-                  <p className="text-xs text-zinc-500 mb-2">Risk Score</p>
-                  <RiskScore score={candidate.llmRiskScore} />
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="text-xs text-zinc-500">Current Risk Score</p>
+                    {candidate.llmRiskScore !== null && candidate.llmRiskScore !== candidate.zombieScore / 100 && (
+                      <p className="text-[10px] text-zinc-600">
+                        Initial: {Math.round(candidate.llmRiskScore * 100)}%
+                      </p>
+                    )}
+                  </div>
+                  <RiskScore score={candidate.zombieScore / 100} />
                 </div>
 
                 {candidate.llmPurpose && (
@@ -693,60 +722,57 @@ export default function CandidateDetailPage() {
                 </div>
               </div>
             </AnimatedCard>
+          </div>
 
-            {/* Recent Observation Events */}
+          {/* Sidebar - Right Column */}
+          <div className="space-y-6">
+            {/* Event Logs */}
             <AnimatedCard
               initialAnimation={!hasAnimated.current}
-              delay={0.4}
+              delay={0.25}
             >
-              <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-2">
-                  <Activity className="w-5 h-5 text-blue-400" />
-                  <h2 className="font-semibold text-white">Recent Observations</h2>
+                  <Radio className="w-4 h-4 text-purple-400" />
+                  <h2 className="font-semibold text-white text-sm">Event Logs</h2>
                 </div>
-                <button
-                  onClick={() => fetchCandidate(true)}
-                  className="p-1.5 text-zinc-500 hover:text-white hover:bg-zinc-800 rounded-lg transition-colors"
-                  title="Refresh"
-                >
-                  <RefreshCw className="w-4 h-4" />
-                </button>
+                {events.length > 0 && (
+                  <span className="text-xs text-zinc-600 bg-zinc-800 px-2 py-0.5 rounded-full">{events.length}</span>
+                )}
               </div>
 
               {events.length === 0 ? (
-                <div className="text-center py-8">
-                  <Radio className="w-10 h-10 text-zinc-600 mx-auto mb-3" />
-                  <p className="text-zinc-400">No observations yet</p>
-                  <p className="text-zinc-500 text-sm mt-1">
-                    Observations will appear once scanning starts
-                  </p>
+                <div className="text-center py-4">
+                  <p className="text-zinc-500 text-xs">No events yet</p>
                 </div>
               ) : (
-                <div className="space-y-2 max-h-[400px] overflow-y-auto">
-                  {events.map((event) => (
-                    <div
+                <div className={`space-y-1.5 ${showAllEvents ? "max-h-[280px] overflow-y-auto pr-1 scrollbar-thin scrollbar-thumb-zinc-700 scrollbar-track-transparent" : ""}`}>
+                  {(showAllEvents ? events : events.slice(0, 2)).map((event, index) => (
+                    <motion.div
                       key={event.eventId}
-                      className="flex items-center justify-between p-3 bg-zinc-800/30 rounded-lg"
+                      initial={{ opacity: 0, x: 10 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      transition={{ delay: index * 0.03 }}
+                      className="p-2 bg-zinc-800/40 rounded-lg hover:bg-zinc-800/60 transition-colors"
                     >
-                      <div className="flex items-center gap-3">
+                      <div className="flex items-start gap-2">
                         {event.trafficDetected ? (
-                          <CheckCircle className="w-4 h-4 text-emerald-400" />
+                          <CheckCircle className="w-3.5 h-3.5 text-emerald-400 mt-0.5 shrink-0" />
                         ) : event.errorType ? (
-                          <XCircle className="w-4 h-4 text-red-400" />
+                          <XCircle className="w-3.5 h-3.5 text-red-400 mt-0.5 shrink-0" />
                         ) : (
-                          <Clock className="w-4 h-4 text-zinc-500" />
+                          <Clock className="w-3.5 h-3.5 text-zinc-500 mt-0.5 shrink-0" />
                         )}
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm text-white">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs text-white font-medium truncate">
                               {event.sourceType || "direct"}
                             </span>
                             {event.httpStatus && (
                               <span
-                                className={`text-xs px-1.5 py-0.5 rounded ${
-                                  event.httpStatus < 400
-                                    ? "bg-emerald-500/20 text-emerald-400"
-                                    : "bg-red-500/20 text-red-400"
+                                className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 ${event.httpStatus < 400
+                                  ? "bg-emerald-500/20 text-emerald-400"
+                                  : "bg-red-500/20 text-red-400"
                                 }`}
                               >
                                 {event.httpStatus}
@@ -754,27 +780,39 @@ export default function CandidateDetailPage() {
                             )}
                           </div>
                           {event.errorMessage && (
-                            <p className="text-xs text-red-400 mt-0.5">{event.errorMessage}</p>
+                            <p className="text-[10px] text-red-400 mt-0.5 line-clamp-2">{event.errorMessage}</p>
                           )}
+                          <p className="text-[10px] text-zinc-600 mt-1">
+                            {formatRelativeTime(event.observedAt)}
+                            {event.responseTimeMs && ` · ${event.responseTimeMs}ms`}
+                          </p>
                         </div>
                       </div>
-                      <div className="text-right">
-                        <p className="text-xs text-zinc-500">
-                          {formatRelativeTime(event.observedAt)}
-                        </p>
-                        {event.responseTimeMs && (
-                          <p className="text-xs text-zinc-600">{event.responseTimeMs}ms</p>
-                        )}
-                      </div>
-                    </div>
+                    </motion.div>
                   ))}
+
+                  {events.length > 2 && (
+                    <button
+                      onClick={() => setShowAllEvents(!showAllEvents)}
+                      className="w-full mt-2 py-1.5 text-[10px] text-zinc-500 hover:text-white bg-zinc-800/30 hover:bg-zinc-800/60 rounded transition-all flex items-center justify-center gap-1"
+                    >
+                      <span>{showAllEvents ? "Show less" : `Show ${events.length - 2} more`}</span>
+                      <motion.svg
+                        animate={{ rotate: showAllEvents ? 180 : 0 }}
+                        transition={{ duration: 0.2 }}
+                        className="w-3 h-3"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                        stroke="currentColor"
+                      >
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                      </motion.svg>
+                    </button>
+                  )}
                 </div>
               )}
             </AnimatedCard>
-          </div>
 
-          {/* Sidebar - Right Column */}
-          <div className="space-y-6">
             {/* File Info */}
             <AnimatedCard
               initialAnimation={!hasAnimated.current}
@@ -899,6 +937,32 @@ export default function CandidateDetailPage() {
           </div>
         </div>
       </div>
+
+      {/* Opt-out Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={showOptOutConfirm}
+        onClose={() => setShowOptOutConfirm(false)}
+        onConfirm={handleOptOut}
+        title="Opt-out from Observation"
+        message="Are you sure you want to opt this service out from observation? This will stop all monitoring for this candidate. You can re-enable observation from the Watcher settings."
+        confirmText="Opt-out"
+        cancelText="Cancel"
+        variant="warning"
+        isLoading={actionLoading}
+      />
+
+      {/* Kill Zombie Confirmation Dialog */}
+      <ConfirmDialog
+        isOpen={showKillConfirm}
+        onClose={() => setShowKillConfirm(false)}
+        onConfirm={() => handleKillZombie()}
+        title="Kill Zombie"
+        message={`This will create a Pull Request to remove "${candidate?.entitySignature || 'this code'}" from your codebase. Are you sure this code is dead and should be removed?`}
+        confirmText="Kill Zombie"
+        cancelText="Cancel"
+        variant="zombie"
+        isLoading={killLoading}
+      />
     </div>
   );
 }
