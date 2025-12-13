@@ -48,13 +48,17 @@ inputs:
   - id: default_branch
     type: STRING
     description: Repository default branch
-    required: true
     defaults: "main"
 
   - id: user_id
     type: STRING
     description: User identifier from authentication
     required: true
+
+  - id: user_email
+    type: STRING
+    description: User email from GitHub OAuth for notifications
+    required: false
 
   - id: github_token
     type: STRING
@@ -455,12 +459,14 @@ tasks:
         "zombie_risk": {
           "level": "low|medium|high",
           "score": 0.0 to 1.0,
-          "reasoning": "Explain your risk assessment. Consider: Are there unused exports? Dead code paths? Deprecated patterns? Orphaned endpoints?",
-          "high_risk_areas": ["List specific files, functions, or modules that warrant close monitoring for potential zombie code"]
+          "reasoning": "Explain your risk assessment focusing on SERVICE-LEVEL concerns: Are there API endpoints that seem unused? Cron jobs with no apparent purpose? Queue workers that might be orphaned? Serverless functions that are never invoked?",
+          "high_risk_areas": ["List specific SERVICE CATEGORIES at risk - e.g., 'Authentication APIs', 'Payment Processing', 'Legacy Cron Jobs', 'Notification Workers'. DO NOT list individual files or assets - focus on business-critical service areas that may become zombies."]
         }
       }"""
               
-              user_prompt = f"""Perform a deep analysis of this repository. Your findings will be used to identify zombie (unused/dead) code.
+              user_prompt = f"""Perform a deep analysis of this repository. Your findings will be used to identify zombie (unused/dead) SERVICES.
+
+      IMPORTANT: We are monitoring SERVICES - API endpoints, cron jobs, queue workers, serverless functions. NOT individual files, assets, or static resources.
 
       📦 REPOSITORY METADATA
       ├─ Name: {watcher_name}
@@ -472,15 +478,15 @@ tasks:
       ├─ Author: {metadata.get('last_commit_author', 'unknown')}
       └─ Date: {metadata.get('last_commit_date', 'unknown')}
 
-      🔍 AUTO-DISCOVERED CODE ENTITIES
-      ├─ HTTP Endpoints: {summary.get('http_endpoints', 0)}
+      🔍 AUTO-DISCOVERED SERVICES (these are what we monitor for zombie status)
+      ├─ HTTP API Endpoints: {summary.get('http_endpoints', 0)}
       ├─ Cron/Scheduled Jobs: {summary.get('cron_jobs', 0)}
       ├─ Queue Workers: {summary.get('queue_workers', 0)}
       ├─ Serverless Functions: {summary.get('serverless_functions', 0)}
-      └─ Total Monitored Entities: {summary.get('total', 0)}
+      └─ Total Monitored Services: {summary.get('total', 0)}
 
       ════════════════════════════════════════════════════════════════════════════════
-      COMPLETE CODEBASE (analyze every file for context)
+      COMPLETE CODEBASE (analyze for context about the services above)
       ════════════════════════════════════════════════════════════════════════════════
       {codebase[:350000]}
       ════════════════════════════════════════════════════════════════════════════════
@@ -534,8 +540,12 @@ tasks:
   - id: detect_dependencies
     type: io.kestra.plugin.scripts.python.Script
     description: |
-      AST + Grep based dependency detection.
-      Finds what code calls each candidate and maps dependencies by signature.
+      Advanced dependency detection using multiple strategies:
+      1. Direct path matching (strings, template literals)
+      2. HTTP client patterns (fetch, axios, got, request, ky, ofetch)
+      3. Route-based detection (Next.js API routes, Express patterns)
+      4. Import/require analysis for internal modules
+      5. Function call tracking between candidates
     timeout: PT15M
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -557,9 +567,10 @@ tasks:
       with open('candidates_with_code.json', 'r') as f:
           candidates = json.load(f)
       
-      CODE_EXT = ('.py', '.js', '.ts', '.jsx', '.tsx', '.go', '.java')
-      SKIP_DIRS = {'node_modules', 'venv', '.venv', '__pycache__', '.git', 'dist', 'build', '.next'}
+      CODE_EXT = ('.py', '.js', '.ts', '.jsx', '.tsx', '.go', '.java', '.mjs', '.cjs')
+      SKIP_DIRS = {'node_modules', 'venv', '.venv', '__pycache__', '.git', 'dist', 'build', '.next', 'coverage', '.turbo'}
       
+      # Read all code files
       all_files = {}
       for root, dirs, files in os.walk(REPO_DIR):
           dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
@@ -573,6 +584,7 @@ tasks:
                   except:
                       pass
       
+      # Map files to candidates
       file_to_candidates = {}
       for c in candidates:
           fp = c['file_path']
@@ -582,101 +594,296 @@ tasks:
       
       sig_to_id = {c['signature']: c['unique_id'] for c in candidates}
       
-      dependencies = {}
+      def build_http_patterns(path):
+          """Build comprehensive patterns for HTTP endpoint calls."""
+          if not path or path == '/unknown':
+              return []
+          
+          patterns = []
+          
+          # Clean path for regex - handle dynamic segments
+          # /api/currency/[country] -> /api/currency/[^/]+
+          # /api/users/:id -> /api/users/[^/]+
+          path_regex = path
+          path_regex = re.sub(r'\[(\w+)\]', r'[^/]+', path_regex)  # [param]
+          path_regex = re.sub(r':(\w+)', r'[^/]+', path_regex)      # :param
+          path_regex = re.sub(r'\{(\w+)\}', r'[^/]+', path_regex)   # {param}
+          path_escaped = re.escape(path_regex).replace(r'\[\^/\]\+', '[^/]+')
+          
+          # Also create a version without escaping for literal matches
+          path_literal = re.escape(path)
+          
+          # Extract key path segments for flexible matching
+          # /api/currency/[country] -> ['api', 'currency']
+          segments = [s for s in path.split('/') if s and not s.startswith('[') and not s.startswith(':') and not s.startswith('{')]
+          key_segment = segments[-1] if segments else ''
+          
+          # 1. Direct string literals (single quotes, double quotes)
+          patterns.append(rf'["\']({path_escaped}|{path_literal})["\']')
+          
+          # 2. Template literals with backticks - COMPREHENSIVE
+          # fetch(`/api/currency/${country}`)
+          # fetch(`${baseUrl}/api/currency/${country}`)
+          if key_segment:
+              patterns.append(rf'`[^`]*/{key_segment}[^`]*`')
+          patterns.append(rf'`[^`]*{path_escaped}[^`]*`')
+          
+          # 3. Fetch API - all variations
+          patterns.extend([
+              rf'fetch\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+              rf'fetch\s*\(\s*[`"\'][^`"\']*/{key_segment}[/\s`"\']' if key_segment else None,
+              rf'fetch\s*\([^)]*{path_escaped}',
+          ])
+          
+          # 4. Axios - all methods
+          for method in ['get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'request']:
+              patterns.extend([
+                  rf'axios\.{method}\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+                  rf'axios\.{method}\s*\(\s*[`"\'][^`"\']*/{key_segment}[/\s`"\']' if key_segment else None,
+              ])
+          # axios({ url: '/api/...' })
+          patterns.append(rf'axios\s*\(\s*\{{[^}}]*url\s*:\s*[`"\'][^`"\']*{path_escaped}')
+          
+          # 5. Other HTTP clients (got, ky, superagent, request, ofetch, $fetch)
+          for client in ['got', 'ky', 'superagent', 'request', 'ofetch', r'\$fetch', 'http', 'api']:
+              patterns.extend([
+                  rf'{client}\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+                  rf'{client}\s*\.\s*\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+                  rf'{client}\s*\(\s*[`"\'][^`"\']*/{key_segment}[/\s`"\']' if key_segment else None,
+              ])
+          
+          # 6. URL construction patterns
+          # new URL('/api/currency', baseUrl)
+          # URL.resolve(base, '/api/currency')
+          patterns.extend([
+              rf'new\s+URL\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+              rf'URL\.resolve\s*\([^,]+,\s*[`"\'][^`"\']*{path_escaped}',
+          ])
+          
+          # 7. String concatenation patterns
+          # baseUrl + '/api/currency'
+          # '/api' + '/currency'
+          if key_segment:
+              patterns.append(rf'[\+\s][`"\'][^`"\']*/{key_segment}[`"\']')
+          
+          # 8. Object property patterns (route configs, API maps)
+          # { currency: '/api/currency' }
+          # routes.currency = '/api/currency'
+          if key_segment:
+              patterns.extend([
+                  rf'{key_segment}\s*:\s*[`"\'][^`"\']*{path_escaped}',
+                  rf'{key_segment}\s*=\s*[`"\'][^`"\']*{path_escaped}',
+              ])
+          
+          # 9. Next.js specific patterns
+          # router.push('/api/currency')
+          # Link href="/api/currency"
+          patterns.extend([
+              rf'router\.\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+              rf'href\s*=\s*[`"\'][^`"\']*{path_escaped}',
+              rf'redirect\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+          ])
+          
+          # 10. Python requests library
+          patterns.extend([
+              rf'requests\.\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+              rf'httpx\.\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+              rf'aiohttp\.\w+\s*\(\s*[`"\'][^`"\']*{path_escaped}',
+          ])
+          
+          # Filter out None patterns and empty ones
+          return [p for p in patterns if p]
       
+      def build_function_patterns(snippet, entity_name):
+          """Build patterns for function/method calls."""
+          patterns = []
+          
+          # Extract function name from code snippet
+          func_patterns = [
+              r'(?:def|function|const|let|var|async function|async)\s+(\w+)',
+              r'export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)',
+              r'export\s+const\s+(\w+)\s*=',
+              r'module\.exports\s*=\s*(?:async\s+)?function\s+(\w+)',
+              r'class\s+(\w+)',
+          ]
+          
+          func_names = set()
+          for fp in func_patterns:
+              for match in re.finditer(fp, snippet):
+                  func_names.add(match.group(1))
+          
+          # Also use entity_name if it looks like a function name
+          if entity_name and re.match(r'^[a-zA-Z_]\w*$', entity_name):
+              func_names.add(entity_name)
+          
+          for func_name in func_names:
+              if len(func_name) > 2:  # Skip very short names
+                  patterns.extend([
+                      rf'\b{func_name}\s*\(',           # Direct call
+                      rf'\.{func_name}\s*\(',           # Method call
+                      rf'await\s+{func_name}\s*\(',     # Async call
+                      rf'{func_name}\s*\.\s*call\s*\(', # .call()
+                      rf'{func_name}\s*\.\s*apply\s*\(', # .apply()
+                  ])
+          
+          return patterns
+      
+      def build_queue_patterns(queue_name):
+          """Build patterns for queue/message calls."""
+          if not queue_name:
+              return []
+          
+          queue_escaped = re.escape(queue_name)
+          patterns = [
+              rf'["\']({queue_escaped})["\']',
+              rf'queue\s*\(\s*["\']({queue_escaped})["\']',
+              rf'publish\s*\(\s*["\']({queue_escaped})["\']',
+              rf'send\s*\(\s*["\']({queue_escaped})["\']',
+              rf'emit\s*\(\s*["\']({queue_escaped})["\']',
+              rf'dispatch\s*\(\s*["\']({queue_escaped})["\']',
+              rf'channel\s*\.\s*\w+\s*\(\s*["\']({queue_escaped})["\']',
+              rf'producer\s*\.\s*\w+\s*\(\s*["\']({queue_escaped})["\']',
+          ]
+          return patterns
+      
+      # Build patterns for each candidate
+      sig_to_patterns = {}
       for candidate in candidates:
           sig = candidate['signature']
           entity_type = candidate['entity_type']
-          file_path = candidate['file_path']
-          unique_id = candidate['unique_id']
-          
-          callers = []
-          depends_on_signatures = []
-          
-          search_patterns = []
+          patterns = []
           
           if entity_type == 'http_endpoint':
               entity_data = candidate.get('entity_data', {})
               path = entity_data.get('path', '')
-              if path and path != '/unknown':
-                  clean_path = re.escape(path).replace(r'\[', '[^/]*').replace(r'\]', '')
-                  search_patterns.extend([
-                      rf'["\']({clean_path}|{path})["\']',
-                      rf'fetch\s*\(\s*[`"\'][^`"\']*{clean_path}',
-                      rf'axios\.[a-z]+\s*\(\s*[`"\'][^`"\']*{clean_path}',
-                  ])
+              patterns.extend(build_http_patterns(path))
           
-          elif entity_type == 'cron_job':
+          elif entity_type in ('cron_job', 'serverless_function', 'scheduled_task'):
               snippet = candidate.get('code_snippet', '')
-              func_match = re.search(r'(?:def|function|const|async function)\s+(\w+)', snippet)
-              if func_match:
-                  func_name = func_match.group(1)
-                  search_patterns.append(rf'\b{func_name}\s*\(')
+              entity_name = candidate.get('entity_name', '')
+              patterns.extend(build_function_patterns(snippet, entity_name))
           
-          elif entity_type == 'queue_worker':
+          elif entity_type in ('queue_worker', 'message_handler', 'event_handler'):
               entity_data = candidate.get('entity_data', {})
-              queue_name = entity_data.get('queue_name', '')
-              if queue_name:
-                  search_patterns.extend([
-                      rf'["\']({queue_name})["\']',
-                      rf'queue\s*\(\s*["\']({queue_name})["\']',
-                  ])
+              queue_name = entity_data.get('queue_name', '') or entity_data.get('event_name', '')
+              patterns.extend(build_queue_patterns(queue_name))
+              # Also add function patterns for the handler
+              snippet = candidate.get('code_snippet', '')
+              entity_name = candidate.get('entity_name', '')
+              patterns.extend(build_function_patterns(snippet, entity_name))
           
-          for rel_path, content in all_files.items():
-              if rel_path == file_path:
+          elif entity_type in ('grpc_service', 'graphql_resolver', 'websocket_handler'):
+              snippet = candidate.get('code_snippet', '')
+              entity_name = candidate.get('entity_name', '')
+              patterns.extend(build_function_patterns(snippet, entity_name))
+          
+          if patterns:
+              sig_to_patterns[sig] = patterns
+      
+      # Initialize dependency tracking
+      dependencies = {}
+      for candidate in candidates:
+          sig = candidate['signature']
+          dependencies[sig] = {
+              "unique_id": candidate['unique_id'],
+              "signature": sig,
+              "entity_type": candidate['entity_type'],
+              "file_path": candidate['file_path'],
+              "callers": [],
+              "called_by_signatures": [],
+              "caller_count": 0,
+              "depends_on_signatures": [],
+              "dependency_count": 0,
+              "is_potentially_unused": True
+          }
+      
+      # Scan all files for dependency relationships
+      print(f"Scanning {len(all_files)} files for dependencies...")
+      
+      for rel_path, content in all_files.items():
+          candidates_in_file = file_to_candidates.get(rel_path, [])
+          candidate_sigs_in_file = {c['signature'] for c in candidates_in_file}
+          
+          for target_sig, patterns in sig_to_patterns.items():
+              # Skip self-references
+              if target_sig in candidate_sigs_in_file:
                   continue
               
-              for pattern in search_patterns:
+              for pattern in patterns:
                   try:
-                      for match in re.finditer(pattern, content, re.IGNORECASE):
+                      for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
                           line_num = content[:match.start()].count('\n') + 1
                           lines = content.split('\n')
                           start = max(0, line_num - 2)
                           end = min(len(lines), line_num + 2)
                           context = '\n'.join(lines[start:end])
                           
-                          callers.append({
+                          caller_info = {
                               "file": rel_path,
                               "line": line_num,
                               "match": match.group(0)[:100],
-                              "context": context[:300]
-                          })
+                              "context": context[:300],
+                              "pattern_matched": pattern[:50]
+                          }
                           
-                          if rel_path in file_to_candidates:
-                              for caller_candidate in file_to_candidates[rel_path]:
-                                  caller_line = caller_candidate.get('line', 0)
-                                  if abs(line_num - caller_line) < 60:
-                                      depends_on_signatures.append(caller_candidate['signature'])
-                  except re.error:
+                          # Add to target's callers
+                          existing_callers = [f"{c['file']}:{c['line']}" for c in dependencies[target_sig]["callers"]]
+                          caller_key = f"{rel_path}:{line_num}"
+                          if caller_key not in existing_callers:
+                              dependencies[target_sig]["callers"].append(caller_info)
+                          
+                          # Link to calling candidate if in same file
+                          for caller_candidate in candidates_in_file:
+                              caller_line = caller_candidate.get('line', 0)
+                              # Expand range to 100 lines for better matching in larger files
+                              if abs(line_num - caller_line) < 100:
+                                  caller_sig = caller_candidate['signature']
+                                  if target_sig not in dependencies[caller_sig]["depends_on_signatures"]:
+                                      dependencies[caller_sig]["depends_on_signatures"].append(target_sig)
+                                  if caller_sig not in dependencies[target_sig]["called_by_signatures"]:
+                                      dependencies[target_sig]["called_by_signatures"].append(caller_sig)
+                  except re.error as e:
                       pass
-          
-          seen_callers = set()
-          unique_callers = []
-          for c in callers:
-              key = f"{c['file']}:{c['line']}"
-              if key not in seen_callers:
-                  seen_callers.add(key)
-                  unique_callers.append(c)
-          
-          depends_on_signatures = list(set(depends_on_signatures))
-          
-          dependencies[sig] = {
-              "unique_id": unique_id,
-              "signature": sig,
-              "entity_type": entity_type,
-              "file_path": file_path,
-              "callers": unique_callers[:20],
-              "caller_count": len(unique_callers),
-              "depends_on_signatures": depends_on_signatures,
-              "dependency_count": len(depends_on_signatures),
-              "is_potentially_unused": len(unique_callers) == 0
-          }
+      
+      # Finalize counts
+      for sig in dependencies:
+          dependencies[sig]["caller_count"] = len(dependencies[sig]["callers"])
+          dependencies[sig]["dependency_count"] = len(dependencies[sig]["depends_on_signatures"])
+          dependencies[sig]["callers"] = dependencies[sig]["callers"][:20]
+          dependencies[sig]["is_potentially_unused"] = dependencies[sig]["caller_count"] == 0
       
       with open('dependencies.json', 'w') as f:
           json.dump(dependencies, f, indent=2)
       
+      # Print detailed summary
+      deps_found = sum(1 for d in dependencies.values() if d['dependency_count'] > 0)
+      callers_found = sum(1 for d in dependencies.values() if d['caller_count'] > 0)
       unused = sum(1 for d in dependencies.values() if d['is_potentially_unused'])
-      print(f"Dependency analysis: {len(dependencies)} candidates, {unused} potentially unused")
+      
+      print(f"\n{'='*60}")
+      print(f"DEPENDENCY ANALYSIS COMPLETE")
+      print(f"{'='*60}")
+      print(f"Total candidates analyzed: {len(dependencies)}")
+      print(f"Candidates with dependencies (call others): {deps_found}")
+      print(f"Candidates with callers (called by others): {callers_found}")
+      print(f"Potentially unused (no callers): {unused}")
+      print(f"{'='*60}")
+      
+      # Show specific relationships found
+      if deps_found > 0:
+          print(f"\nDependency relationships found:")
+          for sig, data in dependencies.items():
+              if data['dependency_count'] > 0:
+                  print(f"  {sig}")
+                  print(f"    -> depends on: {data['depends_on_signatures']}")
+      
+      if callers_found > 0:
+          print(f"\nCaller relationships found:")
+          for sig, data in dependencies.items():
+              if data['caller_count'] > 0:
+                  print(f"  {sig}")
+                  print(f"    <- called by: {data['called_by_signatures'][:5]}")
+                  print(f"    <- from files: {[c['file'] for c in data['callers'][:3]]}")
 
   # ============================================================================
   # STAGE 4: Per-Candidate LLM Analysis
@@ -749,20 +956,22 @@ tasks:
           depends_on = deps.get('depends_on_signatures', [])
           
           try:
-              prompt = f"""You are a zombie code detective. Your mission: determine if this code entity is actively used or potentially dead/unused.
+              prompt = f"""You are a zombie SERVICE detective. Your mission: determine if this SERVICE/ENDPOINT is actively used or potentially dead/unused.
 
-      🏢 REPOSITORY CONTEXT (for understanding business relevance)
+      IMPORTANT: We are analyzing SERVICES (API endpoints, cron jobs, queue workers, serverless functions) - NOT files, assets, or static resources.
+
+      🏢 REPOSITORY CONTEXT
       ├─ Business Purpose: {repo_business[:300]}
       ├─ Tech Stack: {json.dumps(repo_tech)[:200]}
       └─ Architecture: {repo_arch[:200]}
 
-      🎯 TARGET CODE ENTITY
-      ├─ Type: {candidate['entity_type']}
+      🎯 TARGET SERVICE
+      ├─ Service Type: {candidate['entity_type']}
       ├─ Signature: {sig}
       ├─ Location: {candidate['file_path']}
       └─ Framework: {candidate['framework']}
 
-      📝 SOURCE CODE
+      📝 SERVICE CODE
       ┌────────────────────────────────────────────────────────────────────────────────
       {candidate['code_snippet'][:2000]}
       └────────────────────────────────────────────────────────────────────────────────
@@ -773,27 +982,28 @@ tasks:
       ├─ Dependencies it relies on: {depends_on[:5] if depends_on else 'None detected'}
       └─ Sample callers found: {json.dumps(callers_info, indent=2)[:400] if callers_info else 'No internal callers found'}
 
-      ⚠️ ZOMBIE DETECTION CRITERIA
+      ⚠️ ZOMBIE SERVICE DETECTION CRITERIA
       Consider these signals when scoring:
-      • caller_count=0 is a STRONG indicator of potential zombie code
-      • But external APIs (called by browsers/clients) legitimately have 0 internal callers
+      • caller_count=0 is a signal, but external APIs (called by browsers/clients/mobile apps) legitimately have 0 internal callers
       • Look for: deprecated comments, TODO remove, dead code patterns, unused exports
-      • Business-critical code (auth, payments, metrics) should have LOW risk even if caller_count=0
-      • Generic CRUD or utility endpoints with no callers are HIGH risk
+      • Business-critical services (auth, payments, user management) should have LOW risk even if caller_count=0
+      • Generic utility endpoints or test routes with no clear purpose are HIGH risk
+      • Cron jobs without clear scheduling purpose are HIGH risk
+      • Queue workers processing unknown/undefined queues are HIGH risk
 
       Return ONLY valid JSON (no markdown, no explanation):
       {open_brace}
-        "purpose": "Describe what this code does and its business value. Be specific - what problem does it solve?",
+        "purpose": "Describe what this SERVICE does and its business value. Be specific - what user problem does it solve?",
         "risk_score": 0.00 to 1.00,
         "risk_reasoning": "Justify your score. Reference specific evidence: caller count, code patterns, business criticality, naming conventions, comments in code."
       {close_brace}
 
       SCORING GUIDE:
-      • 0.00-0.20: Definitely active (critical business logic, clear callers, essential functionality)
-      • 0.21-0.40: Likely active (useful utility, may be called externally)
-      • 0.41-0.60: Uncertain (no clear evidence either way)
-      • 0.61-0.80: Possibly zombie (no callers, generic code, low business value)
-      • 0.81-1.00: Likely zombie (deprecated markers, dead code patterns, truly orphaned)
+      • 0.00-0.20: Critical service (auth, payments, core business logic, essential APIs)
+      • 0.21-0.40: Active service (useful utility, clearly called externally or internally)
+      • 0.41-0.60: Uncertain (no clear evidence either way, needs observation)
+      • 0.61-0.80: Possibly zombie (no callers, generic code, unclear business value)
+      • 0.81-1.00: Likely zombie (deprecated markers, dead code patterns, orphaned service)
 
       JSON:"""
               
@@ -924,12 +1134,13 @@ tasks:
       WATCHER_ID: "{{ inputs.watcher_id }}"
       WATCHER_NAME: "{{ inputs.watcher_name }}"
       USER_ID: "{{ inputs.user_id }}"
+      USER_EMAIL: "{{ inputs.user_email ?? '' }}"
       REPO_URL: "{{ inputs.repo_url }}"
       REPO_NAME: "{{ vars.repo_name }}"
       REPO_DESCRIPTION: "{{ inputs.repo_description }}"
       DEFAULT_BRANCH: "{{ inputs.default_branch }}"
       APPLICATION_URL: "{{ inputs.application_url ?? '' }}"
-      OBSERVABILITY_URLS: "{{ inputs.observability_urls | json ?? '[]' }}"
+      OBSERVABILITY_URLS: "{{ inputs.observability_urls ?? '[]' }}"
     inputFiles:
       discovery.json: "{{ outputs.discover_entities.outputFiles['discovery.json'] }}"
       git_metadata.json: "{{ outputs.extract_git_metadata.outputFiles['git_metadata.json'] }}"
@@ -975,7 +1186,7 @@ tasks:
       
       cur.execute("""
           INSERT INTO watchers (
-              watcher_id, watcher_name, user_id, repo_url, repo_name, repo_description,
+              watcher_id, watcher_name, user_id, user_email, repo_url, repo_name, repo_description,
               default_branch, application_url, observability_urls,
               total_candidates, http_endpoints, cron_jobs, queue_workers,
               serverless_functions, websockets, grpc_services, graphql_resolvers,
@@ -984,10 +1195,11 @@ tasks:
               llm_zombie_risk, llm_raw_response, status
           ) VALUES (
               %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-              %s, %s, %s, %s, %s, %s, 'pending_schedule'
+              %s, %s, %s, %s, %s, %s, %s, 'pending_schedule'
           )
           ON CONFLICT (watcher_id) DO UPDATE SET
               watcher_name = EXCLUDED.watcher_name,
+              user_email = COALESCE(EXCLUDED.user_email, watchers.user_email),
               total_candidates = EXCLUDED.total_candidates,
               http_endpoints = EXCLUDED.http_endpoints,
               cron_jobs = EXCLUDED.cron_jobs,
@@ -1012,6 +1224,7 @@ tasks:
           os.environ.get('WATCHER_ID'),
           os.environ.get('WATCHER_NAME'),
           os.environ.get('USER_ID'),
+          os.environ.get('USER_EMAIL') or None,
           os.environ.get('REPO_URL'),
           os.environ.get('REPO_NAME'),
           os.environ.get('REPO_DESCRIPTION', '')[:500],
@@ -1158,20 +1371,35 @@ tasks:
               caller_count = deps_data.get('caller_count', 0)
               dependency_count = deps_data.get('dependency_count', 0)
               depends_on_sigs = deps_data.get('depends_on_signatures', [])
+              called_by_sigs = deps_data.get('called_by_signatures', [])
               
               llm_risk = llm_data.get('llm_risk_score', 0.5) or 0.5
-              if caller_count == 0:
-                  zombie_score = int(min(100, (llm_risk * 100) + 20))
+              
+              # Calculate zombie_score (0-100):
+              # Base: LLM risk score (0.0-1.0 → 0-100)
+              # The LLM already considers caller_count context in its analysis
+              # Actual zombie confirmation comes from W2 observation (real traffic data)
+              # 
+              # Small bonus for internal callers (proves the code is actively used)
+              # but NO penalty for zero callers (APIs are called externally, 
+              # and even internal code might be called via reflection/dynamic dispatch)
+              base_score = int(llm_risk * 100)
+              
+              if caller_count > 0:
+                  # Has internal callers: slightly reduce risk (evidence of use)
+                  caller_bonus = min(15, caller_count * 3)  # max 15 point reduction
+                  zombie_score = max(0, base_score - caller_bonus)
               else:
-                  zombie_score = int(max(0, (llm_risk * 100) - (caller_count * 5)))
+                  # No internal callers: just use LLM score (no artificial boost)
+                  zombie_score = base_score
               
               cur.execute("""
                   INSERT INTO zombie_candidates (
                       watcher_id, entity_type, entity_signature, entity_name,
                       file_path, method, route_path, schedule, queue_name, framework,
                       llm_purpose, llm_risk_score, llm_risk_reasoning,
-                      depends_on_signatures, dependency_count, caller_count, zombie_score
-                  ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                      depends_on_signatures, dependency_count, called_by_signatures, caller_count, zombie_score
+                  ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                   ON CONFLICT (watcher_id, entity_type, entity_signature) DO UPDATE SET
                       entity_name = EXCLUDED.entity_name,
                       llm_purpose = EXCLUDED.llm_purpose,
@@ -1179,6 +1407,7 @@ tasks:
                       llm_risk_reasoning = EXCLUDED.llm_risk_reasoning,
                       depends_on_signatures = EXCLUDED.depends_on_signatures,
                       dependency_count = EXCLUDED.dependency_count,
+                      called_by_signatures = EXCLUDED.called_by_signatures,
                       caller_count = EXCLUDED.caller_count,
                       zombie_score = EXCLUDED.zombie_score,
                       scan_count = zombie_candidates.scan_count + 1,
@@ -1199,6 +1428,7 @@ tasks:
                   llm_data.get('llm_risk_reasoning'),
                   depends_on_sigs if depends_on_sigs else None,
                   dependency_count,
+                  called_by_sigs if called_by_sigs else None,
                   caller_count,
                   zombie_score
               ))

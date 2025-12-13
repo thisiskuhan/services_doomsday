@@ -1,0 +1,727 @@
+id: w3_analysis
+namespace: doomsday.avengers
+
+description: |
+  W3: AI Analysis & Decision Workflow
+  
+  TRIGGERS:
+  - Schedule: Every hour, checks for candidates with observation_end_at <= NOW()
+  
+  PURPOSE:
+  1. Gather all evidence from observation period (W2 data)
+  2. LLM analyzes evidence and makes final verdict
+  3. Update candidate with final_zombie_score and verdict
+  4. Send email to user with decision + action links
+  5. Track email thread for Gmail reply detection
+  
+  OUTPUTS:
+  - final_zombie_score (0-100)
+  - final_verdict: 'zombie', 'healthy', 'inconclusive'
+  - Email sent to user with action buttons + reply option
+
+labels:
+  team: doomsday
+  category: watcher-management
+  stage: analysis
+  version: "1.0"
+
+variables:
+  # LLM Configuration
+  llm_model: "{{ kv('w3_llm') ?? 'gemini-2.0-flash' }}"
+  
+  # Thresholds
+  zombie_confidence_threshold: 70   # LLM confidence to declare zombie
+  healthy_confidence_threshold: 80  # LLM confidence to declare healthy
+  
+  # Email configuration - from_email uses SMTP_FROM (sender address)
+  from_email: "{{ kv('SMTP_FROM') ?? 'doomsday-alerts@yourdomain.com' }}"
+  app_base_url: "{{ kv('app_base_url') ?? 'http://localhost:3001' }}"
+  
+  # Processing limits
+  max_candidates_per_run: 50
+
+triggers:
+  # ============================================================================
+  # SCHEDULED TRIGGER: Check for candidates ready for analysis
+  # ============================================================================
+  - id: hourly_analysis_check
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"  # Every hour at :00
+    recoverMissedSchedules: LAST
+
+tasks:
+  # ============================================================================
+  # STAGE 1: Find Candidates Ready for Analysis
+  # ============================================================================
+  - id: find_analysis_ready
+    type: io.kestra.plugin.scripts.python.Script
+    description: Find candidates where observation period has ended
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+      MAX_CANDIDATES: "{{ vars.max_candidates_per_run }}"
+    outputFiles:
+      - candidates_ready.json
+    script: |
+      import os
+      import json
+      import psycopg2
+      from datetime import datetime, timezone
+      
+      db_url = os.environ.get('DATABASE_URL')
+      max_candidates = int(os.environ.get('MAX_CANDIDATES', '50'))
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      # Find candidates where:
+      # - status = 'active' (being observed)
+      # - observation_end_at <= NOW() (observation period ended)
+      # - final_verdict IS NULL (not yet analyzed by W3)
+      cur.execute("""
+          SELECT 
+              zc.candidate_id,
+              zc.watcher_id,
+              zc.entity_type,
+              zc.entity_signature,
+              zc.entity_name,
+              zc.file_path,
+              zc.method,
+              zc.route_path,
+              zc.schedule,
+              zc.code_snippet,
+              zc.llm_purpose,
+              zc.llm_risk_score,
+              zc.llm_risk_reasoning,
+              zc.dependency_count,
+              zc.caller_count,
+              zc.observation_count,
+              zc.consecutive_zero_traffic,
+              zc.has_traffic,
+              zc.traffic_count,
+              zc.zombie_score,
+              zc.zombie_verdict,
+              zc.observation_started_at,
+              zc.observation_end_at,
+              w.watcher_name,
+              w.repo_name,
+              w.repo_url,
+              w.user_id,
+              w.user_email,
+              w.llm_business_context,
+              w.llm_tech_stack
+          FROM zombie_candidates zc
+          JOIN watchers w ON zc.watcher_id = w.watcher_id
+          WHERE zc.status = 'active'
+            AND zc.observation_end_at <= NOW()
+            AND zc.final_verdict IS NULL
+          ORDER BY zc.observation_end_at ASC
+          LIMIT %s
+      """, (max_candidates,))
+      
+      columns = [desc[0] for desc in cur.description]
+      rows = cur.fetchall()
+      
+      candidates = []
+      for row in rows:
+          candidate = dict(zip(columns, row))
+          # Convert timestamps and decimals
+          for k, v in candidate.items():
+              if hasattr(v, 'isoformat'):
+                  candidate[k] = v.isoformat()
+              elif hasattr(v, '__float__'):
+                  candidate[k] = float(v)
+          candidates.append(candidate)
+      
+      cur.close()
+      conn.close()
+      
+      with open('candidates_ready.json', 'w') as f:
+          json.dump(candidates, f, indent=2, default=str)
+      
+      print(f"[W3] Found {len(candidates)} candidates ready for analysis")
+
+  # ============================================================================
+  # STAGE 2: Check if Any Candidates Found
+  # ============================================================================
+  - id: check_has_candidates
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ read(outputs.find_analysis_ready.outputFiles['candidates_ready.json']) | json | length > 0 }}"
+    then:
+      # ========================================================================
+      # STAGE 3: Process Each Candidate
+      # ========================================================================
+      - id: process_candidates
+        type: io.kestra.plugin.core.flow.ForEach
+        concurrencyLimit: 5
+        values: "{{ read(outputs.find_analysis_ready.outputFiles['candidates_ready.json']) }}"
+        tasks:
+          # ====================================================================
+          # TASK 3.1: Gather Evidence
+          # ====================================================================
+          - id: gather_evidence
+            type: io.kestra.plugin.scripts.python.Script
+            description: Collect all observation data for this candidate
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            beforeCommands:
+              - pip install -q psycopg2-binary
+            env:
+              DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+            inputFiles:
+              candidate.json: "{{ taskrun.value }}"
+            outputFiles:
+              - evidence.json
+            script: |
+              import os
+              import json
+              import psycopg2
+              import traceback
+              
+              try:
+                  # Read candidate from input file instead of env var
+                  with open('candidate.json', 'r') as f:
+                      candidate = json.load(f)
+                  
+                  candidate_id = candidate.get('candidate_id')
+                  db_url = os.environ.get('DATABASE_URL')
+                  
+                  print(f"[GATHER_EVIDENCE] Processing candidate_id: {candidate_id}")
+                  print(f"[GATHER_EVIDENCE] Database URL present: {bool(db_url)}")
+                  
+                  conn = psycopg2.connect(db_url, sslmode='require')
+                  cur = conn.cursor()
+                  
+                  # Get all observation summaries
+                  cur.execute("""
+                      SELECT 
+                          observed_at, traffic_detected, total_request_count,
+                          total_sources_queried, sources_with_traffic, sources_with_errors,
+                          observation_verdict, source_breakdown
+                      FROM observation_summaries
+                      WHERE candidate_id = %s
+                      ORDER BY observed_at ASC
+                  """, (candidate_id,))
+                  
+                  summaries = []
+                  for row in cur.fetchall():
+                      summaries.append({
+                          "observed_at": row[0].isoformat() if row[0] else None,
+                          "traffic_detected": row[1],
+                          "total_request_count": row[2],
+                          "total_sources_queried": row[3],
+                          "sources_with_traffic": row[4],
+                          "sources_with_errors": row[5],
+                          "observation_verdict": row[6],
+                          "source_breakdown": row[7]
+                      })
+                  
+                  # Get traffic pattern analysis
+                  cur.execute("""
+                      SELECT 
+                          COUNT(*) as total_observations,
+                          SUM(CASE WHEN traffic_detected THEN 1 ELSE 0 END) as traffic_observations,
+                          SUM(total_request_count) as total_requests,
+                          AVG(CASE WHEN sources_with_errors > 0 THEN 1 ELSE 0 END) as error_rate
+                      FROM observation_summaries
+                      WHERE candidate_id = %s
+                  """, (candidate_id,))
+                  
+                  stats = cur.fetchone()
+                  traffic_stats = {
+                      "total_observations": stats[0] or 0,
+                      "traffic_observations": stats[1] or 0,
+                      "total_requests": stats[2] or 0,
+                      "error_rate": float(stats[3] or 0)
+                  }
+                  
+                  cur.close()
+                  conn.close()
+                  
+                  evidence = {
+                      "candidate": candidate,
+                      "observation_summaries": summaries,
+                      "traffic_stats": traffic_stats,
+                      "observation_period_days": candidate.get('analysis_period_hours', 168) / 24
+                  }
+                  
+                  with open('evidence.json', 'w') as f:
+                      json.dump(evidence, f, indent=2, default=str)
+                  
+                  print(f"[EVIDENCE] Candidate {candidate_id}: {len(summaries)} observations, {traffic_stats['traffic_observations']} with traffic")
+              
+              except Exception as e:
+                  print(f"[ERROR] gather_evidence failed: {e}")
+                  traceback.print_exc()
+                  # Write empty evidence to allow pipeline to continue with error info
+                  evidence = {
+                      "error": str(e),
+                      "candidate": candidate if 'candidate' in dir() else {},
+                      "observation_summaries": [],
+                      "traffic_stats": {"total_observations": 0, "traffic_observations": 0, "total_requests": 0, "error_rate": 0}
+                  }
+                  with open('evidence.json', 'w') as f:
+                      json.dump(evidence, f, indent=2)
+                  raise
+
+          # ====================================================================
+          # TASK 3.2: LLM Final Verdict
+          # ====================================================================
+          - id: llm_final_verdict
+            type: io.kestra.plugin.scripts.python.Script
+            description: LLM analyzes evidence and makes final verdict
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            beforeCommands:
+              - pip install -q google-genai
+            env:
+              GOOGLE_API_KEY: "{{ secret('GOOGLE_AI_API_KEY') }}"
+              LLM_MODEL: "{{ vars.llm_model }}"
+              ZOMBIE_THRESHOLD: "{{ vars.zombie_confidence_threshold }}"
+              HEALTHY_THRESHOLD: "{{ vars.healthy_confidence_threshold }}"
+            inputFiles:
+              evidence.json: "{{ outputs.gather_evidence.outputFiles['evidence.json'] }}"
+            outputFiles:
+              - verdict.json
+            script: |
+              import os
+              import json
+              import re
+              
+              api_key = os.environ.get('GOOGLE_API_KEY')
+              llm_model = os.environ.get('LLM_MODEL', 'gemini-2.0-flash')
+              zombie_threshold = int(os.environ.get('ZOMBIE_THRESHOLD', '70'))
+              healthy_threshold = int(os.environ.get('HEALTHY_THRESHOLD', '80'))
+              
+              with open('evidence.json', 'r') as f:
+                  evidence = json.load(f)
+              
+              candidate = evidence['candidate']
+              summaries = evidence['observation_summaries']
+              stats = evidence['traffic_stats']
+              
+              # Build prompt
+              prompt = f'''You are a service health analyst. Analyze the observation data and determine if this SERVICE is a "zombie" (dead/unused service).
+
+              IMPORTANT: We are analyzing SERVICES (API endpoints, cron jobs, queue workers) - NOT files or static assets.
+
+              ## Target Service
+              - Service Type: {candidate.get('entity_type')}
+              - Signature: {candidate.get('entity_signature')}
+              - File: {candidate.get('file_path')}
+              - Purpose (from initial analysis): {candidate.get('llm_purpose', 'Unknown')}
+              - Initial Risk Score: {candidate.get('llm_risk_score', 0)}
+              - Initial Risk Reasoning: {candidate.get('llm_risk_reasoning', 'None')}
+
+              ## Repository Context
+              - Repo: {candidate.get('repo_name')}
+              - Business Context: {candidate.get('llm_business_context', 'Unknown')}[:500]
+
+              ## Observation Period (REAL TRAFFIC DATA)
+              - Duration: {evidence.get('observation_period_days', 7)} days
+              - Total Observations: {stats.get('total_observations', 0)}
+              - Observations with Traffic: {stats.get('traffic_observations', 0)}
+              - Total Request Count: {stats.get('total_requests', 0)}
+              - Current Zombie Score: {candidate.get('zombie_score', 0)}/100
+              - Consecutive Zero Traffic: {candidate.get('consecutive_zero_traffic', 0)}
+
+              ## Internal Dependencies
+              - Depends on: {candidate.get('dependency_count', 0)} other services
+              - Called by: {candidate.get('caller_count', 0)} other services
+
+              ## Task
+              Based on the REAL TRAFFIC DATA from the observation period, provide your analysis:
+              {{
+                "verdict": "zombie" | "healthy" | "inconclusive",
+                "confidence": <0-100>,
+                "zombie_score": <0-100>,
+                "reasoning": "<2-3 sentences explaining your verdict based on TRAFFIC EVIDENCE>",
+                "recommendation": "<what should be done with this service>",
+                "blast_radius": {{
+                  "risk_level": "low" | "medium" | "high",
+                  "affected_count": <number of potentially affected services if removed>,
+                  "concerns": ["<list of concerns if this service is removed>"]
+                }}
+              }}
+
+              Rules:
+              - If NO traffic detected over the observation period AND caller_count is 0 → likely zombie SERVICE
+              - If consistent traffic detected → healthy SERVICE
+              - If mixed signals or short observation period → inconclusive
+              - Consider: seasonal patterns, backup endpoints, internal-only APIs, webhook receivers
+              - High caller_count suggests service is used internally even without external traffic
+
+              Return ONLY valid JSON, no markdown.'''
+              
+              from google import genai
+              client = genai.Client(api_key=api_key)
+              
+              response = client.models.generate_content(
+                  model=llm_model,
+                  contents=prompt
+              )
+              
+              response_text = response.text.strip()
+              
+              # Parse JSON from response
+              json_match = re.search(r'\{[\s\S]*\}', response_text)
+              if json_match:
+                  try:
+                      verdict = json.loads(json_match.group())
+                  except:
+                      verdict = {
+                          "verdict": "inconclusive",
+                          "confidence": 50,
+                          "zombie_score": candidate.get('zombie_score', 50),
+                          "reasoning": "Failed to parse LLM response",
+                          "recommendation": "Manual review recommended",
+                          "blast_radius": {"risk_level": "medium", "affected_count": 0, "concerns": []}
+                      }
+              else:
+                  verdict = {
+                      "verdict": "inconclusive",
+                      "confidence": 50,
+                      "zombie_score": candidate.get('zombie_score', 50),
+                      "reasoning": "LLM did not return valid JSON",
+                      "recommendation": "Manual review recommended",
+                      "blast_radius": {"risk_level": "medium", "affected_count": 0, "concerns": []}
+                  }
+              
+              # Add candidate info for next task
+              verdict['candidate_id'] = candidate.get('candidate_id')
+              verdict['watcher_id'] = candidate.get('watcher_id')
+              verdict['user_id'] = candidate.get('user_id')
+              verdict['user_email'] = candidate.get('user_email')
+              verdict['entity_signature'] = candidate.get('entity_signature')
+              verdict['repo_name'] = candidate.get('repo_name')
+              verdict['watcher_name'] = candidate.get('watcher_name')
+              
+              with open('verdict.json', 'w') as f:
+                  json.dump(verdict, f, indent=2)
+              
+              print(f"[VERDICT] {verdict['verdict']} (confidence: {verdict['confidence']}%, score: {verdict['zombie_score']})")
+
+          # ====================================================================
+          # TASK 3.3: Update Database & Generate Token
+          # ====================================================================
+          - id: update_candidate
+            type: io.kestra.plugin.scripts.python.Script
+            description: Update candidate with verdict and generate action token
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            beforeCommands:
+              - pip install -q psycopg2-binary
+            env:
+              DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+              APP_BASE_URL: "{{ vars.app_base_url }}"
+              KESTRA_URL: "http://host.docker.internal:8080"
+            inputFiles:
+              verdict.json: "{{ outputs.llm_final_verdict.outputFiles['verdict.json'] }}"
+            outputFiles:
+              - email_data.json
+            script: |
+              import os
+              import json
+              import secrets
+              import psycopg2
+              from datetime import datetime, timezone, timedelta
+              
+              db_url = os.environ.get('DATABASE_URL')
+              app_base_url = os.environ.get('APP_BASE_URL', 'http://localhost:3001')
+              kestra_url = os.environ.get('KESTRA_URL', 'http://localhost:8080')
+              
+              with open('verdict.json', 'r') as f:
+                  verdict = json.load(f)
+              
+              candidate_id = verdict['candidate_id']
+              
+              # Generate action token
+              action_token = secrets.token_urlsafe(32)
+              token_expires = datetime.now(timezone.utc) + timedelta(days=7)
+              
+              conn = psycopg2.connect(db_url, sslmode='require')
+              cur = conn.cursor()
+              
+              # Update candidate with final verdict
+              cur.execute("""
+                  UPDATE zombie_candidates SET
+                      status = 'pending_review',
+                      final_zombie_score = %s,
+                      final_verdict = %s,
+                      final_confidence = %s,
+                      final_reasoning = %s,
+                      final_recommendation = %s,
+                      final_blast_radius = %s,
+                      final_analysis_at = NOW(),
+                      action_token = %s,
+                      action_token_expires_at = %s,
+                      updated_at = NOW()
+                  WHERE candidate_id = %s
+                  RETURNING candidate_id
+              """, (
+                  verdict.get('zombie_score', 50),
+                  verdict.get('verdict', 'inconclusive'),
+                  verdict.get('confidence', 50),
+                  verdict.get('reasoning', ''),
+                  verdict.get('recommendation', ''),
+                  json.dumps(verdict.get('blast_radius', {})),
+                  action_token,
+                  token_expires,
+                  candidate_id
+              ))
+              
+              # Update watcher aggregates
+              cur.execute("""
+                  UPDATE watchers SET
+                      pending_review = (
+                          SELECT COUNT(*) FROM zombie_candidates 
+                          WHERE watcher_id = %s AND status = 'pending_review'
+                      ),
+                      confirmed_zombies = (
+                          SELECT COUNT(*) FROM zombie_candidates 
+                          WHERE watcher_id = %s AND final_verdict = 'zombie'
+                      ),
+                      avg_final_score = (
+                          SELECT COALESCE(AVG(final_zombie_score), 0) FROM zombie_candidates 
+                          WHERE watcher_id = %s AND final_zombie_score IS NOT NULL
+                      ),
+                      updated_at = NOW()
+                  WHERE watcher_id = %s
+              """, (verdict['watcher_id'], verdict['watcher_id'], verdict['watcher_id'], verdict['watcher_id']))
+              
+              # Log decision
+              cur.execute("""
+                  INSERT INTO decision_log (
+                      candidate_id, watcher_id, action_type, action_source,
+                      actor_type, actor_id, decision, confidence, reasoning,
+                      kestra_execution_id
+                  ) VALUES (%s, %s, 'w3_analysis', 'llm', 'system', 'w3_analysis', %s, %s, %s, %s)
+              """, (
+                  candidate_id, verdict['watcher_id'],
+                  verdict.get('verdict'), verdict.get('confidence'), verdict.get('reasoning'),
+                  '{{ execution.id }}'
+              ))
+              
+              conn.commit()
+              cur.close()
+              conn.close()
+              
+              # Build action URLs
+              # Option 1: Kestra webhook URLs
+              webhook_base = f"{kestra_url}/api/v1/executions/webhook/doomsday.watchers/w3_handle_response"
+              
+              # Option 2: Frontend URLs (better UX)
+              frontend_base = f"{app_base_url}/api/actions/w3"
+              
+              email_data = {
+                  "candidate_id": candidate_id,
+                  "watcher_id": verdict['watcher_id'],
+                  "user_id": verdict.get('user_id'),
+                  "user_email": verdict.get('user_email'),
+                  "entity_signature": verdict.get('entity_signature'),
+                  "repo_name": verdict.get('repo_name'),
+                  "watcher_name": verdict.get('watcher_name'),
+                  "verdict": verdict.get('verdict'),
+                  "confidence": verdict.get('confidence'),
+                  "zombie_score": verdict.get('zombie_score'),
+                  "reasoning": verdict.get('reasoning'),
+                  "recommendation": verdict.get('recommendation'),
+                  "blast_radius": verdict.get('blast_radius'),
+                  "action_token": action_token,
+                  "token_expires": token_expires.isoformat(),
+                  "action_urls": {
+                      "kill": f"{frontend_base}?token={action_token}&action=kill",
+                      "false_alert": f"{frontend_base}?token={action_token}&action=false_alert",
+                      "watch_more": f"{frontend_base}?token={action_token}&action=watch_more"
+                  }
+              }
+              
+              with open('email_data.json', 'w') as f:
+                  json.dump(email_data, f, indent=2)
+              
+              print(f"[UPDATE] Candidate {candidate_id} → {verdict.get('verdict')} | Token generated")
+
+          # ====================================================================
+          # TASK 3.4: Prepare Email Content
+          # ====================================================================
+          - id: prepare_email
+            type: io.kestra.plugin.scripts.python.Script
+            description: Prepare email content and store thread info
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            beforeCommands:
+              - pip install -q psycopg2-binary
+            env:
+              DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+            inputFiles:
+              email_data.json: "{{ outputs.update_candidate.outputFiles['email_data.json'] }}"
+            outputFiles:
+              - email_content.json
+            script: |
+              import os
+              import json
+              import psycopg2
+              from datetime import datetime, timezone
+              
+              db_url = os.environ.get('DATABASE_URL')
+              send_email = os.environ.get('SEND_EMAIL', 'false') == 'true'
+              
+              with open('email_data.json', 'r') as f:
+                  data = json.load(f)
+              
+              # Build email content
+              verdict_emoji = "🧟" if data['verdict'] == 'zombie' else "✅" if data['verdict'] == 'healthy' else "🤔"
+              
+              subject = f"{verdict_emoji} Zombie Analysis: {data['entity_signature'][:50]} [{data['repo_name']}]"
+              
+              body = f"""
+              <html>
+              <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                <h2>{verdict_emoji} Zombie Analysis Complete</h2>
+                
+                <div style="background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                  <h3 style="margin-top: 0;">📍 {data['entity_signature']}</h3>
+                  <p><strong>Repository:</strong> {data['repo_name']}</p>
+                  <p><strong>Watcher:</strong> {data['watcher_name']}</p>
+                </div>
+                
+                <div style="background: {'#ffebee' if data['verdict'] == 'zombie' else '#e8f5e9' if data['verdict'] == 'healthy' else '#fff3e0'}; padding: 15px; border-radius: 8px; margin: 20px 0;">
+                  <h3 style="margin-top: 0;">Verdict: {data['verdict'].upper()}</h3>
+                  <p><strong>Confidence:</strong> {data['confidence']}%</p>
+                  <p><strong>Zombie Score:</strong> {data['zombie_score']}/100</p>
+                  <p><strong>Analysis:</strong> {data['reasoning']}</p>
+                  <p><strong>Recommendation:</strong> {data['recommendation']}</p>
+                </div>
+                
+                <h3>🎯 What would you like to do?</h3>
+                
+                <div style="margin: 20px 0;">
+                  <a href="{data['action_urls']['kill']}" 
+                     style="display: inline-block; background: #d32f2f; color: white; padding: 12px 24px; 
+                            text-decoration: none; border-radius: 6px; margin: 5px;">
+                    🗑️ KILL ZOMBIE
+                  </a>
+                  <a href="{data['action_urls']['false_alert']}" 
+                     style="display: inline-block; background: #388e3c; color: white; padding: 12px 24px; 
+                            text-decoration: none; border-radius: 6px; margin: 5px;">
+                    ✅ FALSE ALERT
+                  </a>
+                  <a href="{data['action_urls']['watch_more']}" 
+                     style="display: inline-block; background: #1976d2; color: white; padding: 12px 24px; 
+                            text-decoration: none; border-radius: 6px; margin: 5px;">
+                    👁️ WATCH MORE
+                  </a>
+                </div>
+                
+                <p style="color: #666; font-size: 12px;">
+                  Or simply <strong>reply to this email</strong> with your decision and feedback!<br>
+                  Example: "Kill it, we deprecated this in v2.0" or "Watch for 2 more weeks, it's seasonal"
+                </p>
+                
+                <hr style="margin: 30px 0; border: none; border-top: 1px solid #ddd;">
+                <p style="color: #999; font-size: 11px;">
+                  This alert was generated by Services Doomsday.<br>
+                  Token expires: {data['token_expires'][:10]}
+                </p>
+              </body>
+              </html>
+              """
+              
+              # Store email thread for Gmail trigger matching
+              conn = psycopg2.connect(db_url, sslmode='require')
+              cur = conn.cursor()
+              
+              thread_id = f"doomsday-{data['candidate_id']}-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+              
+              cur.execute("""
+                  INSERT INTO email_threads (
+                      thread_id, candidate_id, watcher_id, user_id, user_email,
+                      subject, action_token, token_expires_at
+                  ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                  ON CONFLICT (thread_id) DO NOTHING
+              """, (
+                  thread_id, data['candidate_id'], data['watcher_id'],
+                  data['user_id'], data.get('user_email', 'unknown@example.com'),
+                  subject, data['action_token'], data['token_expires']
+              ))
+              
+              # Update candidate with email sent timestamp
+              cur.execute("""
+                  UPDATE zombie_candidates SET
+                      alert_email_sent_at = NOW(),
+                      alert_email_id = %s
+                  WHERE candidate_id = %s
+              """, (thread_id, data['candidate_id']))
+              
+              conn.commit()
+              cur.close()
+              conn.close()
+              
+              print(f"[EMAIL] Prepared for {data.get('user_email', 'unknown')}")
+              print(f"  Subject: {subject}")
+              print(f"  Thread ID: {thread_id}")
+              print(f"  Kill URL: {data['action_urls']['kill'][:80]}...")
+              
+              # TODO: Implement actual email sending with MailSend task or SMTP
+              # Save email content for MailSend task
+              email_output = {
+                  "subject": subject,
+                  "to_email": data.get('user_email', ''),
+                  "html_body": body,
+                  "thread_id": thread_id
+              }
+              
+              with open('email_content.json', 'w') as f:
+                  json.dump([email_output], f)
+              
+              print(f"[EMAIL] Prepared for {data.get('user_email', 'unknown')}")
+              print(f"  Subject: {subject}")
+              print(f"  Thread ID: {thread_id}")
+
+          # ====================================================================
+          # TASK 3.5: Send Email via MailSend
+          # ====================================================================
+          - id: send_alert_email
+            type: io.kestra.plugin.notifications.mail.MailSend
+            description: Send verdict email to user via SMTP
+            host: "{{ kv('SMTP_HOST') }}"
+            port: "{{ kv('SMTP_PORT') }}"
+            username: "{{ kv('SMTP_USERNAME') }}"
+            password: "{{ kv('SMTP_PASSWORD') }}"
+            from: "{{ kv('SMTP_FROM') }}"
+            to:
+              - "{{ (read(outputs.prepare_email.outputFiles['email_content.json']) | json)[0].to_email }}"
+            subject: "{{ (read(outputs.prepare_email.outputFiles['email_content.json']) | json)[0].subject }}"
+            htmlTextContent: "{{ (read(outputs.prepare_email.outputFiles['email_content.json']) | json)[0].html_body }}"
+
+    else:
+      - id: no_candidates_ready
+        type: io.kestra.plugin.core.debug.Echo
+        level: INFO
+        format: "[W3] No candidates ready for analysis"
+
+  # ============================================================================
+  # STAGE 4: Output Summary
+  # ============================================================================
+  - id: output_summary
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      execution_id: "{{ execution.id }}"
+      status: "completed"
+      timestamp: "{{ trigger.date ?? execution.startDate }}"
+
+errors:
+  - id: analysis_failed
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      status: "failed"
+      error: "W3 analysis workflow encountered an error"
+      execution_id: "{{ execution.id }}"

@@ -1,9 +1,20 @@
+/**
+ * Dashboard Home Page
+ *
+ * Main dashboard displaying user greeting and system statistics:
+ *   - Watchers count (total/scheduled)
+ *   - Zombies found (high risk count)
+ *   - Candidates count (total/tracked)
+ *
+ * Stats auto-refresh every 30 seconds.
+ */
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
 import { motion } from "framer-motion";
 import { useAuth } from "@/contexts/AuthContext";
 import { AnimatedCounter } from "@/components/ui/AnimatedNumber";
+import { AnimatedBorderGlow } from "@/components/ui/shared";
 
 interface Stats {
   watchers: { total: number; active: number };
@@ -11,44 +22,6 @@ interface Stats {
   zombies: { highRisk: number; mediumRisk: number; potential: number };
   observations: { last24h: number; candidatesObserved: number };
 }
-
-// Animated border glow component for the card
-type Direction = "TOP" | "LEFT" | "BOTTOM" | "RIGHT";
-
-const CardBorderGlow = ({ duration = 1.5 }: { duration?: number }) => {
-  const [direction, setDirection] = useState<Direction>("TOP");
-
-  const rotateDirection = (currentDirection: Direction): Direction => {
-    const directions: Direction[] = ["TOP", "LEFT", "BOTTOM", "RIGHT"];
-    const currentIndex = directions.indexOf(currentDirection);
-    const nextIndex = (currentIndex + 1) % directions.length;
-    return directions[nextIndex];
-  };
-
-  const movingMap: Record<Direction, string> = {
-    TOP: "radial-gradient(30% 70% at 50% 0%, hsl(0, 0%, 50%) 0%, rgba(161, 161, 170, 0) 100%)",
-    LEFT: "radial-gradient(25% 60% at 0% 50%, hsl(0, 0%, 50%) 0%, rgba(161, 161, 170, 0) 100%)",
-    BOTTOM: "radial-gradient(30% 70% at 50% 100%, hsl(0, 0%, 50%) 0%, rgba(161, 161, 170, 0) 100%)",
-    RIGHT: "radial-gradient(25% 60% at 100% 50%, hsl(0, 0%, 50%) 0%, rgba(161, 161, 170, 0) 100%)",
-  };
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setDirection((prevState) => rotateDirection(prevState));
-    }, duration * 1000);
-    return () => clearInterval(interval);
-  }, [duration]);
-
-  return (
-    <motion.div
-      className="absolute inset-0 overflow-hidden rounded-2xl pointer-events-none z-0"
-      style={{ filter: "blur(2px)" }}
-      initial={{ opacity: 0, background: movingMap[direction] }}
-      animate={{ opacity: 1, background: movingMap[direction] }}
-      transition={{ ease: "linear", duration: duration }}
-    />
-  );
-};
 
 export default function HomePage() {
   const { user } = useAuth();
@@ -94,7 +67,7 @@ export default function HomePage() {
   const firstName = user?.displayName?.split(" ")[0] || user?.email?.split("@")[0] || "Developer";
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center px-4">
+    <div className="h-[calc(100vh-80px)] flex flex-col items-center justify-center px-4">
       {/* Main Content */}
       <div className="relative z-10 text-center max-w-2xl mx-auto">
         {/* Greeting */}
@@ -127,7 +100,7 @@ export default function HomePage() {
           transition={{ duration: 0.6, delay: 0.2 }}
           className="relative rounded-2xl p-px"
         >
-          <CardBorderGlow duration={1.5} />
+          <AnimatedBorderGlow color="grey" duration={1.5} alwaysAnimate />
           <div className="relative bg-zinc-900/90 backdrop-blur-xl rounded-2xl p-8 shadow-xl z-10">
             <div className="flex items-center justify-center gap-3 mb-4">
               <div className="w-3 h-3 bg-emerald-500 rounded-full animate-pulse" />
@@ -148,34 +121,38 @@ export default function HomePage() {
         >
           {[
             { 
-              label: "Active Watchers", 
+              label: "Watchers", 
               value: stats?.watchers.total ?? 0,
               subValue: stats?.watchers.active,
               subLabel: "scheduled",
-              color: "emerald"
+              color: "yellow",
+              cursorVariant: "watcher"
             },
             { 
               label: "Zombies Found", 
               value: stats?.zombies.potential ?? 0,
               subValue: stats?.zombies.highRisk,
               subLabel: "high risk",
-              color: "red"
+              color: "red",
+              cursorVariant: "wanda"
             },
             { 
               label: "Candidates", 
               value: stats?.candidates.total ?? 0,
               subValue: stats?.candidates.tracked,
               subLabel: "tracked",
-              color: "blue"
+              color: "blue",
+              cursorVariant: "captain"
             },
           ].map((stat, i) => (
             <div
               key={stat.label}
-              className="group relative bg-zinc-900/30 border border-zinc-800/30 rounded-xl p-4 hover:border-zinc-700/50 transition-all duration-300 overflow-hidden"
+              className="cursor-hover group relative bg-zinc-900/30 border border-zinc-800/30 rounded-xl p-4 hover:border-zinc-700/50 transition-all duration-300 overflow-hidden"
+              data-variant={stat.cursorVariant}
             >
               {/* Glow effect on hover */}
               <div className={`absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity duration-500 bg-gradient-to-br ${
-                stat.color === "emerald" ? "from-emerald-500/5" :
+                stat.color === "yellow" ? "from-yellow-500/5" :
                 stat.color === "red" ? "from-red-500/5" :
                 "from-blue-500/5"
               } to-transparent`} />
@@ -187,7 +164,7 @@ export default function HomePage() {
                   </div>
                 ) : (
                   <p className={`text-2xl md:text-3xl font-semibold mb-1 ${
-                    stat.color === "emerald" ? "text-emerald-400" :
+                    stat.color === "yellow" ? "text-yellow-400" :
                     stat.color === "red" ? "text-red-400" :
                     "text-blue-400"
                   }`}>
@@ -202,7 +179,7 @@ export default function HomePage() {
                 {stat.subValue !== undefined && stat.subValue > 0 && (
                   <p className="text-[10px] md:text-xs text-zinc-600 mt-1">
                     <span className={
-                      stat.color === "emerald" ? "text-emerald-500/70" :
+                      stat.color === "yellow" ? "text-yellow-500/70" :
                       stat.color === "red" ? "text-red-500/70" :
                       "text-blue-500/70"
                     }>

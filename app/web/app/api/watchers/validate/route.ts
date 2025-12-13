@@ -1,20 +1,26 @@
-import { NextRequest, NextResponse } from "next/server";
-import { pool } from "@/lib/db";
-
 /**
  * Watcher Validation API
  *
- * Validates GitHub repository accessibility and input parameters
- * before triggering the Kestra watcher creation workflow.
+ * POST /api/watchers/validate
+ * Validates watcher inputs before creation (pre-flight check).
  *
- * Validation includes:
- * - Watcher name format and length
- * - GitHub repository URL format
- * - Duplicate watcher name check (per user)
- * - Duplicate GitHub repository check (per user)
- * - GitHub API accessibility (public/private with token)
- * - Repository description presence
+ * Body: {
+ *   name: string,
+ *   repoUrl: string,
+ *   repoDescription: string,
+ *   userId: string,
+ *   githubToken?: string
+ * }
+ *
+ * Validates:
+ *   - Name format (3-50 chars)
+ *   - GitHub URL format
+ *   - Duplicate name/repo check (per user)
+ *   - GitHub API accessibility
+ *   - Repository description presence
  */
+import { NextRequest, NextResponse } from "next/server";
+import { pool } from "@/lib/db";
 
 interface ValidateWatcherRequest {
   name: string;

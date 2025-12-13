@@ -1,52 +1,13 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { motion, AnimatePresence, useMotionTemplate, useMotionValue } from "framer-motion";
 import { X, Plus, Clock, Trash2, ChevronDown, AlertCircle } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { LokiIcon } from "@/components/ui/CustomCursor";
-import { cn } from "@/lib/utils";
-
-// Animated border glow component for the modal
-type Direction = "TOP" | "LEFT" | "BOTTOM" | "RIGHT";
-
-const AnimatedBorderGlow = ({ duration = 2 }: { duration?: number }) => {
-  const [direction, setDirection] = useState<Direction>("TOP");
-
-  const rotateDirection = (currentDirection: Direction): Direction => {
-    const directions: Direction[] = ["TOP", "LEFT", "BOTTOM", "RIGHT"];
-    const currentIndex = directions.indexOf(currentDirection);
-    const nextIndex = (currentIndex + 1) % directions.length;
-    return directions[nextIndex];
-  };
-
-  const movingMap: Record<Direction, string> = {
-    TOP: "radial-gradient(30% 70% at 50% 0%, hsl(50, 100%, 50%) 0%, rgba(234, 179, 8, 0) 100%)",
-    LEFT: "radial-gradient(25% 60% at 0% 50%, hsl(50, 100%, 50%) 0%, rgba(234, 179, 8, 0) 100%)",
-    BOTTOM: "radial-gradient(30% 70% at 50% 100%, hsl(50, 100%, 50%) 0%, rgba(234, 179, 8, 0) 100%)",
-    RIGHT: "radial-gradient(25% 60% at 100% 50%, hsl(50, 100%, 50%) 0%, rgba(234, 179, 8, 0) 100%)",
-  };
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setDirection((prevState) => rotateDirection(prevState));
-    }, duration * 1000);
-    return () => clearInterval(interval);
-  }, [duration]);
-
-  return (
-    <motion.div
-      className="absolute inset-0 overflow-hidden rounded-2xl pointer-events-none z-0"
-      style={{
-        filter: "blur(3px)",
-      }}
-      initial={{ background: movingMap[direction] }}
-      animate={{ background: movingMap[direction] }}
-      transition={{ ease: "linear", duration: duration }}
-    />
-  );
-};
+import { cn, OBSERVABILITY_SOURCE_TYPES } from "@/lib/utils";
+import { AnimatedBorderGlow } from "@/components/ui/shared";
 
 interface ObservabilitySource {
   url: string;
@@ -137,15 +98,6 @@ const TextareaWithGlow = ({
   );
 };
 
-const OBSERVABILITY_TYPES = [
-  { value: "prometheus", label: "Prometheus", placeholder: "https://prometheus.example.com/api/v1/query" },
-  { value: "grafana", label: "Grafana", placeholder: "https://grafana.example.com" },
-  { value: "loki", label: "Loki", placeholder: "https://loki.example.com/loki/api/v1/query" },
-  { value: "datadog", label: "Datadog", placeholder: "https://api.datadoghq.com" },
-  { value: "cloudwatch", label: "CloudWatch", placeholder: "arn:aws:logs:region:account:log-group" },
-  { value: "newrelic", label: "New Relic", placeholder: "https://api.newrelic.com" },
-];
-
 export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: WatcherFormProps) {
   const [formData, setFormData] = useState<WatcherFormData>({
     name: "",
@@ -202,7 +154,7 @@ export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: 
     hasValidObservabilitySource;
 
   const getTypeConfig = (type: string) =>
-    OBSERVABILITY_TYPES.find((t) => t.value === type) || OBSERVABILITY_TYPES[0];
+    OBSERVABILITY_SOURCE_TYPES.find((t) => t.value === type) || OBSERVABILITY_SOURCE_TYPES[0];
 
   return (
     <motion.div
@@ -270,10 +222,10 @@ export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: 
                   />
                 </LabelInputContainer>
 
-                {/* Application URL */}
+                {/* Application Base URL */}
                 <LabelInputContainer>
                   <Label htmlFor="appUrl">
-                    Application URL <span className="text-zinc-600">(Optional)</span>
+                    Application Base URL <span className="text-zinc-600">(Optional)</span>
                   </Label>
                   <Input
                     id="appUrl"
@@ -457,7 +409,7 @@ export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: 
                                     disabled={isCreating}
                                     className="bg-zinc-800 border border-zinc-700 text-white px-3 py-2 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/50 transition-all disabled:opacity-50 w-full"
                                   >
-                                    {OBSERVABILITY_TYPES.map((type) => (
+                                    {OBSERVABILITY_SOURCE_TYPES.map((type) => (
                                       <option key={type.value} value={type.value}>
                                         {type.label}
                                       </option>

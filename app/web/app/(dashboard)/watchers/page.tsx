@@ -1,13 +1,23 @@
+/**
+ * Watchers Page
+ *
+ * Displays all zombie watchers for the authenticated user.
+ * Features:
+ *   - Watcher cards grid with status and zombie count
+ *   - Create new watcher form with GitHub integration
+ *   - SSE streaming for real-time watcher creation progress
+ *   - Watcher detail modal with candidates list
+ */
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { useAuth } from "@/contexts/AuthContext";
 import { PinContainer } from "@/components/ui/3d-pin";
 import { WatcherCreationLoader, WATCHER_CREATION_STEPS } from "@/components/ui/WatcherCreationLoader";
 import { WatcherForm } from "@/components/watchers/WatcherForm";
 import { WatcherCard } from "@/components/watchers/WatcherCard";
-import { ScheduleModal } from "@/components/watchers/ScheduleModal";
 import { WatcherDetailModal } from "@/components/watchers/WatcherDetailModal";
 import { LokiIcon } from "@/components/ui/CustomCursor";
 import { DoomLoader } from "@/components/ui/DoomLoader";
@@ -17,13 +27,12 @@ export interface ZombieWatcher {
   id: string;
   name: string;
   repo: string;
-  status: "pending_schedule" | "scheduled" | "active" | "paused";
+  status: "pending_schedule" | "partially_scheduled" | "active" | "paused";
   zombiesFound: number;
   lastScan: string;
   confidence: number;
-  observationType?: "uniform" | "varied" | null;
-  scanFrequencySeconds?: number | null;
-  analysisPeriodHours?: number | null;
+  activeCandidates?: number;
+  pendingCandidates?: number;
 }
 
 export interface NewWatcherForm {
@@ -52,18 +61,17 @@ export default function WatchersPage() {
   const [currentStep, setCurrentStep] = useState(0);
   const [isComplete, setIsComplete] = useState(false);
   const [isFailed, setIsFailed] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
-
-  // Schedule modal state
-  const [showScheduleModal, setShowScheduleModal] = useState(false);
-  const [selectedWatcher, setSelectedWatcher] = useState<ZombieWatcher | null>(null);
 
   // Detail modal state
   const [showDetailModal, setShowDetailModal] = useState(false);
   const [detailWatcherId, setDetailWatcherId] = useState<string | null>(null);
-
-  // Edit schedule mode (for already scheduled watchers)
-  const [isEditingSchedule, setIsEditingSchedule] = useState(false);
+  const [initialTab, setInitialTab] = useState<"overview" | "candidates" | "analysis">("overview");
+  
+  // Router and search params for navigation from candidate detail
+  const searchParams = useSearchParams();
+  const router = useRouter();
 
   // Fetch watchers on mount and when user changes
   const fetchWatchers = useCallback(async () => {
@@ -89,6 +97,21 @@ export default function WatchersPage() {
     }
   }, [user?.uid, hasFetched, fetchWatchers]);
 
+  // Handle query params for opening watcher from candidate detail page
+  useEffect(() => {
+    const openWatcher = searchParams.get("openWatcher");
+    const tab = searchParams.get("tab") as "overview" | "candidates" | "analysis" | null;
+    
+    if (openWatcher) {
+      setDetailWatcherId(openWatcher);
+      setInitialTab(tab || "overview");
+      setShowDetailModal(true);
+      
+      // Clear the URL params without triggering a navigation
+      router.replace("/watchers", { scroll: false });
+    }
+  }, [searchParams, router]);
+
   // Cleanup SSE on unmount
   useEffect(() => {
     return () => {
@@ -99,18 +122,21 @@ export default function WatchersPage() {
   }, []);
 
   // Map Kestra task to step index
+  // Kestra tasks: clone_and_discover → llm_repo_analysis → detect_dependencies → llm_candidate_analysis → store_watcher → store_candidates → output_success
   const getStepFromTask = useCallback((taskId: string): number => {
     const taskToStepMap: Record<string, number> = {
+      // Step 0: validate (handled before Kestra execution starts)
+      // Step 1: Clone & Discover entities
       clone_and_discover: 1,
-      clone_repo: 1,
-      discover_entities: 2,
-      extract_git_metadata: 2,
-      pack_codebase: 2,
-      llm_repo_analysis: 3,
-      detect_dependencies: 3,
+      // Step 2: LLM repo analysis + dependency detection
+      llm_repo_analysis: 2,
+      detect_dependencies: 2,
+      // Step 3: LLM candidate analysis
       llm_candidate_analysis: 3,
+      // Step 4: Store watcher & candidates
       store_watcher: 4,
       store_candidates: 4,
+      // Step 5: Complete
       output_success: 5,
     };
     return taskToStepMap[taskId] ?? 0;
@@ -138,32 +164,39 @@ export default function WatchersPage() {
           lastState = data.state;
         }
 
+        // Capture error message if present
+        if (data.error) {
+          setErrorMessage(data.error);
+        }
+
+        // Update step based on taskId
         if (data.taskId) {
           const stepIndex = getStepFromTask(data.taskId);
-          setCurrentStep(stepIndex);
+          console.log(`Task ${data.taskId} -> Step ${stepIndex}`);
+          if (stepIndex > 0) {
+            setCurrentStep(stepIndex);
+          }
         }
 
         if (data.state === "SUCCESS") {
+          console.log("Execution SUCCESS - setting step 5 and completing");
           eventSource.close();
           setCurrentStep(5);
           setIsComplete(true);
-
-          setTimeout(() => {
-            setIsCreating(false);
-            setShowLoader(false);
-            setShowForm(false);
-            fetchWatchers();
-          }, 2500);
+          // Refresh watchers list
+          fetchWatchers();
         }
 
         if (data.state === "FAILED" || data.state === "KILLED") {
+          console.log("Execution FAILED/KILLED", data);
           eventSource.close();
           setIsFailed(true);
-
-          setTimeout(() => {
-            setIsCreating(false);
-            setShowLoader(false);
-          }, 2500);
+          // Capture failed task info for error message
+          if (data.error) {
+            setErrorMessage(data.error);
+          } else if (data.taskId) {
+            setErrorMessage(`Workflow failed at task: ${data.taskId}`);
+          }
         }
       } catch (error) {
         console.error("SSE parse error:", error);
@@ -225,6 +258,7 @@ export default function WatchersPage() {
           repoDescription: formData.repoDescription,
           applicationUrl: formData.applicationUrl || undefined,
           userId: user.uid,
+          userEmail: user.email || undefined,
           githubToken: formData.githubToken || undefined,
           observabilitySources:
             formData.observabilitySources.length > 0
@@ -267,58 +301,9 @@ export default function WatchersPage() {
     }
   };
 
-  const handleSchedule = (watcher: ZombieWatcher) => {
-    setSelectedWatcher(watcher);
-    setIsEditingSchedule(false);
-    setShowScheduleModal(true);
-  };
-
-  const handleEditSchedule = (watcher: ZombieWatcher) => {
-    setSelectedWatcher(watcher);
-    setIsEditingSchedule(true);
-    setShowScheduleModal(true);
-  };
-
   const handleOpenDetail = (watcherId: string) => {
     setDetailWatcherId(watcherId);
     setShowDetailModal(true);
-  };
-
-  const handleScheduleSubmit = async (scheduleData: {
-    scanFrequencySeconds: number;
-    analysisPeriodHours: number;
-    forAllServices: boolean;
-  }) => {
-    if (!selectedWatcher) return;
-
-    try {
-      const response = await fetch(`/api/watchers/${selectedWatcher.id}/schedule`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(scheduleData),
-      });
-
-      if (response.ok) {
-        setShowScheduleModal(false);
-        setWatchers((prev) =>
-          prev.map((w) =>
-            w.id === selectedWatcher.id
-              ? {
-                  ...w,
-                  status: "scheduled" as const,
-                  observationType: scheduleData.forAllServices ? "uniform" : "varied",
-                }
-              : w
-          )
-        );
-      } else {
-        const error = await response.json();
-        alert(error.error || "Failed to schedule observation");
-      }
-    } catch (err) {
-      console.error("Schedule error:", err);
-      alert("Failed to schedule observation");
-    }
   };
 
   // Delete watcher handler
@@ -355,7 +340,7 @@ export default function WatchersPage() {
   }
 
   return (
-    <div className={`flex flex-col items-center px-4 ${hasWatchers ? "min-h-screen py-12" : "h-[calc(100vh-80px)] justify-center"}`}>
+    <div className={`flex flex-col items-center px-4 ${hasWatchers ? "py-12" : "h-[calc(100vh-80px)] justify-center"}`}>
       {/* Header - Only show when there are watchers */}
       {hasWatchers && (
         <motion.div
@@ -384,13 +369,14 @@ export default function WatchersPage() {
               initial={{ opacity: 0, scale: 0.9 }}
               animate={{ opacity: 1, scale: 1 }}
               className="cursor-hover"
+              data-variant="captain"
             >
               <div
                 onClick={() => setShowForm(true)}
-                className="bg-zinc-900/50 backdrop-blur-xl border border-dashed border-zinc-700 hover:border-emerald-500/50 rounded-2xl p-6 h-full min-h-[200px] flex flex-col items-center justify-center gap-4 cursor-pointer transition-all hover:bg-zinc-900/70 group"
+                className="bg-zinc-900/50 backdrop-blur-xl border border-dashed border-zinc-700 hover:border-blue-500/50 rounded-2xl p-6 h-full min-h-[200px] flex flex-col items-center justify-center gap-4 cursor-pointer transition-all hover:bg-zinc-900/70 hover:shadow-[0_0_30px_rgba(59,130,246,0.15)] group"
               >
-                <div className="w-14 h-14 rounded-full bg-emerald-500/10 flex items-center justify-center group-hover:bg-emerald-500/20 transition-colors">
-                  <Plus className="w-7 h-7 text-emerald-500" />
+                <div className="w-14 h-14 rounded-full bg-blue-500/10 flex items-center justify-center group-hover:bg-blue-500/20 transition-colors">
+                  <Plus className="w-7 h-7 text-blue-500" />
                 </div>
                 <div className="text-center">
                   <p className="text-white font-medium mb-1">Create New Watcher</p>
@@ -405,8 +391,6 @@ export default function WatchersPage() {
                 key={watcher.id}
                 watcher={watcher}
                 index={index}
-                onSchedule={() => handleSchedule(watcher)}
-                onDelete={handleDeleteWatcher}
                 onClick={() => handleOpenDetail(watcher.id)}
               />
             ))}
@@ -498,22 +482,35 @@ export default function WatchersPage() {
         isComplete={isComplete}
         isFailed={isFailed}
         isVisible={showLoader}
+        errorMessage={errorMessage}
+        onClose={() => {
+          // Reset all loader states
+          setShowLoader(false);
+          setIsCreating(false);
+          setIsFailed(false);
+          setIsComplete(false);
+          setCurrentStep(0);
+          setErrorMessage(null);
+          // Close the form if open
+          setShowForm(false);
+          // Refresh watchers list (in case of success)
+          if (isComplete) {
+            fetchWatchers();
+          }
+        }}
+        onRetry={() => {
+          // Reset loader states but keep form open for retry
+          setShowLoader(false);
+          setIsFailed(false);
+          setIsComplete(false);
+          setCurrentStep(0);
+          setErrorMessage(null);
+          // Keep isCreating false and form open
+          setIsCreating(false);
+          // Make sure form is visible
+          setShowForm(true);
+        }}
       />
-
-      {/* Schedule Modal */}
-      <AnimatePresence>
-        {showScheduleModal && selectedWatcher && (
-          <ScheduleModal
-            watcher={selectedWatcher}
-            onSubmit={handleScheduleSubmit}
-            onClose={() => {
-              setShowScheduleModal(false);
-              setIsEditingSchedule(false);
-            }}
-            isEditing={isEditingSchedule}
-          />
-        )}
-      </AnimatePresence>
 
       {/* Watcher Detail Modal */}
       <AnimatePresence>
@@ -521,25 +518,15 @@ export default function WatchersPage() {
           <WatcherDetailModal
             watcherId={detailWatcherId}
             userId={user.uid}
+            initialTab={initialTab}
             onClose={() => {
               setShowDetailModal(false);
               setDetailWatcherId(null);
+              setInitialTab("overview"); // Reset to default for next open
+              // Refresh watchers after modal closes to pick up any changes
+              fetchWatchers();
             }}
             onDelete={handleDeleteWatcher}
-            onSchedule={() => {
-              const watcher = watchers.find(w => w.id === detailWatcherId);
-              if (watcher) {
-                setShowDetailModal(false);
-                handleSchedule(watcher);
-              }
-            }}
-            onEditSchedule={() => {
-              const watcher = watchers.find(w => w.id === detailWatcherId);
-              if (watcher) {
-                setShowDetailModal(false);
-                handleEditSchedule(watcher);
-              }
-            }}
           />
         )}
       </AnimatePresence>

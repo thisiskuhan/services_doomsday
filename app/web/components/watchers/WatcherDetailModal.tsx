@@ -1,28 +1,25 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import ReactMarkdown from "react-markdown";
 import {
-    X,
-    GitBranch,
-    Calendar,
-    Clock,
-    AlertTriangle,
-    Shield,
-    Server,
-    Cpu,
-    Route,
-    Timer,
-    MessageSquare,
-    RefreshCw,
-    Edit3,
-    ChevronRight,
-    Activity,
-    CheckCircle,
-    XCircle,
-    ExternalLink,
-    Trash2,
+  X,
+  GitBranch,
+  AlertTriangle,
+  Shield,
+  Server,
+  Cpu,
+  MessageSquare, ExternalLink,
+  Trash2,
+  Link2
 } from "lucide-react";
+import { ObservationSources } from "./ObservationSources";
+import { CandidateList } from "./CandidateList";
+import { CandidateScheduleModal } from "./CandidateScheduleModal";
+import { ScarletWitchIcon } from "@/components/ui/CustomCursor";
+import { formatDate, formatRelativeTime } from "@/lib/utils";
+import { AnimatedBorderGlow, WatcherStatusBadge } from "@/components/ui/shared";
 
 // Types
 interface WatcherDetails {
@@ -48,17 +45,19 @@ interface WatcherDetails {
   llm_business_context: string | null;
   llm_tech_stack: Record<string, string[]> | null;
   llm_architecture: string | null;
-  llm_health: { status: string; reasons: string[] } | null;
-  llm_zombie_risk: { level: string; factors: string[] } | null;
+  llm_health: {
+    activity_level?: string;
+    documentation_quality?: string;
+    test_coverage?: string;
+    code_quality?: string;
+  } | null;
+  llm_zombie_risk: { level: string; score?: number; reasoning?: string; factors?: string[]; high_risk_areas?: string[] } | null;
   status: string;
   scan_count: number;
   created_at: string;
   updated_at: string;
   application_url: string | null;
-  observation_type: string | null;
-  scan_frequency_minutes: number | null;
-  analysis_period_hours: number | null;
-  next_observation_at: string | null;
+  observability_urls: Record<string, string> | null;
 }
 
 interface ZombieCandidate {
@@ -80,11 +79,16 @@ interface ZombieCandidate {
   caller_count: number;
   scan_frequency_minutes: number | null;
   analysis_period_hours: number | null;
+  first_observed_at: string | null;
+  last_observed_at: string | null;
+  observation_count: number;
   has_traffic: boolean | null;
   last_traffic_at: string | null;
   traffic_count: number;
   zombie_score: number;
   discovered_at: string;
+  // Index signature for flexibility with CandidateScheduleModal
+  [key: string]: unknown;
 }
 
 interface WatcherDetailModalProps {
@@ -92,106 +96,7 @@ interface WatcherDetailModalProps {
   userId: string;
   onClose: () => void;
   onDelete: (watcherId: string) => Promise<void>;
-  onSchedule: () => void;
-  onEditSchedule: () => void;
-}
-
-// Animated border glow
-type Direction = "TOP" | "LEFT" | "BOTTOM" | "RIGHT";
-
-const AnimatedBorderGlow = ({ color = "emerald", duration = 2 }: { color?: "emerald" | "yellow" | "red"; duration?: number }) => {
-  const [direction, setDirection] = useState<Direction>("TOP");
-
-  const rotateDirection = (currentDirection: Direction): Direction => {
-    const directions: Direction[] = ["TOP", "LEFT", "BOTTOM", "RIGHT"];
-    const currentIndex = directions.indexOf(currentDirection);
-    const nextIndex = (currentIndex + 1) % directions.length;
-    return directions[nextIndex];
-  };
-
-  const colorHsl = {
-    emerald: "hsl(145, 80%, 45%)",
-    yellow: "hsl(45, 100%, 50%)",
-    red: "hsl(0, 80%, 50%)",
-  };
-
-  const colorRgba = {
-    emerald: "rgba(16, 185, 129, 0)",
-    yellow: "rgba(234, 179, 8, 0)",
-    red: "rgba(239, 68, 68, 0)",
-  };
-
-  const movingMap: Record<Direction, string> = {
-    TOP: `radial-gradient(30% 70% at 50% 0%, ${colorHsl[color]} 0%, ${colorRgba[color]} 100%)`,
-    LEFT: `radial-gradient(25% 60% at 0% 50%, ${colorHsl[color]} 0%, ${colorRgba[color]} 100%)`,
-    BOTTOM: `radial-gradient(30% 70% at 50% 100%, ${colorHsl[color]} 0%, ${colorRgba[color]} 100%)`,
-    RIGHT: `radial-gradient(25% 60% at 100% 50%, ${colorHsl[color]} 0%, ${colorRgba[color]} 100%)`,
-  };
-
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setDirection((prevState) => rotateDirection(prevState));
-    }, duration * 1000);
-    return () => clearInterval(interval);
-  }, [duration]);
-
-  return (
-    <motion.div
-      className="absolute inset-0 overflow-hidden rounded-2xl pointer-events-none z-0"
-      style={{ filter: "blur(3px)" }}
-      initial={{ background: movingMap[direction] }}
-      animate={{ background: movingMap[direction] }}
-      transition={{ ease: "linear", duration: duration }}
-    />
-  );
-};
-
-// Format date helper
-function formatDate(dateString: string | null): string {
-  if (!dateString) return "N/A";
-  try {
-    const date = new Date(dateString);
-    return date.toLocaleDateString("en-US", {
-      month: "short",
-      day: "numeric",
-      year: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    });
-  } catch {
-    return dateString;
-  }
-}
-
-// Format relative time
-function formatRelativeTime(dateString: string | null): string {
-  if (!dateString) return "N/A";
-  try {
-    const date = new Date(dateString);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffMins = Math.floor(diffMs / 60000);
-    const diffHours = Math.floor(diffMs / 3600000);
-    const diffDays = Math.floor(diffMs / 86400000);
-
-    if (diffMins < 1) return "Just now";
-    if (diffMins < 60) return `${diffMins} min${diffMins > 1 ? "s" : ""} ago`;
-    if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? "s" : ""} ago`;
-    if (diffDays < 30) return `${diffDays} day${diffDays > 1 ? "s" : ""} ago`;
-    return formatDate(dateString);
-  } catch {
-    return dateString;
-  }
-}
-
-// Format schedule time
-function formatSchedule(minutes: number | null): string {
-  if (!minutes) return "Not set";
-  if (minutes < 1) return `${Math.round(minutes * 60)} seconds`;
-  if (minutes < 60) return `${Math.round(minutes)} minutes`;
-  const hours = minutes / 60;
-  if (hours < 24) return `${Math.round(hours)} hours`;
-  return `${Math.round(hours / 24)} days`;
+  initialTab?: "overview" | "candidates" | "analysis";
 }
 
 // Tab component
@@ -233,128 +138,58 @@ const Tab = ({
   </button>
 );
 
-// Risk badge component
-const RiskBadge = ({ score }: { score: number | null }) => {
-  if (score === null) return <span className="text-zinc-500">-</span>;
-  
-  const percentage = Math.round(score * 100);
-  let color = "text-emerald-400 bg-emerald-500/20";
-  if (percentage >= 70) color = "text-red-400 bg-red-500/20";
-  else if (percentage >= 40) color = "text-yellow-400 bg-yellow-500/20";
-  
-  return (
-    <span className={`px-2 py-0.5 text-xs font-medium rounded-full ${color}`}>
-      {percentage}%
-    </span>
-  );
-};
-
-// Entity type icon
-const EntityIcon = ({ type }: { type: string }) => {
-  const icons: Record<string, React.ReactNode> = {
-    http_endpoint: <Route className="w-4 h-4 text-blue-400" />,
-    cron_job: <Timer className="w-4 h-4 text-purple-400" />,
-    queue_worker: <MessageSquare className="w-4 h-4 text-orange-400" />,
-    serverless_function: <Cpu className="w-4 h-4 text-cyan-400" />,
-    websocket: <Activity className="w-4 h-4 text-green-400" />,
-    grpc_service: <Server className="w-4 h-4 text-pink-400" />,
-    graphql_resolver: <RefreshCw className="w-4 h-4 text-amber-400" />,
-  };
-  return icons[type] || <Server className="w-4 h-4 text-zinc-400" />;
-};
-
-// Status badge component
-const StatusBadge = ({ status }: { status: string }) => {
-  const statusConfig: Record<string, { bg: string; text: string; dot: string }> = {
-    pending_schedule: { bg: "bg-yellow-500/20", text: "text-yellow-400", dot: "bg-yellow-500" },
-    scheduled: { bg: "bg-emerald-500/20", text: "text-emerald-400", dot: "bg-emerald-500" },
-    active: { bg: "bg-emerald-500/20", text: "text-emerald-400", dot: "bg-emerald-500" },
-    paused: { bg: "bg-zinc-500/20", text: "text-zinc-400", dot: "bg-zinc-500" },
-  };
-  
-  const config = statusConfig[status] || statusConfig.paused;
-  const label = status.replace("_", " ").replace(/\b\w/g, l => l.toUpperCase());
-  
-  return (
-    <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-full ${config.bg} ${config.text}`}>
-      <span className={`w-1.5 h-1.5 rounded-full ${config.dot}`} />
-      {label}
-    </span>
-  );
-};
-
-// Health indicator
-const HealthIndicator = ({ health }: { health: WatcherDetails["llm_health"] | null }) => {
-  if (!health) return <span className="text-zinc-500 text-sm">Not analyzed</span>;
-  
-  const statusConfig: Record<string, { icon: React.ReactNode; color: string }> = {
-    healthy: { icon: <CheckCircle className="w-4 h-4" />, color: "text-emerald-400" },
-    warning: { icon: <AlertTriangle className="w-4 h-4" />, color: "text-yellow-400" },
-    critical: { icon: <XCircle className="w-4 h-4" />, color: "text-red-400" },
-  };
-  
-  const config = statusConfig[health.status] || statusConfig.warning;
-  
-  return (
-    <div className="flex items-start gap-2">
-      <span className={config.color}>{config.icon}</span>
-      <div>
-        <p className={`text-sm font-medium ${config.color}`}>
-          {health.status.charAt(0).toUpperCase() + health.status.slice(1)}
-        </p>
-        {health.reasons && health.reasons.length > 0 && (
-          <ul className="mt-1 space-y-0.5">
-            {health.reasons.slice(0, 3).map((reason, i) => (
-              <li key={i} className="text-xs text-zinc-500 flex items-start gap-1">
-                <ChevronRight className="w-3 h-3 mt-0.5 flex-shrink-0" />
-                <span>{reason}</span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-    </div>
-  );
-};
-
 export function WatcherDetailModal({
   watcherId,
   userId,
   onClose,
   onDelete,
-  onSchedule,
-  onEditSchedule,
+  initialTab = "overview",
 }: WatcherDetailModalProps) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [watcher, setWatcher] = useState<WatcherDetails | null>(null);
   const [candidates, setCandidates] = useState<ZombieCandidate[]>([]);
-  const [activeTab, setActiveTab] = useState<"overview" | "candidates" | "analysis">("overview");
+  const [activeTab, setActiveTab] = useState<"overview" | "candidates" | "analysis">(initialTab);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
+  const [showScheduleModal, setShowScheduleModal] = useState(false);
+  const [candidatesToSchedule, setCandidatesToSchedule] = useState<ZombieCandidate[]>([]);
+
+  // Derive status from candidates
+  const derivedStatus = useMemo(() => {
+    if (candidates.length === 0) return watcher?.status || "pending_schedule";
+    
+    const activeCandidates = candidates.filter(c => c.status === "active").length;
+    const pendingCandidates = candidates.filter(c => c.status === "pending").length;
+    
+    if (activeCandidates === candidates.length) return "active";
+    if (activeCandidates > 0) return "partially_scheduled";
+    if (pendingCandidates === candidates.length) return "pending_schedule";
+    return watcher?.status || "pending_schedule";
+  }, [candidates, watcher?.status]);
+
+  const fetchDetails = useCallback(async () => {
+    try {
+      setLoading(true);
+      const response = await fetch(`/api/watchers/${watcherId}?userId=${userId}`);
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.error || "Failed to fetch details");
+      }
+
+      setWatcher(data.watcher);
+      setCandidates(data.candidates || []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setLoading(false);
+    }
+  }, [watcherId, userId]);
 
   useEffect(() => {
-    const fetchDetails = async () => {
-      try {
-        setLoading(true);
-        const response = await fetch(`/api/watchers/${watcherId}?userId=${userId}`);
-        const data = await response.json();
-
-        if (!response.ok) {
-          throw new Error(data.error || "Failed to fetch details");
-        }
-
-        setWatcher(data.watcher);
-        setCandidates(data.candidates || []);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : "Unknown error");
-      } finally {
-        setLoading(false);
-      }
-    };
-
     fetchDetails();
-  }, [watcherId, userId]);
+  }, [fetchDetails]);
 
   const handleDelete = async () => {
     setIsDeleting(true);
@@ -368,7 +203,22 @@ export function WatcherDetailModal({
     }
   };
 
-  const borderColor = watcher?.status === "pending_schedule" ? "yellow" : "emerald";
+  const handleScheduleClick = (selectedCandidates: Array<{ candidate_id: number; [key: string]: unknown }>) => {
+    // Cast to ZombieCandidate for internal use
+    setCandidatesToSchedule(selectedCandidates as ZombieCandidate[]);
+    setShowScheduleModal(true);
+  };
+
+  const handleScheduleComplete = () => {
+    setShowScheduleModal(false);
+    setCandidatesToSchedule([]);
+    // Refresh data
+    fetchDetails();
+  };
+
+  const borderColor = derivedStatus === "pending_schedule" ? "yellow" 
+    : derivedStatus === "partially_scheduled" ? "yellow"
+    : "emerald";
 
   // Render loading state
   if (loading) {
@@ -502,22 +352,24 @@ export function WatcherDetailModal({
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-3 mb-2">
                 <h2 className="text-xl font-semibold text-white truncate">{watcher.watcher_name}</h2>
-                <StatusBadge status={watcher.status} />
+                <WatcherStatusBadge status={derivedStatus} />
               </div>
-              <a
-                href={watcher.repo_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 text-sm text-zinc-400 hover:text-emerald-400 transition-colors"
-              >
-                <GitBranch className="w-4 h-4" />
-                <span className="font-mono">{watcher.repo_name}</span>
-                <ExternalLink className="w-3 h-3" />
-              </a>
+              {watcher.application_url && (
+                <a
+                  href={watcher.application_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-sm text-zinc-400 hover:text-emerald-400 transition-colors"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  <span className="font-mono truncate max-w-[300px]">{watcher.application_url}</span>
+                </a>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setShowDeleteConfirm(true)}
+                data-variant="wanda"
                 className="p-2 text-zinc-500 hover:text-red-500 hover:bg-red-500/10 rounded-lg transition-colors"
                 title="Delete watcher"
               >
@@ -536,7 +388,7 @@ export function WatcherDetailModal({
           <div className="flex items-center border-b border-zinc-800 px-6">
             <Tab label="Overview" active={activeTab === "overview"} onClick={() => setActiveTab("overview")} />
             <Tab label="Candidates" active={activeTab === "candidates"} onClick={() => setActiveTab("candidates")} count={candidates.length} />
-            <Tab label="LLM Analysis" active={activeTab === "analysis"} onClick={() => setActiveTab("analysis")} />
+            <Tab label="Analysis" active={activeTab === "analysis"} onClick={() => setActiveTab("analysis")} />
           </div>
 
           {/* Content */}
@@ -550,12 +402,16 @@ export function WatcherDetailModal({
                     <p className="text-xs text-zinc-500">Total Candidates</p>
                   </div>
                   <div className="bg-zinc-800/50 rounded-xl p-4">
-                    <p className="text-2xl font-bold text-white">{watcher.http_endpoints}</p>
-                    <p className="text-xs text-zinc-500">HTTP Endpoints</p>
+                    <p className="text-2xl font-bold text-emerald-400">
+                      {candidates.filter(c => c.status === "active").length}
+                    </p>
+                    <p className="text-xs text-zinc-500">Active Observations</p>
                   </div>
                   <div className="bg-zinc-800/50 rounded-xl p-4">
-                    <p className="text-2xl font-bold text-white">{watcher.cron_jobs}</p>
-                    <p className="text-xs text-zinc-500">Cron Jobs</p>
+                    <p className="text-2xl font-bold text-yellow-400">
+                      {candidates.filter(c => c.status === "pending").length}
+                    </p>
+                    <p className="text-xs text-zinc-500">Pending Schedule</p>
                   </div>
                   <div className="bg-zinc-800/50 rounded-xl p-4">
                     <p className="text-2xl font-bold text-white">{watcher.scan_count}</p>
@@ -563,99 +419,92 @@ export function WatcherDetailModal({
                   </div>
                 </div>
 
-                {/* Schedule Section */}
+                {/* Observation Sources */}
                 <div className="bg-zinc-800/30 rounded-xl p-5 border border-zinc-700/50">
-                  <div className="flex items-center justify-between mb-4">
-                    <div className="flex items-center gap-2">
-                      <Calendar className="w-5 h-5 text-emerald-400" />
-                      <h3 className="font-medium text-white">Observation Schedule</h3>
-                    </div>
-                    {watcher.status === "pending_schedule" ? (
-                      <button
-                        onClick={() => {
-                          onClose();
-                          onSchedule();
-                        }}
-                        className="px-3 py-1.5 text-xs font-medium bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30 rounded-lg transition-colors"
-                      >
-                        Set Schedule
-                      </button>
-                    ) : (
-                      <button
-                        onClick={() => {
-                          onClose();
-                          onEditSchedule();
-                        }}
-                        className="px-3 py-1.5 text-xs font-medium bg-emerald-500/20 text-emerald-400 hover:bg-emerald-500/30 rounded-lg transition-colors flex items-center gap-1.5"
-                      >
-                        <Edit3 className="w-3 h-3" />
-                        Edit Schedule
-                      </button>
-                    )}
+                  <div className="flex items-center gap-2 mb-4">
+                    <Link2 className="w-5 h-5 text-emerald-400" />
+                    <h3 className="font-medium text-white">Observation Sources</h3>
                   </div>
-
-                  {watcher.status === "pending_schedule" ? (
-                    <p className="text-zinc-500 text-sm">
-                      No schedule configured yet. Set a schedule to start monitoring for zombie candidates.
-                    </p>
-                  ) : (
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                      <div>
-                        <p className="text-xs text-zinc-500 mb-1">Scan Frequency</p>
-                        <p className="text-sm text-white font-medium">
-                          {formatSchedule(watcher.scan_frequency_minutes)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs text-zinc-500 mb-1">Analysis Period</p>
-                        <p className="text-sm text-white font-medium">
-                          {formatSchedule(watcher.analysis_period_hours ? watcher.analysis_period_hours * 60 : null)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs text-zinc-500 mb-1">Observation Type</p>
-                        <p className="text-sm text-white font-medium capitalize">
-                          {watcher.observation_type || "N/A"}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs text-zinc-500 mb-1">Next Observation</p>
-                        <p className="text-sm text-white font-medium">
-                          {watcher.next_observation_at 
-                            ? formatRelativeTime(watcher.next_observation_at)
-                            : "Pending"}
-                        </p>
-                      </div>
-                    </div>
-                  )}
+                  <ObservationSources
+                    watcherId={watcherId}
+                    applicationUrl={watcher.application_url}
+                    existingSources={watcher.observability_urls || {}}
+                    onSourcesChange={() => fetchDetails()}
+                  />
                 </div>
 
                 {/* Git Info */}
                 <div className="bg-zinc-800/30 rounded-xl p-5 border border-zinc-700/50">
-                  <div className="flex items-center gap-2 mb-4">
-                    <GitBranch className="w-5 h-5 text-blue-400" />
-                    <h3 className="font-medium text-white">Latest Commit</h3>
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="flex items-center gap-2">
+                      <GitBranch className="w-5 h-5 text-blue-400" />
+                      <h3 className="font-medium text-white">Repository</h3>
+                    </div>
+                    <a
+                      href={watcher.repo_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      data-variant="captain"
+                      className="inline-flex items-center gap-1.5 text-sm text-zinc-400 hover:text-blue-400 transition-colors"
+                    >
+                      <span className="font-mono">{watcher.repo_name}</span>
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
                   </div>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  
+                  {/* Repository Description */}
+                  {watcher.repo_description && (
+                    <p className="text-sm text-zinc-400 mb-4 line-clamp-2">
+                      {watcher.repo_description}
+                    </p>
+                  )}
+
+                  {/* Commit Details */}
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                     <div>
-                      <p className="text-xs text-zinc-500 mb-1">Commit Hash</p>
-                      <p className="text-sm text-white font-mono">
-                        {watcher.last_commit_hash?.substring(0, 8) || "N/A"}
+                      <p className="text-xs text-zinc-500 mb-1">Branch</p>
+                      <p className="text-sm text-white font-mono truncate">
+                        {watcher.default_branch || "main"}
                       </p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-zinc-500 mb-1">Commit</p>
+                      <button
+                        onClick={() => {
+                          if (watcher.last_commit_hash) {
+                            navigator.clipboard.writeText(watcher.last_commit_hash);
+                          }
+                        }}
+                        data-variant="captain"
+                        className="text-sm text-blue-400 hover:text-blue-300 font-mono transition-colors cursor-pointer"
+                        title="Click to copy full hash"
+                      >
+                        {watcher.last_commit_hash?.substring(0, 7) || "N/A"}
+                      </button>
                     </div>
                     <div>
                       <p className="text-xs text-zinc-500 mb-1">Author</p>
-                      <p className="text-sm text-white">
+                      <p className="text-sm text-white truncate">
                         {watcher.last_commit_author || "N/A"}
                       </p>
                     </div>
-                    <div className="md:col-span-2">
-                      <p className="text-xs text-zinc-500 mb-1">Message</p>
-                      <p className="text-sm text-zinc-300 line-clamp-2">
-                        {watcher.last_commit_message || "N/A"}
+                    <div>
+                      <p className="text-xs text-zinc-500 mb-1">Committed</p>
+                      <p className="text-sm text-zinc-300">
+                        {watcher.last_commit_date ? formatRelativeTime(watcher.last_commit_date) : "N/A"}
                       </p>
                     </div>
                   </div>
+                  
+                  {/* Commit Message */}
+                  {watcher.last_commit_message && (
+                    <div className="mt-3 pt-3 border-t border-zinc-700/30">
+                      <p className="text-xs text-zinc-500 mb-1">Latest Commit Message</p>
+                      <p className="text-sm text-zinc-300 line-clamp-2">
+                        {watcher.last_commit_message}
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 {/* Timestamps */}
@@ -673,85 +522,156 @@ export function WatcherDetailModal({
             )}
 
             {activeTab === "candidates" && (
-              <div className="space-y-3">
-                {candidates.length === 0 ? (
-                  <div className="text-center py-12">
-                    <Server className="w-12 h-12 text-zinc-600 mx-auto mb-4" />
-                    <p className="text-zinc-400">No zombie candidates discovered yet</p>
-                    <p className="text-zinc-500 text-sm mt-1">
-                      Candidates will appear after the first scan
-                    </p>
-                  </div>
-                ) : (
-                  candidates.map((candidate) => (
-                    <motion.div
-                      key={candidate.candidate_id}
-                      initial={{ opacity: 0, y: 10 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      className="bg-zinc-800/30 border border-zinc-700/50 rounded-xl p-4 hover:border-zinc-600/50 transition-colors"
-                    >
-                      <div className="flex items-start justify-between gap-4">
-                        <div className="flex items-start gap-3 flex-1 min-w-0">
-                          <EntityIcon type={candidate.entity_type} />
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className="font-medium text-white truncate">
-                                {candidate.entity_name || candidate.entity_signature}
-                              </span>
-                              <span className="text-xs px-1.5 py-0.5 bg-zinc-700 text-zinc-400 rounded">
-                                {candidate.entity_type.replace("_", " ")}
-                              </span>
-                            </div>
-                            <p className="text-xs text-zinc-500 font-mono mt-1 truncate">
-                              {candidate.file_path}
-                            </p>
-                            {candidate.llm_purpose && (
-                              <p className="text-sm text-zinc-400 mt-2 line-clamp-2">
-                                {candidate.llm_purpose}
-                              </p>
-                            )}
-                          </div>
-                        </div>
-                        <div className="flex flex-col items-end gap-2">
-                          <RiskBadge score={candidate.llm_risk_score} />
-                          {candidate.method && candidate.route_path && (
-                            <span className="text-xs font-mono text-zinc-500">
-                              {candidate.method} {candidate.route_path}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                      
-                      {/* Candidate schedule info if different from watcher */}
-                      {(candidate.scan_frequency_minutes || candidate.analysis_period_hours) && (
-                        <div className="mt-3 pt-3 border-t border-zinc-700/30 flex items-center gap-4 text-xs">
-                          <div className="flex items-center gap-1.5 text-zinc-500">
-                            <Clock className="w-3 h-3" />
-                            <span>Scan: {formatSchedule(candidate.scan_frequency_minutes)}</span>
-                          </div>
-                          <div className="flex items-center gap-1.5 text-zinc-500">
-                            <Timer className="w-3 h-3" />
-                            <span>Period: {formatSchedule(candidate.analysis_period_hours ? candidate.analysis_period_hours * 60 : null)}</span>
-                          </div>
-                        </div>
-                      )}
-                    </motion.div>
-                  ))
-                )}
-              </div>
+              <CandidateList
+                candidates={candidates}
+                watcherId={watcherId}
+                userId={userId}
+                onScheduleClick={handleScheduleClick}
+                onRefresh={fetchDetails}
+              />
             )}
 
             {activeTab === "analysis" && (
               <div className="space-y-6">
-                {/* Business Context */}
+                {/* Health & Risk Overview */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {/* Project Health Card */}
+                  <div className="bg-gradient-to-br from-zinc-800/50 to-zinc-900/50 rounded-xl p-4 border border-zinc-700/50 flex flex-col">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <div className="p-1.5 rounded-lg bg-emerald-500/10">
+                          <Shield className="w-4 h-4 text-emerald-400" />
+                        </div>
+                        <h3 className="text-sm font-medium text-white">Project Health</h3>
+                      </div>
+                      {watcher.llm_health && Object.keys(watcher.llm_health).length > 0 && (() => {
+                        const metrics = [
+                          watcher.llm_health.activity_level,
+                          watcher.llm_health.documentation_quality,
+                          watcher.llm_health.code_quality
+                        ];
+                        const scoreMap: Record<string, number> = { good: 100, active: 100, moderate: 60, stale: 40, poor: 20, abandoned: 10, none: 0 };
+                        const scores = metrics.map(m => scoreMap[m?.toLowerCase() || ""] ?? 50);
+                        const avg = Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+                        const color = avg >= 70 ? "text-emerald-400" : avg >= 40 ? "text-yellow-400" : "text-red-400";
+                        return <span className={`text-xl font-bold ${color}`}>{avg}%</span>;
+                      })()}
+                    </div>
+                    {watcher.llm_health && Object.keys(watcher.llm_health).length > 0 ? (
+                      <div className="space-y-2.5 flex-1 flex flex-col justify-center">
+                        {[
+                          { label: "Activity", value: watcher.llm_health.activity_level },
+                          { label: "Documentation", value: watcher.llm_health.documentation_quality },
+                          { label: "Code Quality", value: watcher.llm_health.code_quality },
+                        ].map((metric, i) => {
+                          const v = metric.value?.toLowerCase() || "";
+                          const scoreMap: Record<string, number> = { good: 100, active: 100, moderate: 60, stale: 40, poor: 20, abandoned: 10, none: 0 };
+                          const score = scoreMap[v] ?? 50;
+                          const barColor = score >= 70 ? "bg-emerald-500" : score >= 40 ? "bg-yellow-500" : "bg-red-500";
+                          const textColor = score >= 70 ? "text-emerald-400" : score >= 40 ? "text-yellow-400" : "text-red-400";
+                          return (
+                            <div key={i}>
+                              <div className="flex items-center justify-between mb-1">
+                                <span className="text-xs text-zinc-400">{metric.label}</span>
+                                <span className={`text-xs font-medium capitalize ${textColor}`}>{metric.value || "Unknown"}</span>
+                              </div>
+                              <div className="h-1.5 bg-zinc-700/50 rounded-full overflow-hidden">
+                                <div 
+                                  className={`h-full ${barColor} rounded-full transition-all duration-500`}
+                                  style={{ width: `${score}%` }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <p className="text-sm text-zinc-500">Not analyzed</p>
+                    )}
+                  </div>
+
+                  {/* Zombie Risk Card */}
+                  <div className="bg-gradient-to-br from-zinc-800/50 to-zinc-900/50 rounded-xl p-4 border border-zinc-700/50 flex flex-col">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <div className={`p-1.5 rounded-lg ${
+                          watcher.llm_zombie_risk?.level === "high" ? "bg-red-500/10" 
+                          : watcher.llm_zombie_risk?.level === "medium" ? "bg-yellow-500/10"
+                          : "bg-emerald-500/10"
+                        }`}>
+                        <AlertTriangle className={`w-4 h-4 ${
+                          watcher.llm_zombie_risk?.level === "high" ? "text-red-400" 
+                          : watcher.llm_zombie_risk?.level === "medium" ? "text-yellow-400"
+                          : "text-emerald-400"
+                        }`} />
+                      </div>
+                      <h3 className="text-sm font-medium text-white">Zombie Risk</h3>
+                      </div>
+                      {watcher.llm_zombie_risk?.score !== undefined && (() => {
+                        const riskPercent = Math.round(watcher.llm_zombie_risk.score * 100);
+                        const color = riskPercent >= 70 ? "text-red-400" : riskPercent >= 40 ? "text-yellow-400" : "text-emerald-400";
+                        return <span className={`text-xl font-bold ${color}`}>{riskPercent}%</span>;
+                      })()}
+                    </div>
+                    {watcher.llm_zombie_risk ? (
+                      <div className="flex-1 flex flex-col justify-center items-center">
+                        {/* Animated Pulse Indicator */}
+                        <div className="relative mb-2">
+                          {/* Pulse rings - color based on risk level */}
+                          <div className={`absolute inset-0 rounded-full animate-ping opacity-20 ${
+                            watcher.llm_zombie_risk.level === "high" ? "bg-red-500"
+                            : watcher.llm_zombie_risk.level === "medium" ? "bg-yellow-500"
+                            : "bg-emerald-500"
+                          }`} style={{ animationDuration: "2s" }} />
+                          {/* Center circle with Wanda - always red glow, border color based on risk */}
+                          <div className={`relative w-16 h-16 rounded-full flex items-center justify-center shadow-[0_0_25px_rgba(239,68,68,0.6),0_0_50px_rgba(239,68,68,0.3),0_0_75px_rgba(239,68,68,0.1)] ${
+                            watcher.llm_zombie_risk.level === "high" ? "bg-red-500/20 border-2 border-red-500/50"
+                            : watcher.llm_zombie_risk.level === "medium" ? "bg-yellow-500/20 border-2 border-yellow-500/50"
+                            : "bg-emerald-500/20 border-2 border-emerald-500/50"
+                          }`}>
+                            <ScarletWitchIcon className="w-14 h-14" />
+                          </div>
+                        </div>
+
+                        {/* Risk Level Label */}
+                        <span className={`text-sm font-semibold capitalize ${
+                          watcher.llm_zombie_risk.level === "high" ? "text-red-400"
+                          : watcher.llm_zombie_risk.level === "medium" ? "text-yellow-400"
+                          : "text-emerald-400"
+                        }`}>
+                          {watcher.llm_zombie_risk.level} Risk
+                        </span>
+                        
+                        {/* High Risk Areas */}
+                        {watcher.llm_zombie_risk.high_risk_areas && watcher.llm_zombie_risk.high_risk_areas.length > 0 && (
+                          <div className="pt-2 mt-2 border-t border-zinc-700/30 w-full">
+                            <div className="flex flex-wrap gap-1.5 justify-center">
+                              {watcher.llm_zombie_risk.high_risk_areas.slice(0, 3).map((area, i) => (
+                                <span key={i} className="px-2 py-0.5 text-xs bg-red-500/10 text-red-400 rounded-md">
+                                  {area}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="text-sm text-zinc-500 flex-1 flex items-center justify-center">Not analyzed</p>
+                    )}
+                  </div>
+                </div>
+
+                {/* Description */}
                 <div className="bg-zinc-800/30 rounded-xl p-5 border border-zinc-700/50">
                   <h3 className="font-medium text-white mb-3 flex items-center gap-2">
                     <MessageSquare className="w-4 h-4 text-blue-400" />
-                    Business Context
+                    Description
                   </h3>
-                  <p className="text-sm text-zinc-300 leading-relaxed">
-                    {watcher.llm_business_context || "No business context analysis available."}
-                  </p>
+                  <div className="text-sm text-zinc-300 leading-relaxed text-justify prose prose-sm prose-invert max-w-none prose-p:my-2 prose-ul:my-2 prose-li:my-0.5 prose-headings:text-zinc-200 prose-strong:text-zinc-200">
+                    <ReactMarkdown>
+                      {watcher.llm_business_context || "No analysis available."}
+                    </ReactMarkdown>
+                  </div>
                 </div>
 
                 {/* Architecture */}
@@ -760,9 +680,11 @@ export function WatcherDetailModal({
                     <Server className="w-4 h-4 text-purple-400" />
                     Architecture
                   </h3>
-                  <p className="text-sm text-zinc-300 leading-relaxed">
-                    {watcher.llm_architecture || "No architecture analysis available."}
-                  </p>
+                  <div className="text-sm text-zinc-300 leading-relaxed text-justify prose prose-sm prose-invert max-w-none prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-0.5 prose-headings:text-zinc-200 prose-headings:text-base prose-strong:text-zinc-200 prose-code:text-emerald-400 prose-code:bg-zinc-800 prose-code:px-1 prose-code:py-0.5 prose-code:rounded">
+                    <ReactMarkdown>
+                      {watcher.llm_architecture || "No architecture analysis available."}
+                    </ReactMarkdown>
+                  </div>
                 </div>
 
                 {/* Tech Stack */}
@@ -791,53 +713,27 @@ export function WatcherDetailModal({
                     </div>
                   </div>
                 )}
-
-                {/* Health & Risk */}
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="bg-zinc-800/30 rounded-xl p-5 border border-zinc-700/50">
-                    <h3 className="font-medium text-white mb-3 flex items-center gap-2">
-                      <Shield className="w-4 h-4 text-emerald-400" />
-                      Project Health
-                    </h3>
-                    <HealthIndicator health={watcher.llm_health} />
-                  </div>
-
-                  <div className="bg-zinc-800/30 rounded-xl p-5 border border-zinc-700/50">
-                    <h3 className="font-medium text-white mb-3 flex items-center gap-2">
-                      <AlertTriangle className="w-4 h-4 text-yellow-400" />
-                      Zombie Risk
-                    </h3>
-                    {watcher.llm_zombie_risk ? (
-                      <div>
-                        <p className={`text-sm font-medium mb-2 ${
-                          watcher.llm_zombie_risk.level === "high" 
-                            ? "text-red-400" 
-                            : watcher.llm_zombie_risk.level === "medium"
-                            ? "text-yellow-400"
-                            : "text-emerald-400"
-                        }`}>
-                          {watcher.llm_zombie_risk.level.charAt(0).toUpperCase() + watcher.llm_zombie_risk.level.slice(1)} Risk
-                        </p>
-                        {watcher.llm_zombie_risk.factors && watcher.llm_zombie_risk.factors.length > 0 && (
-                          <ul className="space-y-0.5">
-                            {watcher.llm_zombie_risk.factors.slice(0, 3).map((factor, i) => (
-                              <li key={i} className="text-xs text-zinc-500 flex items-start gap-1">
-                                <ChevronRight className="w-3 h-3 mt-0.5 flex-shrink-0" />
-                                <span>{factor}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        )}
-                      </div>
-                    ) : (
-                      <span className="text-zinc-500 text-sm">Not analyzed</span>
-                    )}
-                  </div>
-                </div>
               </div>
             )}
           </div>
         </div>
+
+        {/* Candidate Schedule Modal */}
+        <AnimatePresence>
+          {showScheduleModal && candidatesToSchedule.length > 0 && (
+            <CandidateScheduleModal
+              candidates={candidatesToSchedule}
+              watcherId={watcherId}
+              userId={userId}
+              applicationUrl={watcher?.application_url || null}
+              onClose={() => {
+                setShowScheduleModal(false);
+                setCandidatesToSchedule([]);
+              }}
+              onScheduleComplete={handleScheduleComplete}
+            />
+          )}
+        </AnimatePresence>
       </motion.div>
     </motion.div>
   );

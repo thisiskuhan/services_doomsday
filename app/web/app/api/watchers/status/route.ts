@@ -1,3 +1,17 @@
+/**
+ * Kestra Execution Status API
+ *
+ * GET /api/watchers/status?executionId=xxx
+ * Returns the current status of a Kestra workflow execution.
+ *
+ * Response: {
+ *   state: string,           // RUNNING, SUCCESS, FAILED, KILLED
+ *   currentTask: string,     // Current task ID
+ *   progress: string,        // Human-readable progress message
+ *   duration: number,
+ *   outputs?: object
+ * }
+ */
 import { NextRequest, NextResponse } from 'next/server';
 
 interface KestraExecution {

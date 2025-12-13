@@ -1,3 +1,20 @@
+/**
+ * PostgreSQL Database Connection Module
+ *
+ * Manages database connections with automatic SSL configuration.
+ * Supports various cloud providers (Aiven, Neon, Supabase, Render, Railway).
+ *
+ * Environment Variables:
+ *   - DATABASE_URL: PostgreSQL connection string
+ *   - PGSQL_CA_PATH: Optional path to CA certificate file
+ *
+ * Exports:
+ *   - pool: PostgreSQL connection pool
+ *   - query<T>(text, params): Execute query returning multiple rows
+ *   - queryOne<T>(text, params): Execute query returning single row or null
+ *   - initializeDatabase(): Initialize schema from db_schema.sql
+ *   - checkConnection(): Test database connectivity
+ */
 import { Pool, PoolConfig } from "pg";
 import fs from "fs";
 import path from "path";
@@ -6,7 +23,6 @@ const getSslConfig = (): PoolConfig["ssl"] => {
   const caPath = process.env.PGSQL_CA_PATH;
   
   if (caPath) {
-    // Try multiple possible locations for the CA file
     const cwd = process.cwd();
     const possiblePaths = [
       path.isAbsolute(caPath) ? caPath : path.resolve(cwd, caPath),
@@ -24,13 +40,11 @@ const getSslConfig = (): PoolConfig["ssl"] => {
           };
         }
       } catch {
-        // Continue to next path
       }
     }
     console.warn(`[db] CA certificate not found, tried: ${possiblePaths.join(", ")}`);
   }
   
-  // Allow self-signed certificates when no CA is provided or not found
   console.log(`[db] Using SSL with rejectUnauthorized: false`);
   return { rejectUnauthorized: false };
 };
@@ -48,14 +62,11 @@ const requiresSsl = (): boolean => {
   );
 };
 
-// Remove sslmode from connection string to avoid conflicts with our SSL config
 const getConnectionString = (): string => {
   const dbUrl = process.env.DATABASE_URL || "";
-  // Remove sslmode parameter from URL as we handle SSL separately
   return dbUrl.replace(/[?&]sslmode=[^&]*/g, "").replace(/\?$/, "");
 };
 
-// Get SSL configuration at initialization time
 const sslConfig = requiresSsl() ? getSslConfig() : false;
 
 const pool = new Pool({
@@ -116,7 +127,6 @@ export async function initializeDatabase(): Promise<void> {
       throw new Error(`Schema file not found: ${schemaPath}`);
     }
 
-    // Check if tables already exist
     const tablesExist = await client.query(`
       SELECT EXISTS (
         SELECT FROM information_schema.tables 
@@ -129,7 +139,6 @@ export async function initializeDatabase(): Promise<void> {
       return;
     }
 
-    // Create tables from schema
     const schema = fs.readFileSync(schemaPath, "utf-8");
     for (const statement of parseSqlStatements(schema)) {
       await client.query(statement);

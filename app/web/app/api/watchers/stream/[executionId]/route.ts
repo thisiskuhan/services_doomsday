@@ -1,3 +1,14 @@
+/**
+ * Kestra Execution Stream API
+ *
+ * GET /api/watchers/stream/[executionId]
+ * Server-Sent Events (SSE) endpoint for real-time workflow progress.
+ *
+ * Polls Kestra every 2 seconds and streams updates:
+ *   { state, taskId, taskState, duration, outputs, error? }
+ *
+ * Terminal states: SUCCESS, FAILED, KILLED
+ */
 import { NextRequest, NextResponse } from "next/server";
 
 const POLL_INTERVAL_MS = 2000;
@@ -42,32 +53,99 @@ export async function GET(
 
           const execution = await response.json();
           const currentState = execution.state.current;
-          
-          // Get the latest task that's currently running or most recently completed
           const taskRunList = execution.taskRunList || [];
-          const latestTask = taskRunList.length > 0 
-            ? taskRunList[taskRunList.length - 1]
-            : null;
-          const currentTaskId = latestTask?.taskId || "";
+          
+          // When execution is complete, use a special task ID for proper step mapping
+          let currentTaskId = "";
+          let taskState = "";
+          let errorMessage = "";
+          
+          if (currentState === "SUCCESS") {
+            // Execution completed - use output_success to map to final step
+            currentTaskId = "output_success";
+            taskState = "SUCCESS";
+          } else if (currentState === "FAILED" || currentState === "KILLED") {
+            // Find the failed task
+            const failedTask = taskRunList.find((t: { state?: { current?: string } }) => 
+              t.state?.current === "FAILED"
+            );
+            currentTaskId = failedTask?.taskId || "creation_failed";
+            taskState = "FAILED";
+            
+            // Extract error message from outputs if available
+            if (execution.outputs?.values?.error) {
+              errorMessage = execution.outputs.values.error;
+            } else if (failedTask?.taskId) {
+              errorMessage = `Workflow failed at task: ${failedTask.taskId}`;
+            } else {
+              errorMessage = "Workflow execution failed";
+            }
+          } else {
+            // Execution is still running - find the currently running task
+            // First, look for any task with RUNNING state
+            const runningTask = taskRunList.find((t: { state?: { current?: string } }) => 
+              t.state?.current === "RUNNING"
+            );
+            
+            if (runningTask) {
+              // Extract base task ID (remove nested suffixes like ".clone_repo")
+              const fullTaskId = runningTask.taskId || "";
+              currentTaskId = fullTaskId.split(".")[0];
+              taskState = "RUNNING";
+            } else if (taskRunList.length > 0) {
+              // No running task, get the most recent completed one by end time
+              const completedTasks = taskRunList.filter((t: { state?: { current?: string; endDate?: string } }) => 
+                t.state?.current === "SUCCESS" && t.state?.endDate
+              );
+              
+              if (completedTasks.length > 0) {
+                const sortedTasks = [...completedTasks].sort((a: { state?: { endDate?: string } }, b: { state?: { endDate?: string } }) => {
+                  const aEnd = a.state?.endDate || "";
+                  const bEnd = b.state?.endDate || "";
+                  return bEnd.localeCompare(aEnd);
+                });
+                const fullTaskId = sortedTasks[0]?.taskId || "";
+                currentTaskId = fullTaskId.split(".")[0];
+                taskState = sortedTasks[0]?.state?.current || "";
+              }
+            }
+          }
 
-          // Send update if state OR task changed
-          if (currentState !== lastState || currentTaskId !== lastTaskId) {
+          // Send update if state OR task changed, OR if it's a terminal state (always send terminal)
+          const isTerminalState = TERMINAL_STATES.includes(currentState);
+          if (currentState !== lastState || currentTaskId !== lastTaskId || isTerminalState) {
             lastState = currentState;
             lastTaskId = currentTaskId;
             
-            const data = {
+            const data: Record<string, unknown> = {
               state: currentState,
               taskId: currentTaskId,
-              taskState: latestTask?.state?.current || "",
+              taskState: taskState,
               duration: execution.state.duration,
               outputs: execution.outputs,
             };
+            
+            // Include error message if present
+            if (errorMessage) {
+              data.error = errorMessage;
+            }
+            
+            console.log(`[SSE] Sending: state=${currentState}, taskId=${currentTaskId}, isTerminal=${isTerminalState}`);
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
           }
 
-          if (TERMINAL_STATES.includes(currentState)) {
+          if (isTerminalState) {
+            // Send one more time after a small delay to ensure client receives it
+            setTimeout(() => {
+              try {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ state: currentState, final: true })}\n\n`));
+              } catch (e) {
+                // Stream may already be closed
+              }
+            }, 100);
+            
             clearInterval(pollInterval);
-            controller.close();
+            setTimeout(() => controller.close(), 200);
           }
         } catch (error) {
           console.error("[api/watchers/stream] Poll error:", error);

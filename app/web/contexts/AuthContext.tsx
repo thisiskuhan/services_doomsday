@@ -1,3 +1,16 @@
+/**
+ * Authentication Context Provider
+ *
+ * Manages Firebase authentication state across the application.
+ * Provides current user and loading state to all child components.
+ *
+ * Exports:
+ *   - useAuth(): Hook to access auth context (user, loading)
+ *   - AuthProvider: Context provider component wrapping the app
+ *
+ * Usage:
+ *   const { user, loading } = useAuth();
+ */
 "use client";
 
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";

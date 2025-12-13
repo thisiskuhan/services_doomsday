@@ -1,3 +1,10 @@
+/**
+ * Root Page (Entry Point)
+ *
+ * Redirects users based on authentication state:
+ *   - Authenticated users → /home (dashboard)
+ *   - Unauthenticated users → /login
+ */
 "use client";
 
 import { useEffect } from "react";

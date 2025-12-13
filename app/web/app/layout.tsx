@@ -1,7 +1,17 @@
+/**
+ * Root Layout
+ *
+ * Application-wide layout wrapper with:
+ *   - Custom Google Fonts (Staatliches, Dancing Script, Cinzel Decorative)
+ *   - Firebase Authentication Provider
+ *   - Global Music Player
+ *   - Vercel Speed Insights
+ */
 import type { Metadata } from "next";
 import { Staatliches, Dancing_Script, Cinzel_Decorative } from "next/font/google";
 import { AuthProvider } from "@/contexts/AuthContext";
 import MusicPlayer from "@/components/ui/MusicPlayer";
+import { SpeedInsights } from "@vercel/speed-insights/next";
 import "./globals.css";
 
 const staatliches = Staatliches({
@@ -45,6 +55,7 @@ export default function RootLayout({
         <AuthProvider>
           {children}
           <MusicPlayer />
+          <SpeedInsights />
         </AuthProvider>
       </body>
     </html>

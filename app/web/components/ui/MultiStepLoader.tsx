@@ -1,7 +1,7 @@
 "use client";
 
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckCircle2, Loader2, Circle, XCircle } from "lucide-react";
+import { CheckCircle2, Loader2, Circle, XCircle, X } from "lucide-react";
 
 export interface LoadingStep {
   id: string;
@@ -14,6 +14,8 @@ interface MultiStepLoaderProps {
   isComplete: boolean;
   isFailed: boolean;
   isVisible: boolean;
+  errorMessage?: string;
+  onClose?: () => void;
 }
 
 export function MultiStepLoader({
@@ -22,6 +24,8 @@ export function MultiStepLoader({
   isComplete,
   isFailed,
   isVisible,
+  errorMessage,
+  onClose,
 }: MultiStepLoaderProps) {
   return (
     <AnimatePresence>
@@ -37,15 +41,28 @@ export function MultiStepLoader({
             animate={{ scale: 1, opacity: 1 }}
             exit={{ scale: 0.9, opacity: 0 }}
             transition={{ type: "spring", damping: 25, stiffness: 300 }}
-            className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 w-full max-w-md shadow-2xl"
+            className="bg-zinc-900 border border-zinc-800 rounded-2xl p-8 w-full max-w-md shadow-2xl relative"
           >
+            {/* Close button - show when failed or complete */}
+            {(isFailed || isComplete) && onClose && (
+              <button
+                onClick={onClose}
+                className="absolute top-4 right-4 p-1 rounded-lg hover:bg-zinc-800 transition-colors"
+              >
+                <X className="w-5 h-5 text-zinc-400 hover:text-white" />
+              </button>
+            )}
             {/* Header */}
             <div className="text-center mb-8">
               <motion.div
                 initial={{ scale: 0 }}
                 animate={{ scale: 1 }}
                 transition={{ delay: 0.1, type: "spring", stiffness: 200 }}
-                className="inline-flex items-center justify-center w-16 h-16 rounded-full bg-gradient-to-br from-[#00ff41]/20 to-[#a78bfa]/20 mb-4"
+                className={`inline-flex items-center justify-center w-16 h-16 rounded-full mb-4 ${
+                  isFailed 
+                    ? "bg-gradient-to-br from-red-500/20 to-red-600/20" 
+                    : "bg-gradient-to-br from-[#00ff41]/20 to-[#a78bfa]/20"
+                }`}
               >
                 {isComplete ? (
                   <CheckCircle2 className="w-8 h-8 text-[#00ff41]" />
@@ -66,9 +83,21 @@ export function MultiStepLoader({
                 {isComplete
                   ? "Your watcher is ready to hunt zombies"
                   : isFailed
-                  ? "Something went wrong"
+                  ? "Something went wrong during workflow execution"
                   : "Please wait while we set things up"}
               </p>
+              {/* Error message box */}
+              {isFailed && errorMessage && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="mt-4 p-3 bg-red-500/10 border border-red-500/30 rounded-lg text-left"
+                >
+                  <p className="text-xs text-red-400 font-mono break-all">
+                    {errorMessage}
+                  </p>
+                </motion.div>
+              )}
             </div>
 
             {/* Steps */}
@@ -189,6 +218,27 @@ export function MultiStepLoader({
                   : `Step ${currentStep + 1} of ${steps.length}`}
               </p>
             </div>
+
+            {/* Action buttons for failed/complete state */}
+            {(isFailed || isComplete) && onClose && (
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.3 }}
+                className="mt-6 flex justify-center"
+              >
+                <button
+                  onClick={onClose}
+                  className={`px-6 py-2.5 rounded-lg font-medium text-sm transition-all ${
+                    isFailed
+                      ? "bg-zinc-800 hover:bg-zinc-700 text-white border border-zinc-700"
+                      : "bg-[#00ff41]/20 hover:bg-[#00ff41]/30 text-[#00ff41] border border-[#00ff41]/30"
+                  }`}
+                >
+                  {isFailed ? "Close & Try Again" : "Done"}
+                </button>
+              </motion.div>
+            )}
           </motion.div>
         </motion.div>
       )}

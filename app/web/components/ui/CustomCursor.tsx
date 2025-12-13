@@ -26,12 +26,28 @@ export const LokiIcon = ({ className }: { className?: string }) => (
   </div>
 );
 
+// Scarlet Witch Icon Component - uses actual SVG from public folder
+export const ScarletWitchIcon = ({ className }: { className?: string }) => (
+  <div className={`relative ${className}`}>
+    <Image src="/scarlet-witch.svg" alt="Scarlet Witch" fill className="object-contain" priority />
+  </div>
+);
+
+// Captain America Icon Component - uses actual SVG from public folder
+export const CaptainAmericaIcon = ({ className }: { className?: string }) => (
+  <div className={`relative ${className}`}>
+    <Image src="/captain-america.svg" alt="Captain America" fill className="object-contain" priority />
+  </div>
+);
+
 export function CustomCursor() {
   const [position, setPosition] = useState({ x: 0, y: 0 });
   const [isHovering, setIsHovering] = useState(false);
   const [isVisible, setIsVisible] = useState(false);
   const [isDanger, setIsDanger] = useState(false);
   const [isWatcher, setIsWatcher] = useState(false);
+  const [isCaptain, setIsCaptain] = useState(false);
+  const [isWanda, setIsWanda] = useState(false);
 
   useEffect(() => {
     const updatePosition = (e: MouseEvent) => {
@@ -56,15 +72,19 @@ export function CustomCursor() {
         variantElement
       ) {
         setIsHovering(true);
-        // Check if it's a danger or watcher variant
+        // Check if it's a danger, watcher, captain, or wanda variant
         const elementWithVariant = variantElement || hoverableElement || target;
         const variant = elementWithVariant?.getAttribute("data-variant");
         setIsDanger(variant === "danger");
         setIsWatcher(variant === "watcher");
+        setIsCaptain(variant === "captain");
+        setIsWanda(variant === "wanda");
       } else {
         setIsHovering(false);
         setIsDanger(false);
         setIsWatcher(false);
+        setIsCaptain(false);
+        setIsWanda(false);
       }
     };
 
@@ -100,14 +120,18 @@ export function CustomCursor() {
         }}
       >
         {isHovering ? (
-          /* Icon when hovering - Iron Man for logout, Loki for watchers, Dr. Doom for others */
+          /* Icon when hovering - Iron Man for logout, Loki for watchers, Captain America for create, Wanda for delete, Dr. Doom for others */
           <div
-            className={`w-[60px] h-[60px] ${isDanger ? "drop-shadow-[0_0_10px_rgba(239,68,68,0.6)]" : isWatcher ? "drop-shadow-[0_0_10px_rgba(234,179,8,0.6)]" : "drop-shadow-[0_0_10px_rgba(0,255,65,0.6)]"}`}
+            className={`${isWanda ? "w-[47px] h-[47px]" : isWatcher ? "w-[57px] h-[57px]" : isCaptain ? "w-[59px] h-[59px]" : isDanger ? "w-[55px] h-[55px]" : "w-[60px] h-[60px]"} ${isDanger ? "drop-shadow-[0_0_10px_rgba(239,68,68,0.6)]" : isWatcher ? "drop-shadow-[0_0_10px_rgba(234,179,8,0.6)]" : isCaptain ? "drop-shadow-[0_0_10px_rgba(59,130,246,0.6)]" : isWanda ? "drop-shadow-[0_0_10px_rgba(239,68,68,0.6)]" : "drop-shadow-[0_0_10px_rgba(0,255,65,0.6)]"}`}
           >
             {isDanger ? (
               <IronManIcon className="w-full h-full" />
             ) : isWatcher ? (
               <LokiIcon className="w-full h-full" />
+            ) : isCaptain ? (
+              <CaptainAmericaIcon className="w-full h-full" />
+            ) : isWanda ? (
+              <ScarletWitchIcon className="w-full h-full" />
             ) : (
               <DoomIcon className="w-full h-full" />
             )}
@@ -141,7 +165,7 @@ export function CustomCursor() {
       >
         <div
           className={`w-1 h-1 rounded-full ${
-            isHovering ? (isDanger ? "bg-red-500" : isWatcher ? "bg-yellow-500" : "bg-[#00ff41]") : "bg-zinc-600"
+            isHovering ? (isDanger ? "bg-red-500" : isWatcher ? "bg-yellow-500" : isCaptain ? "bg-blue-500" : isWanda ? "bg-red-500" : "bg-[#00ff41]") : "bg-zinc-600"
           }`}
         ></div>
       </motion.div>

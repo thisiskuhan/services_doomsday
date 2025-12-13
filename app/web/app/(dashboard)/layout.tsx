@@ -1,3 +1,13 @@
+/**
+ * Dashboard Layout
+ *
+ * Protected layout for authenticated dashboard pages.
+ * Includes:
+ *   - Authentication guard (redirects to /login if not authenticated)
+ *   - Spotlight background effect
+ *   - Custom cursor
+ *   - Floating dock navigation (Home, Watchers, Logout)
+ */
 "use client";
 
 import { useAuth } from "@/contexts/AuthContext";
@@ -103,7 +113,7 @@ export default function DashboardLayout({
       <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-emerald-600/5 rounded-full blur-[128px] pointer-events-none" />
 
       {/* Main Content */}
-      <div className="relative z-10 min-h-screen pb-24">
+      <div className="relative z-10 h-screen overflow-y-auto pb-24">
         {children}
       </div>
 

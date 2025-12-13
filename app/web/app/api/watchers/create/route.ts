@@ -1,21 +1,30 @@
-import { NextRequest, NextResponse } from "next/server";
-import { v4 as uuidv4 } from "uuid";
-import { pool } from "@/lib/db";
-
 /**
  * Watcher Creation API
  *
- * Validates inputs, GitHub repository, application URL, and observability sources,
- * then triggers the Kestra watcher creation workflow (w1_watcher_creation).
+ * POST /api/watchers/create
+ * Creates a new watcher by validating inputs and triggering Kestra workflow.
+ *
+ * Body: {
+ *   name: string,                    // 3-50 characters
+ *   repoUrl: string,                 // GitHub URL format
+ *   repoDescription: string,
+ *   applicationUrl?: string,
+ *   userId: string,
+ *   userEmail?: string,
+ *   githubToken?: string,
+ *   observabilitySources?: [{ url, type?, token? }]
+ * }
  *
  * Flow:
- * 1. Validate inputs (name, URL format, description)
- * 2. Check for duplicate watchers (name or repo URL)
- * 3. Validate GitHub repository via API
- * 4. Validate Application URL (if provided)
- * 5. Validate Observability Sources with tokens
- * 6. Trigger Kestra workflow for discovery, LLM analysis, and storage
+ *   1. Validate inputs and check duplicates
+ *   2. Validate GitHub repository access
+ *   3. Validate Application URL (if provided)
+ *   4. Validate Observability Sources
+ *   5. Trigger Kestra w1_watcher_creation workflow
  */
+import { NextRequest, NextResponse } from "next/server";
+import { v4 as uuidv4 } from "uuid";
+import { pool } from "@/lib/db";
 
 interface ObservabilitySource {
   url: string;
@@ -30,6 +39,7 @@ interface CreateWatcherRequest {
   repoDescription: string;
   applicationUrl?: string;
   userId: string;
+  userEmail?: string;
   githubToken?: string;
   observabilitySources?: ObservabilitySource[];
 }
@@ -465,6 +475,7 @@ export async function POST(req: NextRequest) {
       repo_description: body.repoDescription,
       default_branch: defaultBranch,
       user_id: body.userId,
+      user_email: body.userEmail || null,
       github_token: body.githubToken || null,
       application_url: body.applicationUrl || null,
       observability_urls: observabilityUrls.length > 0 ? JSON.stringify(observabilityUrls) : null,

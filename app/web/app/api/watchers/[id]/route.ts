@@ -1,3 +1,17 @@
+/**
+ * Single Watcher API
+ *
+ * GET /api/watchers/[id]?userId=xxx
+ * Returns detailed watcher information with all zombie candidates.
+ *
+ * DELETE /api/watchers/[id]?userId=xxx
+ * Deletes a watcher and all its associated candidates.
+ *
+ * Response (GET): {
+ *   watcher: { watcherId, name, repoUrl, llmAnalysis, ... },
+ *   candidates: [{ candidateId, entityType, zombieScore, ... }]
+ * }
+ */
 import { NextRequest, NextResponse } from "next/server";
 import { query } from "@/lib/db";
 
@@ -31,10 +45,7 @@ interface WatcherDetails {
   created_at: string;
   updated_at: string;
   application_url: string | null;
-  observation_type: string | null;
-  scan_frequency_minutes: number | null;
-  analysis_period_hours: number | null;
-  next_observation_at: string | null;
+  observability_urls: Record<string, string> | null;
 }
 
 interface ZombieCandidate {
@@ -56,17 +67,25 @@ interface ZombieCandidate {
   caller_count: number;
   scan_frequency_minutes: number | null;
   analysis_period_hours: number | null;
+  first_observed_at: string | null;
+  last_observed_at: string | null;
+  observation_count: number;
   has_traffic: boolean | null;
   last_traffic_at: string | null;
   traffic_count: number;
   zombie_score: number;
+  zombie_verdict: string | null;
+  final_zombie_score: number | null;
+  final_verdict: string | null;
+  final_confidence: number | null;
+  final_reasoning: string | null;
+  human_action: string | null;
+  human_feedback: string | null;
+  pr_url: string | null;
+  pr_status: string | null;
   discovered_at: string;
 }
 
-/**
- * GET /api/watchers/[id]
- * Get detailed information about a watcher and its zombie candidates
- */
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -98,8 +117,7 @@ export async function GET(
         serverless_functions, websockets, grpc_services, graphql_resolvers,
         last_commit_hash, last_commit_message, last_commit_author, last_commit_date,
         llm_business_context, llm_tech_stack, llm_architecture, llm_health, llm_zombie_risk,
-        status, scan_count, created_at, updated_at, application_url,
-        observation_type, scan_frequency_minutes, analysis_period_hours, next_observation_at
+        status, scan_count, created_at, updated_at, application_url, observability_urls
       FROM watchers 
       WHERE watcher_id = $1 AND user_id = $2`,
       [id, userId]
@@ -122,10 +140,24 @@ export async function GET(
         llm_purpose, llm_risk_score, llm_risk_reasoning,
         dependency_count, caller_count,
         scan_frequency_minutes, analysis_period_hours,
-        has_traffic, last_traffic_at, traffic_count, zombie_score, discovered_at
+        first_observed_at, last_observed_at, observation_count,
+        has_traffic, last_traffic_at, traffic_count, zombie_score, zombie_verdict,
+        final_zombie_score, final_verdict, final_confidence, final_reasoning,
+        human_action, human_feedback, pr_url, pr_status, discovered_at
       FROM zombie_candidates 
       WHERE watcher_id = $1 
-      ORDER BY llm_risk_score DESC NULLS LAST, discovered_at DESC`,
+      ORDER BY 
+        CASE status 
+          WHEN 'pending_review' THEN 1
+          WHEN 'confirmed_zombie' THEN 2
+          WHEN 'active' THEN 3
+          WHEN 'pending' THEN 4
+          WHEN 'killed' THEN 5
+          WHEN 'healthy' THEN 6
+          ELSE 7
+        END,
+        COALESCE(final_zombie_score, zombie_score) DESC NULLS LAST,
+        discovered_at DESC`,
       [id]
     );
 
@@ -146,10 +178,6 @@ export async function GET(
   }
 }
 
-/**
- * DELETE /api/watchers/[id]
- * Delete a watcher and all its associated zombie candidates
- */
 export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }

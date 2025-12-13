@@ -1,0 +1,655 @@
+# ================================================================
+# W4 KILL ZOMBIE - DOOMSDAY SERVICES
+# ================================================================
+# Creates a GitHub PR to remove confirmed zombie code
+# 
+# FLOW:
+# 1. Get candidate details from DB
+# 2. Clone repo, generate removal, validate, commit, push (all in WorkingDirectory)
+# 3. Create PR via GitHub API
+# 4. Update DB with PR info
+# 5. Send notification email
+# 
+# DB TABLES USED:
+# - zombie_candidates (read/update)
+# - watchers (read)
+# - decision_log (insert)
+# ================================================================
+
+id: w4_kill_zombie
+namespace: doomsday.assemble
+description: |
+  Automated zombie code removal.
+  Creates a GitHub Pull Request to remove dead code after human confirmation.
+
+labels:
+  workflow: w4-kill
+  type: code-removal
+  version: "2.0"
+
+# ================================================================
+# INPUT SCHEMA
+# ================================================================
+inputs:
+  - id: candidate_id
+    type: INT
+    required: true
+    description: "ID of the zombie candidate to kill"
+    
+  - id: entity_signature
+    type: STRING
+    required: true
+    description: "Signature of the dead entity (function/class/endpoint)"
+    
+  - id: file_path
+    type: STRING
+    required: true
+    description: "Path to the file containing the dead code"
+    
+  - id: repo_url
+    type: STRING
+    required: true
+    description: "Git repository URL"
+    
+  - id: repo_owner
+    type: STRING
+    required: true
+    description: "GitHub repository owner"
+    
+  - id: repo_name
+    type: STRING
+    required: true
+    description: "GitHub repository name"
+
+  - id: github_token
+    type: STRING
+    required: true
+    description: "GitHub OAuth token for repo access"
+
+variables:
+  llm_model: "{{ kv('w4_llm') ?? 'gemini-2.0-flash' }}"
+
+# ================================================================
+# MAIN WORKFLOW TASKS  
+# ================================================================
+tasks:
+  # ============================================================
+  # STEP 1: Get full candidate details
+  # ============================================================
+  - id: get_candidate_details
+    type: io.kestra.plugin.scripts.python.Script
+    description: Fetch candidate and watcher details from database
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+      CANDIDATE_ID: "{{ inputs.candidate_id }}"
+    outputFiles:
+      - candidate.json
+    script: |
+      import os
+      import json
+      import psycopg2
+      
+      db_url = os.environ.get('DATABASE_URL')
+      candidate_id = int(os.environ.get('CANDIDATE_ID'))
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      cur.execute("""
+          SELECT 
+              zc.candidate_id,
+              zc.entity_type,
+              zc.entity_signature,
+              zc.entity_name,
+              zc.file_path,
+              zc.code_snippet,
+              zc.start_line,
+              zc.end_line,
+              zc.zombie_score,
+              zc.final_zombie_score,
+              zc.final_reasoning,
+              w.watcher_id,
+              w.repo_url,
+              w.repo_name,
+              w.default_branch,
+              w.user_email
+          FROM zombie_candidates zc
+          JOIN watchers w ON zc.watcher_id = w.watcher_id
+          WHERE zc.candidate_id = %s
+      """, (candidate_id,))
+      
+      row = cur.fetchone()
+      if not row:
+          raise Exception(f"Candidate {candidate_id} not found")
+      
+      columns = [desc[0] for desc in cur.description]
+      candidate = dict(zip(columns, row))
+      
+      for k, v in candidate.items():
+          if hasattr(v, 'isoformat'):
+              candidate[k] = v.isoformat()
+      
+      cur.execute("""
+          UPDATE zombie_candidates
+          SET 
+              status = 'confirmed_zombie',
+              human_action = 'kill',
+              human_action_at = NOW(),
+              updated_at = NOW()
+          WHERE candidate_id = %s
+      """, (candidate_id,))
+      
+      conn.commit()
+      cur.close()
+      conn.close()
+      
+      with open('candidate.json', 'w') as f:
+          json.dump([candidate], f, indent=2)
+      
+      print(f"[W4] Loaded candidate {candidate_id}: {candidate.get('entity_signature')}")
+
+  # ============================================================
+  # STEP 2: Clone repo, generate removal, validate, commit, push
+  # All runnable tasks inside WorkingDirectory
+  # ============================================================
+  - id: working_dir
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      - id: clone_repo
+        type: io.kestra.plugin.git.Clone
+        url: "{{ inputs.repo_url }}"
+        branch: "{{ (read(outputs.get_candidate_details.outputFiles['candidate.json']) | json)[0].default_branch ?? 'main' }}"
+        username: oauth2
+        password: "{{ inputs.github_token }}"
+
+      - id: generate_validate_commit
+        type: io.kestra.plugin.scripts.python.Script
+        description: LLM generates removal, validates syntax, applies changes
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install -q google-genai
+        env:
+          GOOGLE_API_KEY: "{{ secret('GOOGLE_AI_API_KEY') }}"
+          LLM_MODEL: "{{ vars.llm_model }}"
+          ENTITY_SIGNATURE: "{{ inputs.entity_signature }}"
+          FILE_PATH: "{{ inputs.file_path }}"
+          CANDIDATE_ID: "{{ inputs.candidate_id }}"
+        inputFiles:
+          candidate.json: "{{ outputs.get_candidate_details.outputFiles['candidate.json'] }}"
+        outputFiles:
+          - result.json
+          - updated_file.txt
+        script: |
+          import os
+          import json
+          import ast
+          
+          api_key = os.environ.get('GOOGLE_API_KEY')
+          llm_model = os.environ.get('LLM_MODEL', 'gemini-2.0-flash')
+          entity_sig = os.environ.get('ENTITY_SIGNATURE')
+          file_path = os.environ.get('FILE_PATH')
+          candidate_id = os.environ.get('CANDIDATE_ID')
+          
+          # Read candidate details
+          with open('candidate.json', 'r') as f:
+              candidate = json.load(f)
+          
+          # Read target file
+          try:
+              with open(file_path, 'r') as f:
+                  target_content = f.read()
+          except FileNotFoundError:
+              with open('result.json', 'w') as f:
+                  json.dump({"success": False, "error": "Target file not found", "stage": "read"}, f)
+              with open('updated_file.txt', 'w') as f:
+                  f.write("")
+              raise Exception(f"Target file not found: {file_path}")
+          
+          start_line = candidate.get('start_line', 0)
+          end_line = candidate.get('end_line', 0)
+          entity_type = candidate.get('entity_type', 'unknown')
+          
+          # === STAGE 1: LLM Generate Removal ===
+          prompt = f"""You are a code surgeon. Your job is to SAFELY remove a dead/unused SERVICE from a codebase.
+
+          IMPORTANT: You are removing a SERVICE (API endpoint, cron job, queue worker, serverless function) that has been confirmed as unused through traffic observation.
+
+          TARGET ZOMBIE SERVICE:
+          - Service Signature: {entity_sig}
+          - Service Type: {entity_type}
+          - File: {file_path}
+          - Lines: {start_line} to {end_line} (approximate)
+
+          ORIGINAL FILE CONTENT:
+          ```
+          {target_content}
+          ```
+
+          TASK:
+          1. Remove the dead service code ({entity_sig})
+          2. Remove any imports that become unused after removal
+          3. Clean up any dangling references, route registrations, or comments about this service
+          4. Preserve all OTHER services and code exactly as-is
+          5. Maintain proper formatting and indentation
+          6. If this is an API route file, ensure the route handler is fully removed
+          7. If this is a cron job, remove the schedule decorator and handler
+          8. If this is a queue worker, remove the worker class/function and any queue bindings
+
+          RESPOND WITH ONLY THE COMPLETE UPDATED FILE CONTENT.
+          No explanations, no markdown code blocks, just the raw file content.
+          If the entire file would be empty after removal, respond with: # File emptied - consider deleting
+          """
+          
+          from google import genai
+          client = genai.Client(api_key=api_key)
+          
+          response = client.models.generate_content(
+              model=llm_model,
+              contents=prompt,
+              config={
+                  "temperature": 0.1,
+                  "max_output_tokens": 8192
+              }
+          )
+          
+          new_content = response.text.strip()
+          
+          # Remove markdown code block wrappers if present
+          if new_content.startswith('```'):
+              lines = new_content.split('\n')
+              lines = lines[1:]
+              if lines and lines[-1].strip() == '```':
+                  lines = lines[:-1]
+              new_content = '\n'.join(lines)
+          
+          print(f"[LLM] Generated updated file ({len(new_content)} chars)")
+          
+          # === STAGE 2: Validate Syntax ===
+          validation_errors = []
+          
+          if file_path.endswith('.py'):
+              try:
+                  ast.parse(new_content)
+                  print("[VALIDATE] ✅ Python syntax valid")
+              except SyntaxError as e:
+                  validation_errors.append(f"Python syntax error: {e.msg} at line {e.lineno}")
+          
+          elif file_path.endswith(('.js', '.jsx', '.ts', '.tsx')):
+              open_braces = new_content.count('{') + new_content.count('[') + new_content.count('(')
+              close_braces = new_content.count('}') + new_content.count(']') + new_content.count(')')
+              if open_braces != close_braces:
+                  validation_errors.append(f"Unbalanced braces: {open_braces} open vs {close_braces} close")
+              else:
+                  print("[VALIDATE] ✅ JS/TS basic validation passed")
+          
+          if validation_errors:
+              with open('result.json', 'w') as f:
+                  json.dump({"success": False, "error": "; ".join(validation_errors), "stage": "validation"}, f)
+              with open('updated_file.txt', 'w') as f:
+                  f.write(new_content)
+              raise Exception(f"Validation failed: {validation_errors}")
+          
+          # === STAGE 3: Write updated file ===
+          with open('updated_file.txt', 'w') as f:
+              f.write(new_content)
+          
+          with open('result.json', 'w') as f:
+              json.dump({"success": True, "message": "Code removal generated and validated"}, f)
+          
+          print("[SUCCESS] Code generated and validated")
+
+      - id: apply_and_push
+        type: io.kestra.plugin.scripts.shell.Commands
+        description: Apply changes, commit, and push to new branch
+        env:
+          GITHUB_TOKEN: "{{ inputs.github_token }}"
+          REPO_OWNER: "{{ inputs.repo_owner }}"
+          REPO_NAME: "{{ inputs.repo_name }}"
+          FILE_PATH: "{{ inputs.file_path }}"
+          ENTITY_SIGNATURE: "{{ inputs.entity_signature }}"
+          CANDIDATE_ID: "{{ inputs.candidate_id }}"
+        outputFiles:
+          - branch_name.txt
+        commands:
+          - |
+            # Create safe branch name
+            SAFE_NAME=$(echo "$ENTITY_SIGNATURE" | tr -cd '[:alnum:]-_' | cut -c1-50)
+            BRANCH_NAME="zombie-removal/${SAFE_NAME}-${CANDIDATE_ID}"
+            echo "$BRANCH_NAME" > branch_name.txt
+            echo "Creating branch: $BRANCH_NAME"
+            
+            # Configure git
+            git config user.email "doomsday-bot@graveyard.dev"
+            git config user.name "Doomsday Bot"
+            
+            # Create and checkout new branch
+            git checkout -b "$BRANCH_NAME"
+            
+            # Apply the updated file
+            cp updated_file.txt "$FILE_PATH"
+            
+            # Check if file should be deleted
+            if grep -q "# File emptied - consider deleting" "$FILE_PATH"; then
+              git rm "$FILE_PATH"
+              echo "File marked for deletion"
+            else
+              git add "$FILE_PATH"
+              echo "File updated"
+            fi
+            
+            # Commit
+            git commit -m "🧟 Remove dead code: $ENTITY_SIGNATURE" \
+              -m "Automated removal by Doomsday Services" \
+              -m "" \
+              -m "Candidate ID: $CANDIDATE_ID" \
+              -m "Detection: Zero usage + no traffic during observation"
+            
+            # Push to remote
+            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}.git" "$BRANCH_NAME"
+            
+            echo "✅ Branch pushed: $BRANCH_NAME"
+
+  # ============================================================
+  # STEP 3: Create GitHub Pull Request
+  # ============================================================
+  - id: create_pull_request
+    type: io.kestra.plugin.scripts.python.Script
+    description: Create PR via GitHub API
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q requests
+    env:
+      GITHUB_TOKEN: "{{ inputs.github_token }}"
+      REPO_OWNER: "{{ inputs.repo_owner }}"
+      REPO_NAME: "{{ inputs.repo_name }}"
+      CANDIDATE_ID: "{{ inputs.candidate_id }}"
+      ENTITY_SIGNATURE: "{{ inputs.entity_signature }}"
+      FILE_PATH: "{{ inputs.file_path }}"
+    inputFiles:
+      candidate.json: "{{ outputs.get_candidate_details.outputFiles['candidate.json'] }}"
+      branch_name.txt: "{{ outputs.apply_and_push.outputFiles['branch_name.txt'] }}"
+    outputFiles:
+      - pr_info.json
+    script: |
+      import os
+      import json
+      import requests
+      
+      token = os.environ.get('GITHUB_TOKEN')
+      owner = os.environ.get('REPO_OWNER')
+      repo = os.environ.get('REPO_NAME')
+      candidate_id = os.environ.get('CANDIDATE_ID')
+      entity_sig = os.environ.get('ENTITY_SIGNATURE')
+      file_path = os.environ.get('FILE_PATH')
+      
+      with open('candidate.json', 'r') as f:
+          candidate = json.load(f)
+      
+      with open('branch_name.txt', 'r') as f:
+          branch_name = f.read().strip()
+      
+      default_branch = candidate.get('default_branch', 'main')
+      zombie_score = candidate.get('final_zombie_score') or candidate.get('zombie_score', 0)
+      reasoning = candidate.get('final_reasoning', 'No traffic detected during observation period')
+      
+      # Build PR body (avoiding YAML list marker issues)
+      pr_body = "## 🧟 Zombie Code Removal\n\n"
+      pr_body += "### Target\n"
+      pr_body += f"* **Entity:** `{entity_sig}`\n"
+      pr_body += f"* **File:** `{file_path}`\n"
+      pr_body += f"* **Type:** {candidate.get('entity_type', 'unknown')}\n\n"
+      pr_body += "### Detection Summary\n"
+      pr_body += "This code was identified as zombie/dead code through automated analysis:\n\n"
+      pr_body += "1. **Static Analysis:** Zero callers found in codebase\n"
+      pr_body += "2. **Runtime Observation:** No traffic detected during monitoring period\n"
+      pr_body += f"3. **Final Zombie Score:** {zombie_score}/100\n"
+      pr_body += "4. **Human Verification:** ✅ Confirmed for removal\n\n"
+      pr_body += "### Analysis\n"
+      pr_body += f"{reasoning}\n\n"
+      pr_body += "### Changes\n"
+      pr_body += "This PR removes the dead code and cleans up any associated:\n"
+      pr_body += "* Unused imports\n"
+      pr_body += "* Orphaned comments\n"
+      pr_body += "* Related dead code blocks\n\n"
+      pr_body += "---\n\n"
+      pr_body += "*Generated by [Doomsday Services](https://github.com/doomsday-services) - Automated Dead Code Detection*\n\n"
+      pr_body += f"**Candidate ID:** {candidate_id}\n"
+      
+      response = requests.post(
+          f"https://api.github.com/repos/{owner}/{repo}/pulls",
+          headers={
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github.v3+json",
+              "Content-Type": "application/json"
+          },
+          json={
+              "title": f"🧟 Remove dead code: {entity_sig[:50]}",
+              "head": branch_name,
+              "base": default_branch,
+              "body": pr_body
+          }
+      )
+      
+      if response.status_code in [200, 201]:
+          pr_data = response.json()
+          result = {
+              "success": True,
+              "pr_url": pr_data.get("html_url", ""),
+              "pr_number": pr_data.get("number", 0),
+              "pr_state": pr_data.get("state", "open")
+          }
+      else:
+          result = {
+              "success": False,
+              "error": response.text,
+              "status_code": response.status_code
+          }
+      
+      with open('pr_info.json', 'w') as f:
+          json.dump([result], f, indent=2)
+      
+      if result["success"]:
+          print(f"[PR] Created: {result['pr_url']}")
+      else:
+          print(f"[PR] Failed: {result['error']}"}
+
+  # ============================================================
+  # STEP 4: Update database with PR info
+  # ============================================================
+  - id: update_database
+    type: io.kestra.plugin.scripts.python.Script
+    description: Update candidate with PR info and log decision
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+      CANDIDATE_ID: "{{ inputs.candidate_id }}"
+      EXECUTION_ID: "{{ execution.id }}"
+    inputFiles:
+      pr_info.json: "{{ outputs.create_pull_request.outputFiles['pr_info.json'] }}"
+      candidate.json: "{{ outputs.get_candidate_details.outputFiles['candidate.json'] }}"
+    script: |
+      import os
+      import json
+      import psycopg2
+      
+      db_url = os.environ.get('DATABASE_URL')
+      candidate_id = int(os.environ.get('CANDIDATE_ID'))
+      execution_id = os.environ.get('EXECUTION_ID')
+      
+      with open('pr_info.json', 'r') as f:
+          pr_info = json.load(f)
+      
+      with open('candidate.json', 'r') as f:
+          candidate = json.load(f)
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      if pr_info.get('success'):
+          cur.execute("""
+              UPDATE zombie_candidates
+              SET 
+                  status = 'killed',
+                  pr_url = %s,
+                  pr_number = %s,
+                  pr_status = 'open',
+                  pr_created_at = NOW(),
+                  kill_execution_id = %s,
+                  killed_at = NOW(),
+                  updated_at = NOW()
+              WHERE candidate_id = %s
+          """, (pr_info['pr_url'], pr_info['pr_number'], execution_id, candidate_id))
+          
+          cur.execute("""
+              INSERT INTO decision_log (
+                  candidate_id, watcher_id, action_type, action_source,
+                  actor_type, actor_id, decision, reasoning,
+                  kestra_execution_id, metadata
+              ) VALUES (%s, %s, 'kill', 'w4_workflow', 'system', 'w4_kill_zombie', 'PR created', %s, %s, %s)
+          """, (
+              candidate_id, 
+              candidate.get('watcher_id'),
+              f"PR #{pr_info['pr_number']} created",
+              execution_id,
+              json.dumps({"pr_url": pr_info['pr_url'], "pr_number": pr_info['pr_number']})
+          ))
+          
+          print(f"[DB] Updated candidate {candidate_id} with PR {pr_info['pr_url']}")
+      else:
+          cur.execute("""
+              INSERT INTO decision_log (
+                  candidate_id, watcher_id, action_type, action_source,
+                  actor_type, actor_id, decision, reasoning,
+                  kestra_execution_id
+              ) VALUES (%s, %s, 'kill_failed', 'w4_workflow', 'system', 'w4_kill_zombie', 'PR creation failed', %s, %s)
+          """, (candidate_id, candidate.get('watcher_id'), pr_info.get('error', 'Unknown error'), execution_id))
+          
+          print(f"[DB] Logged failure for candidate {candidate_id}")
+      
+      conn.commit()
+      cur.close()
+      conn.close()
+
+  # ============================================================
+  # STEP 5: Send notification email
+  # ============================================================
+  - id: check_pr_success
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ (read(outputs.create_pull_request.outputFiles['pr_info.json']) | json)[0].success == true }}"
+    then:
+      - id: send_success_notification
+        type: io.kestra.plugin.notifications.mail.MailSend
+        host: "{{ kv('SMTP_HOST') }}"
+        port: "{{ kv('SMTP_PORT') }}"
+        username: "{{ kv('SMTP_USERNAME') }}"
+        password: "{{ kv('SMTP_PASSWORD') }}"
+        from: "{{ kv('SMTP_FROM') }}"
+        to:
+          - "{{ (read(outputs.get_candidate_details.outputFiles['candidate.json']) | json)[0].user_email }}"
+        subject: "🔪 PR Created - Killing {{ inputs.entity_signature }}"
+        htmlTextContent: |
+          <html>
+          <body style="font-family: Arial, sans-serif; background: #1a1a1a; color: #e0e0e0; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background: #2d2d2d; border-radius: 8px; padding: 30px; border: 1px solid #ef4444;">
+              <h2 style="color: #ef4444;">🔪 Pull Request Created</h2>
+              
+              <div style="background: #1a1a1a; padding: 20px; border-radius: 8px; margin: 20px 0;">
+                <p style="margin: 5px 0;"><strong>Entity:</strong> <code style="background: #374151; padding: 2px 6px; border-radius: 4px;">{{ inputs.entity_signature }}</code></p>
+                <p style="margin: 5px 0;"><strong>File:</strong> <code style="background: #374151; padding: 2px 6px; border-radius: 4px;">{{ inputs.file_path }}</code></p>
+                <p style="margin: 5px 0;"><strong>Repository:</strong> {{ inputs.repo_owner }}/{{ inputs.repo_name }}</p>
+              </div>
+              
+              <div style="text-align: center; margin: 30px 0;">
+                <a href="{{ (read(outputs.create_pull_request.outputFiles['pr_info.json']) | json)[0].pr_url }}" 
+                   style="background: #ef4444; color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
+                  🔗 Review Pull Request
+                </a>
+              </div>
+              
+              <p style="color: #888; font-size: 12px; text-align: center;">
+                Review and merge the PR to complete the zombie removal process.
+              </p>
+            </div>
+          </body>
+          </html>
+    else:
+      - id: send_failure_notification
+        type: io.kestra.plugin.notifications.mail.MailSend
+        host: "{{ kv('SMTP_HOST') }}"
+        port: "{{ kv('SMTP_PORT') }}"
+        username: "{{ kv('SMTP_USERNAME') }}"
+        password: "{{ kv('SMTP_PASSWORD') }}"
+        from: "{{ kv('SMTP_FROM') }}"
+        to:
+          - "{{ (read(outputs.get_candidate_details.outputFiles['candidate.json']) | json)[0].user_email }}"
+        subject: "❌ Zombie Kill Failed - {{ inputs.entity_signature }}"
+        htmlTextContent: |
+          <html>
+          <body style="font-family: Arial, sans-serif; background: #1a1a1a; color: #e0e0e0; padding: 20px;">
+            <div style="max-width: 600px; margin: 0 auto; background: #2d2d2d; border-radius: 8px; padding: 30px; border: 1px solid #ef4444;">
+              <h2 style="color: #ef4444;">❌ PR Creation Failed</h2>
+              <p>Failed to create pull request for removing <strong>{{ inputs.entity_signature }}</strong></p>
+              <p style="background: #1a1a1a; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 12px;">
+                {{ (read(outputs.create_pull_request.outputFiles['pr_info.json']) | json)[0].error }}
+              </p>
+              <p>Please check the Kestra execution logs for details.</p>
+            </div>
+          </body>
+          </html>
+
+# ================================================================
+# ERROR HANDLING
+# ================================================================
+errors:
+  - id: handle_error
+    type: io.kestra.plugin.core.flow.Sequential
+    tasks:
+      - id: log_error
+        type: io.kestra.plugin.core.log.Log
+        message: "W4 Kill Zombie Error: {{ error.message }}"
+        level: ERROR
+        
+      - id: revert_status
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install -q psycopg2-binary
+        env:
+          DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+          CANDIDATE_ID: "{{ inputs.candidate_id }}"
+        script: |
+          import os
+          import psycopg2
+          
+          db_url = os.environ.get('DATABASE_URL')
+          candidate_id = int(os.environ.get('CANDIDATE_ID'))
+          
+          conn = psycopg2.connect(db_url, sslmode='require')
+          cur = conn.cursor()
+          
+          cur.execute("""
+              UPDATE zombie_candidates
+              SET status = 'pending_review', updated_at = NOW()
+              WHERE candidate_id = %s
+          """, (candidate_id,))
+          
+          conn.commit()
+          cur.close()
+          conn.close()
+          
+          print(f"[ERROR] Reverted candidate {candidate_id} to pending_review")

@@ -1,0 +1,394 @@
+# ================================================================
+# W3 RESPONSE HANDLER - DOOMSDAY SERVICES
+# ================================================================
+# Handles human responses to zombie verdicts via:
+# 1. Webhook (magic links from email)
+# 2. Gmail trigger (natural language replies)
+#
+# DB TABLES USED:
+# - zombie_candidates (read/update)
+# - watchers (read)
+# - decision_log (insert)
+# ================================================================
+
+id: w3_handle_response
+namespace: doomsday.avengers
+description: |
+  Handles human decisions on zombie verdicts.
+  Supports both direct webhook actions and natural language email replies.
+
+labels:
+  workflow: w3-response
+  type: human-interaction
+  version: "2.0"
+
+# ================================================================
+# TRIGGERS
+# ================================================================
+triggers:
+  - id: webhook_trigger
+    type: io.kestra.plugin.core.trigger.Webhook
+    key: zombie-action
+    conditions:
+      - type: io.kestra.plugin.core.condition.Expression
+        expression: "{{ trigger.body.token is defined or trigger.body.action_token is defined }}"
+
+# ================================================================
+# INPUT SCHEMA
+# ================================================================
+inputs:
+  - id: source
+    type: STRING
+    defaults: "webhook"
+    description: "Source of the action: webhook or email"
+    
+  - id: action_token
+    type: STRING
+    required: false
+    description: "Magic link token for webhook actions"
+    
+  - id: action
+    type: STRING
+    required: false
+    description: "Direct action: kill, false_alert, watch_more"
+    
+  - id: feedback
+    type: STRING
+    required: false
+    description: "Optional user feedback"
+
+# ================================================================
+# MAIN WORKFLOW TASKS
+# ================================================================
+tasks:
+  # ============================================================
+  # STEP 1: Validate token and get candidate details
+  # ============================================================
+  - id: validate_and_get_candidate
+    type: io.kestra.plugin.scripts.python.Script
+    description: Validate action token and fetch candidate details
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+      ACTION_TOKEN: "{{ inputs.action_token ?? trigger.body.token ?? trigger.body.action_token }}"
+      ACTION: "{{ inputs.action ?? trigger.body.action }}"
+      FEEDBACK: "{{ inputs.feedback ?? trigger.body.feedback ?? '' }}"
+    outputFiles:
+      - candidate.json
+      - context.json
+    script: |
+      import os
+      import json
+      import psycopg2
+      from datetime import datetime, timezone
+      
+      db_url = os.environ.get('DATABASE_URL')
+      action_token = os.environ.get('ACTION_TOKEN', '')
+      action = os.environ.get('ACTION', '').lower()
+      feedback = os.environ.get('FEEDBACK', '')
+      
+      if not action_token:
+          raise Exception("No action token provided")
+      
+      if not action or action not in ['kill', 'false_alert', 'watch_more']:
+          raise Exception(f"Invalid action: {action}")
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      # Validate token and get candidate
+      cur.execute("""
+          SELECT 
+              zc.candidate_id,
+              zc.watcher_id,
+              zc.entity_type,
+              zc.entity_signature,
+              zc.entity_name,
+              zc.file_path,
+              zc.status,
+              zc.zombie_score,
+              zc.final_zombie_score,
+              w.repo_url,
+              w.repo_name,
+              w.user_email,
+              w.default_branch
+          FROM zombie_candidates zc
+          JOIN watchers w ON zc.watcher_id = w.watcher_id
+          WHERE zc.action_token = %s
+            AND zc.action_token_expires_at > NOW()
+            AND zc.status = 'pending_review'
+      """, (action_token,))
+      
+      row = cur.fetchone()
+      
+      if not row:
+          cur.close()
+          conn.close()
+          raise Exception("Invalid or expired action token, or candidate not in pending_review status")
+      
+      columns = [desc[0] for desc in cur.description]
+      candidate = dict(zip(columns, row))
+      
+      # Convert to JSON-safe
+      for k, v in candidate.items():
+          if hasattr(v, 'isoformat'):
+              candidate[k] = v.isoformat()
+      
+      cur.close()
+      conn.close()
+      
+      with open('candidate.json', 'w') as f:
+          json.dump([candidate], f, indent=2)
+      
+      # Parse repo owner from repo_url
+      repo_url = candidate.get('repo_url', '')
+      repo_owner = ''
+      if 'github.com/' in repo_url:
+          parts = repo_url.split('github.com/')[-1].split('/')
+          if len(parts) >= 1:
+              repo_owner = parts[0]
+      
+      context = {
+          "action": action,
+          "feedback": feedback,
+          "candidate_id": candidate['candidate_id'],
+          "watcher_id": candidate['watcher_id'],
+          "entity_signature": candidate.get('entity_signature', 'unknown'),
+          "file_path": candidate.get('file_path', ''),
+          "repo_url": repo_url,
+          "repo_owner": repo_owner,
+          "repo_name": candidate.get('repo_name', ''),
+          "source_type": "webhook"
+      }
+      
+      with open('context.json', 'w') as f:
+          json.dump([context], f, indent=2)
+      
+      print(f"[VALIDATE] Token valid for candidate {candidate['candidate_id']}, action: {action}")
+
+  # ============================================================
+  # STEP 2: Route to appropriate action handler
+  # ============================================================
+  - id: route_action
+    type: io.kestra.plugin.core.flow.Switch
+    value: "{{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].action }}"
+    cases:
+      # ============================================================
+      # ACTION: KILL - Trigger W4 to create PR
+      # ============================================================
+      kill:
+        - id: execute_kill
+          type: io.kestra.plugin.core.flow.Subflow
+          flowId: w4_kill_zombie
+          namespace: doomsday.assemble
+          inputs:
+            candidate_id: "{{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].candidate_id }}"
+            entity_signature: "{{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].entity_signature }}"
+            file_path: "{{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].file_path }}"
+            repo_url: "{{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].repo_url }}"
+            repo_owner: "{{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].repo_owner }}"
+            repo_name: "{{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].repo_name }}"
+          wait: true
+      
+      # ============================================================
+      # ACTION: FALSE_ALERT - Mark as healthy
+      # ============================================================
+      false_alert:
+        - id: mark_false_alert
+          type: io.kestra.plugin.scripts.python.Script
+          description: Mark candidate as healthy (false positive)
+          taskRunner:
+            type: io.kestra.plugin.scripts.runner.docker.Docker
+          containerImage: python:3.11-slim
+          beforeCommands:
+            - pip install -q psycopg2-binary
+          env:
+            DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+            EXECUTION_ID: "{{ execution.id }}"
+          inputFiles:
+            context.json: "{{ outputs.validate_and_get_candidate.outputFiles['context.json'] }}"
+          script: |
+            import os
+            import json
+            import psycopg2
+            
+            db_url = os.environ.get('DATABASE_URL')
+            execution_id = os.environ.get('EXECUTION_ID')
+            
+            with open('context.json', 'r') as f:
+                ctx = json.load(f)
+            
+            candidate_id = ctx['candidate_id']
+            watcher_id = ctx['watcher_id']
+            feedback = ctx.get('feedback', 'Marked via action link')
+            
+            conn = psycopg2.connect(db_url, sslmode='require')
+            cur = conn.cursor()
+            
+            # Update candidate to healthy
+            cur.execute("""
+                UPDATE zombie_candidates
+                SET 
+                    status = 'healthy',
+                    human_action = 'false_alert',
+                    human_feedback = %s,
+                    human_action_at = NOW(),
+                    human_action_source = 'webhook',
+                    action_token = NULL,
+                    action_token_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE candidate_id = %s
+            """, (feedback, candidate_id))
+            
+            # Log decision
+            cur.execute("""
+                INSERT INTO decision_log (
+                    candidate_id, watcher_id, action_type, action_source,
+                    actor_type, actor_id, decision, reasoning,
+                    kestra_execution_id
+                ) VALUES (%s, %s, 'false_alert', 'webhook', 'human', 'user', 'Marked as false alert', %s, %s)
+            """, (candidate_id, watcher_id, feedback, execution_id))
+            
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            print(f"[FALSE_ALERT] Candidate {candidate_id} marked as healthy")
+            
+        - id: send_false_alert_confirmation
+          type: io.kestra.plugin.notifications.mail.MailSend
+          host: "{{ kv('SMTP_HOST') }}"
+          port: "{{ kv('SMTP_PORT') }}"
+          username: "{{ kv('SMTP_USERNAME') }}"
+          password: "{{ kv('SMTP_PASSWORD') }}"
+          from: "{{ kv('SMTP_FROM') }}"
+          to:
+            - "{{ (read(outputs.validate_and_get_candidate.outputFiles['candidate.json']) | json)[0].user_email }}"
+          subject: "✅ False Alert Acknowledged - {{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].entity_signature }}"
+          htmlTextContent: |
+            <html>
+            <body style="font-family: Arial, sans-serif; background: #1a1a1a; color: #e0e0e0; padding: 20px;">
+              <div style="max-width: 600px; margin: 0 auto; background: #2d2d2d; border-radius: 8px; padding: 30px; border: 1px solid #22c55e;">
+                <h2 style="color: #22c55e;">✅ Marked as False Alert</h2>
+                <p><strong>{{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].entity_signature }}</strong> has been marked as healthy.</p>
+                <p>This code will no longer be flagged as a zombie candidate.</p>
+                <p style="color: #888; margin-top: 20px;">Thanks for the feedback! This helps improve our detection accuracy.</p>
+              </div>
+            </body>
+            </html>
+      
+      # ============================================================
+      # ACTION: WATCH_MORE - Extend observation period
+      # ============================================================
+      watch_more:
+        - id: extend_observation
+          type: io.kestra.plugin.scripts.python.Script
+          description: Extend observation period by 48 hours
+          taskRunner:
+            type: io.kestra.plugin.scripts.runner.docker.Docker
+          containerImage: python:3.11-slim
+          beforeCommands:
+            - pip install -q psycopg2-binary
+          env:
+            DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+            EXECUTION_ID: "{{ execution.id }}"
+          inputFiles:
+            context.json: "{{ outputs.validate_and_get_candidate.outputFiles['context.json'] }}"
+          script: |
+            import os
+            import json
+            import psycopg2
+            
+            db_url = os.environ.get('DATABASE_URL')
+            execution_id = os.environ.get('EXECUTION_ID')
+            
+            with open('context.json', 'r') as f:
+                ctx = json.load(f)
+            
+            candidate_id = ctx['candidate_id']
+            watcher_id = ctx['watcher_id']
+            feedback = ctx.get('feedback', 'Extended via action link')
+            
+            conn = psycopg2.connect(db_url, sslmode='require')
+            cur = conn.cursor()
+            
+            # Update candidate - extend observation, reduce score
+            cur.execute("""
+                UPDATE zombie_candidates
+                SET 
+                    status = 'active',
+                    observation_end_at = NOW() + INTERVAL '48 hours',
+                    zombie_score = GREATEST(0, zombie_score - 20),
+                    final_verdict = NULL,
+                    final_zombie_score = NULL,
+                    human_action = 'watch_more',
+                    human_feedback = %s,
+                    human_action_at = NOW(),
+                    human_action_source = 'webhook',
+                    extended_observation_days = COALESCE(extended_observation_days, 0) + 2,
+                    action_token = NULL,
+                    action_token_expires_at = NULL,
+                    updated_at = NOW()
+                WHERE candidate_id = %s
+                RETURNING observation_end_at
+            """, (feedback, candidate_id))
+            
+            new_end = cur.fetchone()[0]
+            
+            # Log decision
+            cur.execute("""
+                INSERT INTO decision_log (
+                    candidate_id, watcher_id, action_type, action_source,
+                    actor_type, actor_id, decision, reasoning,
+                    kestra_execution_id
+                ) VALUES (%s, %s, 'watch_more', 'webhook', 'human', 'user', 'Extended observation', %s, %s)
+            """, (candidate_id, watcher_id, feedback, execution_id))
+            
+            conn.commit()
+            cur.close()
+            conn.close()
+            
+            print(f"[WATCH_MORE] Candidate {candidate_id} extended until {new_end}")
+            
+        - id: send_watch_more_confirmation
+          type: io.kestra.plugin.notifications.mail.MailSend
+          host: "{{ kv('SMTP_HOST') }}"
+          port: "{{ kv('SMTP_PORT') }}"
+          username: "{{ kv('SMTP_USERNAME') }}"
+          password: "{{ kv('SMTP_PASSWORD') }}"
+          from: "{{ kv('SMTP_FROM') }}"
+          to:
+            - "{{ (read(outputs.validate_and_get_candidate.outputFiles['candidate.json']) | json)[0].user_email }}"
+          subject: "⏳ Extended Observation - {{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].entity_signature }}"
+          htmlTextContent: |
+            <html>
+            <body style="font-family: Arial, sans-serif; background: #1a1a1a; color: #e0e0e0; padding: 20px;">
+              <div style="max-width: 600px; margin: 0 auto; background: #2d2d2d; border-radius: 8px; padding: 30px; border: 1px solid #fbbf24;">
+                <h2 style="color: #fbbf24;">⏳ Observation Extended</h2>
+                <p><strong>{{ (read(outputs.validate_and_get_candidate.outputFiles['context.json']) | json)[0].entity_signature }}</strong> will be monitored for an additional 48 hours.</p>
+                <p>The zombie score has been reduced by 20 points to reflect your uncertainty.</p>
+                <p style="color: #888; margin-top: 20px;">You'll receive another verdict email when the extended observation period ends.</p>
+              </div>
+            </body>
+            </html>
+
+    defaults:
+      - id: unknown_action
+        type: io.kestra.plugin.core.execution.Fail
+        errorMessage: "Unknown action"
+
+# ================================================================
+# ERROR HANDLING
+# ================================================================
+errors:
+  - id: handle_error
+    type: io.kestra.plugin.core.flow.Sequential
+    tasks:
+      - id: log_error
+        type: io.kestra.plugin.core.log.Log
+        message: "W3 Response Handler Error: {{ error.message }}"
+        level: ERROR

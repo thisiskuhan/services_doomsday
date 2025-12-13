@@ -1,14 +1,20 @@
+/**
+ * Database Initialization API
+ *
+ * GET /api/db/init
+ * Initializes database schema and returns table information.
+ *
+ * Response: {
+ *   status: "ok",
+ *   wasAlreadyInitialized: boolean,
+ *   tables: string[],
+ *   tableCounts: { [tableName]: number }
+ * }
+ */
 import { NextResponse } from "next/server";
 import { ensureDatabaseInitialized, isDatabaseInitialized } from "@/lib/db-init";
 import { query } from "@/lib/db";
 
-/**
- * Initialize database
- * 
- * Behavior controlled by REPLACE_ALL flag in lib/db.ts:
- * - REPLACE_ALL = true  → Drop all tables and recreate from schema
- * - REPLACE_ALL = false → Skip if tables exist (preserve data)
- */
 export async function GET() {
   try {
     const alreadyInitialized = isDatabaseInitialized();

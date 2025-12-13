@@ -2,8 +2,9 @@
 
 import { useState, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { CheckCircle2, Circle, XCircle, Skull, Zap } from "lucide-react";
+import { CheckCircle2, Circle, XCircle, Zap, X, RotateCcw, ArrowRight } from "lucide-react";
 import { LokiIcon } from "@/components/ui/CustomCursor";
+import Image from "next/image";
 
 export interface LoadingStep {
   id: string;
@@ -17,6 +18,9 @@ interface WatcherCreationLoaderProps {
   isComplete: boolean;
   isFailed: boolean;
   isVisible: boolean;
+  errorMessage?: string | null;
+  onClose?: () => void;
+  onRetry?: () => void;
 }
 
 // Animated border glow component
@@ -166,6 +170,9 @@ export function WatcherCreationLoader({
   isComplete,
   isFailed,
   isVisible,
+  errorMessage,
+  onClose,
+  onRetry,
 }: WatcherCreationLoaderProps) {
   return (
     <AnimatePresence>
@@ -202,6 +209,18 @@ export function WatcherCreationLoader({
 
             {/* Main content - Horizontal layout */}
             <div className="relative bg-zinc-950/95 border border-zinc-800/50 rounded-2xl p-6 md:p-8 overflow-hidden">
+              {/* Close button - only show when complete or failed */}
+              {(isComplete || isFailed) && onClose && (
+                <motion.button
+                  initial={{ opacity: 0, scale: 0.8 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="absolute top-4 right-4 z-20 p-2 rounded-full bg-zinc-800/80 hover:bg-zinc-700/80 text-zinc-400 hover:text-white transition-colors"
+                  onClick={onClose}
+                  aria-label="Close"
+                >
+                  <X className="w-5 h-5" />
+                </motion.button>
+              )}
               {/* Floating particles */}
               <FloatingParticles isComplete={isComplete} isFailed={isFailed} />
 
@@ -237,7 +256,13 @@ export function WatcherCreationLoader({
                         animate={{ rotate: [0, -10, 10, -10, 0] }}
                         transition={{ duration: 0.5 }}
                       >
-                        <Skull className="w-10 h-10 md:w-12 md:h-12 text-red-400" />
+                        <Image 
+                          src="/scarlet-witch.svg" 
+                          alt="Scarlet Witch - Error" 
+                          width={48} 
+                          height={48}
+                          className="w-10 h-10 md:w-12 md:h-12"
+                        />
                       </motion.div>
                     ) : (
                       <motion.div
@@ -418,6 +443,62 @@ export function WatcherCreationLoader({
                         : `Step ${currentStep + 1} of ${steps.length}`}
                     </p>
                   </div>
+
+                  {/* Error message display */}
+                  {isFailed && errorMessage && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      className="mt-4 p-3 rounded-lg bg-red-500/10 border border-red-500/30"
+                    >
+                      <p className="text-xs md:text-sm text-red-400 break-words">
+                        <span className="font-semibold">Error: </span>
+                        {errorMessage}
+                      </p>
+                    </motion.div>
+                  )}
+
+                  {/* Action buttons */}
+                  {(isComplete || isFailed) && (
+                    <motion.div
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ delay: 0.2 }}
+                      className="mt-4 flex gap-3 justify-end"
+                    >
+                      {isFailed && onRetry && (
+                        <button
+                          onClick={onRetry}
+                          className="flex items-center gap-2 px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-sm font-medium transition-colors"
+                        >
+                          <RotateCcw className="w-4 h-4" />
+                          Try Again
+                        </button>
+                      )}
+                      {onClose && (
+                        <button
+                          onClick={onClose}
+                          className={`flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
+                            isComplete
+                              ? "bg-green-500/20 hover:bg-green-500/30 text-green-400 hover:text-green-300 border border-green-500/30"
+                              : "bg-red-500/20 hover:bg-red-500/30 text-red-400 hover:text-red-300 border border-red-500/30"
+                          }`}
+                        >
+                          {isComplete ? (
+                            <>
+                              Continue
+                              <ArrowRight className="w-4 h-4" />
+                            </>
+                          ) : (
+                            <>
+                              <X className="w-4 h-4" />
+                              Close
+                            </>
+                          )}
+                        </button>
+                      )}
+                    </motion.div>
+                  )}
                 </div>
               </div>
             </div>
@@ -431,9 +512,9 @@ export function WatcherCreationLoader({
 // Updated steps for watcher creation with descriptions
 export const WATCHER_CREATION_STEPS: LoadingStep[] = [
   { id: "validate", label: "Validating Repository", description: "Checking access and permissions..." },
-  { id: "clone", label: "Cloning Codebase", description: "Fetching repository contents..." },
-  { id: "discover", label: "Discovering Entities", description: "Finding endpoints, jobs, and services..." },
-  { id: "analyze", label: "AI Analysis", description: "Gemini analyzing code patterns..." },
-  { id: "store", label: "Storing Data", description: "Saving watcher configuration..." },
-  { id: "complete", label: "Finalizing", description: "Activating the watcher..." },
+  { id: "clone", label: "Cloning & Discovering", description: "Fetching code and finding entities..." },
+  { id: "analyze-repo", label: "Analyzing Repository", description: "AI analyzing codebase structure..." },
+  { id: "analyze-candidates", label: "Analyzing Candidates", description: "AI analyzing each entity..." },
+  { id: "store", label: "Storing Data", description: "Saving watcher and candidates..." },
+  { id: "complete", label: "Complete", description: "Watcher created successfully!" },
 ];

@@ -1,3 +1,10 @@
+/**
+ * Global Styles
+ *
+ * Tailwind CSS configuration with custom theme variables.
+ * Includes color palette, animations, and CSS custom properties
+ * for light/dark mode support.
+ */
 @import "tailwindcss";
 @import "tw-animate-css";
 

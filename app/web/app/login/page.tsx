@@ -1,3 +1,13 @@
+/**
+ * Login Page
+ *
+ * Authentication page with GitHub OAuth sign-in.
+ * Features:
+ *   - Animated "DOOMSDAY" text background
+ *   - Spotlight gradient effects
+ *   - Custom Dr. Doom cursor
+ *   - Initial loading animation (1.5s)
+ */
 "use client";
 
 import { useState, useEffect } from "react";

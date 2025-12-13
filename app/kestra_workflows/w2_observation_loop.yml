@@ -1,0 +1,552 @@
+id: w2_observation_loop
+namespace: doomsday.guardians
+
+description: |
+  Observation Loop Workflow (W2) - Simplified Version
+  
+  PURPOSE: Continuously monitor zombie candidates for traffic evidence.
+  Polls every minute, observes due candidates, stores evidence, updates verdicts.
+  
+  SIMPLIFIED: Uses single Python script per candidate to avoid WorkingDirectory issues.
+
+labels:
+  team: doomsday
+  category: watcher-management
+  stage: observation
+  version: "2.0"
+
+variables:
+  max_candidates_per_run: 100
+  concurrency_limit: 10
+  health_check_threshold: 10
+  suspect_threshold: 3
+
+tasks:
+  # ============================================================================
+  # STAGE 1: Poll for Due Candidates
+  # ============================================================================
+  - id: poll_due_candidates
+    type: io.kestra.plugin.scripts.python.Script
+    description: Find all zombie_candidates due for observation
+    retry:
+      type: exponential
+      maxAttempts: 3
+      interval: PT5S
+      maxInterval: PT30S
+    timeout: PT2M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+      MAX_CANDIDATES: "{{ vars.max_candidates_per_run }}"
+    outputFiles:
+      - due_candidates.json
+      - poll_stats.json
+    script: |
+      import os
+      import json
+      import psycopg2
+      from datetime import datetime, timezone
+      
+      db_url = os.environ.get('DATABASE_URL')
+      max_candidates = int(os.environ.get('MAX_CANDIDATES', '100'))
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      now = datetime.now(timezone.utc)
+      
+      # Get count of active candidates
+      cur.execute("""
+          SELECT COUNT(*) FROM zombie_candidates WHERE status = 'active'
+      """)
+      total_active = cur.fetchone()[0]
+      
+      # Find due candidates
+      cur.execute("""
+          SELECT 
+              zc.candidate_id,
+              zc.watcher_id,
+              zc.entity_type,
+              zc.entity_signature,
+              zc.entity_name,
+              zc.file_path,
+              zc.method,
+              zc.route_path,
+              zc.scan_frequency_minutes,
+              zc.observation_count,
+              zc.consecutive_zero_traffic,
+              zc.health_check_count,
+              zc.zombie_score,
+              zc.has_traffic,
+              w.observability_urls,
+              w.watcher_name,
+              w.repo_name,
+              w.application_url
+          FROM zombie_candidates zc
+          JOIN watchers w ON zc.watcher_id = w.watcher_id
+          WHERE zc.status = 'active'
+            AND zc.next_observation_at <= NOW()
+            AND (zc.observation_end_at IS NULL OR zc.observation_end_at > NOW())
+          ORDER BY zc.next_observation_at ASC
+          LIMIT %s
+      """, (max_candidates,))
+      
+      columns = [desc[0] for desc in cur.description]
+      rows = cur.fetchall()
+      
+      candidates = []
+      for row in rows:
+          candidate = dict(zip(columns, row))
+          # Parse observability_urls
+          obs_urls = candidate.get('observability_urls')
+          if isinstance(obs_urls, str):
+              try:
+                  candidate['observability_urls'] = json.loads(obs_urls)
+              except:
+                  candidate['observability_urls'] = []
+          candidates.append(candidate)
+      
+      cur.close()
+      conn.close()
+      
+      # Write outputs
+      with open('due_candidates.json', 'w') as f:
+          json.dump(candidates, f, indent=2, default=str)
+      
+      stats = {
+          "poll_timestamp": now.isoformat(),
+          "due_candidates_found": len(candidates),
+          "total_active_candidates": total_active,
+          "max_candidates_limit": max_candidates
+      }
+      with open('poll_stats.json', 'w') as f:
+          json.dump(stats, f, indent=2)
+      
+      print(f"[POLL] Found {len(candidates)}/{total_active} active candidates due for observation")
+
+  # ============================================================================
+  # STAGE 2: Check if Any Candidates Found
+  # ============================================================================
+  - id: check_has_candidates
+    type: io.kestra.plugin.core.flow.If
+    description: Skip observation if no candidates are due
+    condition: "{{ read(outputs.poll_due_candidates.outputFiles['due_candidates.json']) | json | length > 0 }}"
+    then:
+      # ========================================================================
+      # STAGE 3: Process Each Candidate
+      # ========================================================================
+      - id: process_candidates
+        type: io.kestra.plugin.core.flow.ForEach
+        description: Process each due candidate in parallel
+        concurrencyLimit: 10
+        values: "{{ read(outputs.poll_due_candidates.outputFiles['due_candidates.json']) }}"
+        tasks:
+          # Single comprehensive task - no WorkingDirectory needed
+          - id: observe_and_store
+            type: io.kestra.plugin.scripts.python.Script
+            description: Query sources, store evidence, update candidate
+            retry:
+              type: exponential
+              maxAttempts: 2
+              interval: PT5S
+              maxInterval: PT30S
+            timeout: PT5M
+            taskRunner:
+              type: io.kestra.plugin.scripts.runner.docker.Docker
+            containerImage: python:3.11-slim
+            beforeCommands:
+              - pip install -q psycopg2-binary requests
+            env:
+              CANDIDATE_DATA: "{{ taskrun.value }}"
+              DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+              HEALTH_CHECK_THRESHOLD: "{{ vars.health_check_threshold }}"
+              SUSPECT_THRESHOLD: "{{ vars.suspect_threshold }}"
+              QUERY_TIMEOUT: "30"
+            script: |
+              import os
+              import json
+              import uuid
+              import time
+              import requests
+              import psycopg2
+              from datetime import datetime, timezone, timedelta
+              from concurrent.futures import ThreadPoolExecutor, as_completed
+              
+              # =================================================================
+              # CONFIGURATION
+              # =================================================================
+              db_url = os.environ.get('DATABASE_URL')
+              health_check_threshold = int(os.environ.get('HEALTH_CHECK_THRESHOLD', '10'))
+              suspect_threshold = int(os.environ.get('SUSPECT_THRESHOLD', '3'))
+              query_timeout = int(os.environ.get('QUERY_TIMEOUT', '30'))
+              
+              candidate_str = os.environ.get('CANDIDATE_DATA', '{}')
+              candidate = json.loads(candidate_str)
+              
+              # Generate batch ID
+              batch_id = str(uuid.uuid4())
+              now = datetime.now(timezone.utc)
+              
+              # Extract candidate info
+              candidate_id = candidate.get('candidate_id')
+              watcher_id = candidate.get('watcher_id')
+              entity_type = candidate.get('entity_type')
+              entity_sig = candidate.get('entity_signature', 'unknown')
+              method = candidate.get('method', 'GET')
+              route_path = candidate.get('route_path', '/')
+              scan_freq = candidate.get('scan_frequency_minutes', 60)
+              prev_obs_count = candidate.get('observation_count', 0)
+              prev_consecutive_zero = candidate.get('consecutive_zero_traffic', 0)
+              prev_health_check_count = candidate.get('health_check_count', 0)
+              prev_zombie_score = candidate.get('zombie_score', 0)
+              app_url = candidate.get('application_url')
+              
+              # Parse observability sources
+              obs_urls = candidate.get('observability_urls') or []
+              if isinstance(obs_urls, str):
+                  try:
+                      obs_urls = json.loads(obs_urls)
+                  except:
+                      obs_urls = []
+              
+              # =================================================================
+              # BUILD SOURCE CONFIGURATIONS
+              # =================================================================
+              sources = []
+              for idx, url in enumerate(obs_urls):
+                  if isinstance(url, dict):
+                      sources.append({
+                          "source_type": url.get("type", "prometheus"),
+                          "source_name": url.get("name", f"source_{idx}"),
+                          "source_url": url.get("url", ""),
+                          "query_template": url.get("query", "")
+                      })
+                  elif isinstance(url, str) and url.strip():
+                      sources.append({
+                          "source_type": "prometheus",
+                          "source_name": f"prometheus_{idx}",
+                          "source_url": url
+                      })
+              
+              # Add health check if applicable
+              if app_url and route_path and entity_type == 'http_endpoint':
+                  endpoint_url = app_url.rstrip('/') + route_path
+                  sources.append({
+                      "source_type": "health_check",
+                      "source_name": "http_health_check",
+                      "source_url": endpoint_url,
+                      "http_method": method
+                  })
+              
+              if not sources:
+                  sources.append({
+                      "source_type": "no_data",
+                      "source_name": "no_sources",
+                      "source_url": ""
+                  })
+              
+              print(f"[PREP] Batch {batch_id[:8]} | Candidate {candidate_id} | {len(sources)} sources")
+              
+              # =================================================================
+              # QUERY HANDLERS
+              # =================================================================
+              def query_prometheus(source):
+                  result = {
+                      "source_type": "prometheus",
+                      "source_name": source.get('source_name', 'prometheus'),
+                      "source_url": source.get('source_url', ''),
+                      "traffic_detected": False,
+                      "raw_request_count": 0,
+                      "error_type": None,
+                      "error_message": None
+                  }
+                  url = source.get('source_url', '').rstrip('/')
+                  if not url:
+                      result['error_type'] = 'no_url'
+                      result['error_message'] = 'No Prometheus URL'
+                      return result
+                  
+                  # Build PromQL
+                  if route_path:
+                      promql = 'sum(increase(http_requests_total{path=~".*' + str(route_path) + '.*"}[1h]))'
+                  else:
+                      promql = 'sum(increase(http_requests_total[1h]))'
+                  result['query_expression'] = promql
+                  
+                  try:
+                      start = time.time()
+                      resp = requests.get(f"{url}/api/v1/query", params={"query": promql}, timeout=query_timeout)
+                      result['query_response_time_ms'] = int((time.time() - start) * 1000)
+                      
+                      if resp.status_code == 200:
+                          data = resp.json()
+                          if data.get('status') == 'success':
+                              for r in data.get('data', {}).get('result', []):
+                                  val = r.get('value', [None, '0'])
+                                  if len(val) > 1:
+                                      try:
+                                          result['raw_request_count'] += int(float(val[1]))
+                                      except:
+                                          pass
+                              result['traffic_detected'] = result['raw_request_count'] > 0
+                      else:
+                          result['error_type'] = 'http_error'
+                          result['error_message'] = f"HTTP {resp.status_code}"
+                  except requests.Timeout:
+                      result['error_type'] = 'timeout'
+                      result['error_message'] = f"Timeout after {query_timeout}s"
+                  except Exception as e:
+                      result['error_type'] = 'error'
+                      result['error_message'] = str(e)[:200]
+                  return result
+              
+              def query_health_check(source):
+                  result = {
+                      "source_type": "health_check",
+                      "source_name": source.get('source_name', 'health_check'),
+                      "source_url": source.get('source_url', ''),
+                      "traffic_detected": False,
+                      "is_alive": False,
+                      "http_status": None,
+                      "error_type": None,
+                      "error_message": None
+                  }
+                  url = source.get('source_url', '')
+                  if not url:
+                      result['error_type'] = 'no_url'
+                      return result
+                  
+                  http_method = source.get('http_method', 'GET').upper()
+                  try:
+                      start = time.time()
+                      if http_method == 'GET':
+                          resp = requests.get(url, timeout=query_timeout, allow_redirects=True)
+                      elif http_method == 'POST':
+                          resp = requests.post(url, json={}, timeout=query_timeout)
+                      else:
+                          resp = requests.request(http_method, url, timeout=query_timeout)
+                      
+                      result['http_status'] = resp.status_code
+                      result['health_check_latency_ms'] = int((time.time() - start) * 1000)
+                      result['is_alive'] = resp.status_code < 500
+                  except requests.Timeout:
+                      result['error_type'] = 'timeout'
+                  except Exception as e:
+                      result['error_type'] = 'error'
+                      result['error_message'] = str(e)[:200]
+                  return result
+              
+              def query_no_data(source):
+                  return {
+                      "source_type": "no_data",
+                      "source_name": source.get('source_name', 'no_data'),
+                      "traffic_detected": False,
+                      "error_type": "no_sources",
+                      "error_message": "No observability sources configured"
+                  }
+              
+              HANDLERS = {
+                  "prometheus": query_prometheus,
+                  "health_check": query_health_check,
+                  "no_data": query_no_data,
+                  "grafana": query_no_data,
+                  "datadog": query_no_data,
+                  "loki": query_no_data
+              }
+              
+              # =================================================================
+              # QUERY ALL SOURCES IN PARALLEL
+              # =================================================================
+              results = []
+              
+              def query_source(src):
+                  handler = HANDLERS.get(src.get('source_type', 'no_data'), query_no_data)
+                  r = handler(src)
+                  r['observation_batch_id'] = batch_id
+                  r['candidate_id'] = candidate_id
+                  r['watcher_id'] = watcher_id
+                  r['observed_at'] = datetime.now(timezone.utc).isoformat()
+                  return r
+              
+              with ThreadPoolExecutor(max_workers=min(10, len(sources))) as executor:
+                  futures = {executor.submit(query_source, s): s for s in sources}
+                  for future in as_completed(futures):
+                      try:
+                          results.append(future.result())
+                      except Exception as e:
+                          src = futures[future]
+                          results.append({
+                              "source_type": src.get('source_type', 'unknown'),
+                              "traffic_detected": False,
+                              "error_type": "executor_error",
+                              "error_message": str(e)[:200]
+                          })
+              
+              traffic_sources = sum(1 for r in results if r.get('traffic_detected'))
+              print(f"[QUERY] {len(results)} sources | {traffic_sources} with traffic")
+              
+              # =================================================================
+              # STORE TO DATABASE
+              # =================================================================
+              conn = psycopg2.connect(db_url, sslmode='require')
+              cur = conn.cursor()
+              
+              # Store observation_events
+              health_check_performed = False
+              health_check_alive = None
+              health_check_status = None
+              
+              for sr in results:
+                  is_hc = sr.get('source_type') == 'health_check'
+                  if is_hc:
+                      health_check_performed = True
+                      health_check_alive = sr.get('is_alive')
+                      health_check_status = sr.get('http_status')
+                  
+                  cur.execute("""
+                      INSERT INTO observation_events (
+                          candidate_id, watcher_id, observation_batch_id, observed_at,
+                          source_type, source_name, source_url,
+                          raw_request_count, traffic_detected,
+                          http_status, is_alive, health_check_latency_ms,
+                          error_type, error_message, query_expression, query_response_time_ms
+                      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                  """, (
+                      candidate_id, watcher_id, batch_id,
+                      sr.get('observed_at', now.isoformat()),
+                      sr.get('source_type'), sr.get('source_name'), sr.get('source_url'),
+                      sr.get('raw_request_count', 0), sr.get('traffic_detected', False),
+                      sr.get('http_status'), sr.get('is_alive'), sr.get('health_check_latency_ms'),
+                      sr.get('error_type'), sr.get('error_message'),
+                      sr.get('query_expression'), sr.get('query_response_time_ms')
+                  ))
+              
+              # Aggregate results
+              total_sources = len(results)
+              sources_with_traffic = sum(1 for r in results if r.get('traffic_detected'))
+              sources_with_errors = sum(1 for r in results if r.get('error_type'))
+              traffic_detected = sources_with_traffic > 0
+              total_request_count = sum(r.get('raw_request_count', 0) for r in results)
+              
+              if sources_with_errors == total_sources:
+                  observation_verdict = 'error'
+              elif traffic_detected:
+                  observation_verdict = 'traffic_found'
+              else:
+                  observation_verdict = 'no_traffic'
+              
+              # Store observation_summary
+              cur.execute("""
+                  INSERT INTO observation_summaries (
+                      candidate_id, watcher_id, observation_batch_id, observed_at,
+                      total_sources_queried, sources_with_traffic, sources_with_errors,
+                      traffic_detected, total_request_count,
+                      health_check_performed, health_check_alive, health_check_status,
+                      observation_verdict
+                  ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                  ON CONFLICT (candidate_id, observation_batch_id) DO NOTHING
+              """, (
+                  candidate_id, watcher_id, batch_id, now,
+                  total_sources, sources_with_traffic, sources_with_errors,
+                  traffic_detected, total_request_count,
+                  health_check_performed, health_check_alive, health_check_status,
+                  observation_verdict
+              ))
+              
+              # =================================================================
+              # UPDATE ZOMBIE_CANDIDATE
+              # =================================================================
+              new_obs_count = prev_obs_count + 1
+              new_consecutive_zero = 0 if traffic_detected else prev_consecutive_zero + 1
+              new_health_check_count = prev_health_check_count + (1 if health_check_performed and health_check_alive else 0)
+              next_observation_at = now + timedelta(minutes=scan_freq)
+              
+              # Determine zombie verdict
+              if traffic_detected:
+                  zombie_verdict = 'healthy'
+                  new_zombie_score = max(0, prev_zombie_score - 10)
+              elif new_consecutive_zero >= health_check_threshold:
+                  zombie_verdict = 'zombie'
+                  new_zombie_score = min(100, prev_zombie_score + 5)
+              elif new_consecutive_zero >= suspect_threshold:
+                  zombie_verdict = 'suspect'
+                  new_zombie_score = min(100, prev_zombie_score + 2)
+              else:
+                  zombie_verdict = 'unknown'
+                  new_zombie_score = prev_zombie_score
+              
+              log_entry = json.dumps({
+                  "batch": batch_id[:8],
+                  "at": now.isoformat(),
+                  "traffic": traffic_detected,
+                  "verdict": observation_verdict
+              })
+              
+              cur.execute("""
+                  UPDATE zombie_candidates SET
+                      observation_count = %s,
+                      consecutive_zero_traffic = %s,
+                      health_check_count = %s,
+                      has_traffic = CASE WHEN %s THEN TRUE ELSE has_traffic END,
+                      last_traffic_at = CASE WHEN %s THEN NOW() ELSE last_traffic_at END,
+                      traffic_count = traffic_count + %s,
+                      first_observed_at = COALESCE(first_observed_at, NOW()),
+                      last_observed_at = NOW(),
+                      next_observation_at = %s,
+                      zombie_score = %s,
+                      zombie_verdict = %s,
+                      observation_log = (
+                          CASE 
+                              WHEN jsonb_array_length(observation_log) >= 10 
+                              THEN observation_log - 0 
+                              ELSE observation_log 
+                          END || %s::jsonb
+                      ),
+                      updated_at = NOW()
+                  WHERE candidate_id = %s
+              """, (
+                  new_obs_count, new_consecutive_zero, new_health_check_count,
+                  traffic_detected, traffic_detected, total_request_count,
+                  next_observation_at, new_zombie_score, zombie_verdict,
+                  log_entry, candidate_id
+              ))
+              
+              conn.commit()
+              cur.close()
+              conn.close()
+              
+              print(f"[DONE] Candidate {candidate_id} | {observation_verdict} | Score: {new_zombie_score} | Next: {next_observation_at.strftime('%H:%M')}")
+
+    else:
+      - id: no_candidates_due
+        type: io.kestra.plugin.core.debug.Echo
+        level: INFO
+        format: "[POLL] No candidates due for observation"
+
+  # ============================================================================
+  # STAGE 4: Output Results
+  # ============================================================================
+  - id: output_poll_stats
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      poll_timestamp: "{{ trigger.date ?? execution.startDate }}"
+      execution_id: "{{ execution.id }}"
+      status: "completed"
+
+errors:
+  - id: observation_loop_failed
+    type: io.kestra.plugin.core.output.OutputValues
+    values:
+      status: "failed"
+      error: "Observation loop workflow encountered an error"
+      execution_id: "{{ execution.id }}"
+
+triggers:
+  - id: every_5_minutes
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "*/5 * * * *"
+    recoverMissedSchedules: LAST

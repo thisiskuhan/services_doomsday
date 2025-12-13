@@ -1,16 +1,21 @@
+/**
+ * Watcher Schedule API (Legacy)
+ *
+ * POST /api/watchers/[id]/schedule
+ * Schedule all candidates for a watcher at once.
+ * Deprecated: Use /api/candidates/[id]/schedule or /api/candidates/schedule/bulk instead.
+ *
+ * Body: {
+ *   scanFrequencySeconds: number,  // 1-86400 (24 hours)
+ *   analysisPeriodHours: number,   // 1/60 - 8760 (365 days)
+ *   forAllServices: boolean
+ * }
+ *
+ * GET /api/watchers/[id]/schedule
+ * Returns aggregated schedule info from all candidates.
+ */
 import { NextRequest, NextResponse } from "next/server";
 import { pool } from "@/lib/db";
-
-/**
- * Schedule Observation API
- * 
- * Updates watcher and candidates with observation settings.
- * Called from the Schedule modal after watcher creation.
- * Supports both initial scheduling and editing of existing schedules.
- * 
- * POST /api/watchers/[id]/schedule
- * Body: { scanFrequencySeconds, analysisPeriodHours, forAllServices }
- */
 
 interface ScheduleRequest {
   scanFrequencySeconds: number;
@@ -45,7 +50,7 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       );
     }
 
-    // Check watcher exists (allow both pending_schedule and scheduled for editing)
+    // Check watcher exists
     const watcherResult = await client.query(
       "SELECT watcher_id, status FROM watchers WHERE watcher_id = $1",
       [watcherId]
@@ -55,80 +60,48 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ error: "Watcher not found" }, { status: 404 });
     }
 
-    const watcher = watcherResult.rows[0];
-    
-    // Allow scheduling for pending_schedule or re-scheduling for already scheduled watchers
-    if (watcher.status !== "pending_schedule" && watcher.status !== "scheduled") {
-      return NextResponse.json(
-        { error: `Cannot modify schedule for watcher with status: ${watcher.status}` },
-        { status: 400 }
-      );
-    }
-
-    // Convert seconds to minutes for database storage (period already in hours)
+    // Convert seconds to minutes for database storage
     const scanFrequencyMinutes = body.scanFrequencySeconds / 60;
     const analysisPeriodHours = body.analysisPeriodHours;
 
-    // Calculate next observation time (using seconds for precision)
-    const nextObservationAt = new Date(Date.now() + body.scanFrequencySeconds * 1000);
-
-    // Determine observation type
-    const observationType = body.forAllServices ? "uniform" : "varied";
+    // Calculate observation times
+    const now = new Date();
+    const nextObservationAt = new Date(now.getTime() + body.scanFrequencySeconds * 1000);
+    const observationEndAt = new Date(now.getTime() + body.analysisPeriodHours * 60 * 60 * 1000);
 
     await client.query("BEGIN");
 
-    // Update watcher with scheduling info
+    // Update all candidates with schedule settings and set to active
     await client.query(
-      `UPDATE watchers SET
-        status = 'scheduled',
-        observation_type = $1,
-        scan_frequency_minutes = $2,
-        analysis_period_hours = $3,
-        next_observation_at = $4,
+      `UPDATE zombie_candidates SET
+        status = 'active',
+        scan_frequency_minutes = $1,
+        analysis_period_hours = $2,
+        next_observation_at = $3,
+        observation_end_at = $4,
+        first_observed_at = COALESCE(first_observed_at, NOW()),
         updated_at = NOW()
       WHERE watcher_id = $5`,
-      [observationType, scanFrequencyMinutes, analysisPeriodHours, nextObservationAt, watcherId]
+      [scanFrequencyMinutes, analysisPeriodHours, nextObservationAt, observationEndAt, watcherId]
     );
 
-    // Always propagate schedule to candidates when forAllServices is true
-    // This ensures candidates have the same schedule settings as the watcher
-    if (body.forAllServices) {
-      await client.query(
-        `UPDATE zombie_candidates SET
-          scan_frequency_minutes = $1,
-          analysis_period_hours = $2,
-          updated_at = NOW()
-        WHERE watcher_id = $3`,
-        [scanFrequencyMinutes, analysisPeriodHours, watcherId]
-      );
-    } else {
-      // For 'varied' type, also set default values on candidates
-      // This allows the user to later customize individual endpoints
-      await client.query(
-        `UPDATE zombie_candidates SET
-          scan_frequency_minutes = $1,
-          analysis_period_hours = $2,
-          updated_at = NOW()
-        WHERE watcher_id = $3`,
-        [scanFrequencyMinutes, analysisPeriodHours, watcherId]
-      );
-    }
+    // Update watcher status to active (all candidates are now scheduled)
+    await client.query(
+      `UPDATE watchers SET status = 'active', updated_at = NOW() WHERE watcher_id = $1`,
+      [watcherId]
+    );
 
     await client.query("COMMIT");
-
-    const isUpdate = watcher.status === "scheduled";
 
     return NextResponse.json({
       success: true,
       watcherId,
-      status: "scheduled",
-      observationType,
-      scanFrequencySeconds: body.scanFrequencySeconds,
-      analysisPeriodHours: body.analysisPeriodHours,
+      status: "active",
+      scanFrequencyMinutes,
+      analysisPeriodHours,
       nextObservationAt: nextObservationAt.toISOString(),
-      message: isUpdate 
-        ? "Schedule updated successfully. Observation data preserved."
-        : "Observation scheduled successfully.",
+      observationEndAt: observationEndAt.toISOString(),
+      message: "All candidates scheduled successfully.",
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -146,52 +119,60 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
   }
 }
 
-/**
- * GET /api/watchers/[id]/schedule
- * Get current schedule settings for a watcher
- */
 export async function GET(req: NextRequest, { params }: RouteParams) {
   try {
     const { id: watcherId } = await params;
 
-    const result = await pool.query(
-      `SELECT 
-        watcher_id, watcher_name, status, observation_type,
-        scan_frequency_minutes, analysis_period_days, next_observation_at
-      FROM watchers WHERE watcher_id = $1`,
+    // Get watcher basic info
+    const watcherResult = await pool.query(
+      `SELECT watcher_id, watcher_name, status FROM watchers WHERE watcher_id = $1`,
       [watcherId]
     );
 
-    if (result.rows.length === 0) {
+    if (watcherResult.rows.length === 0) {
       return NextResponse.json({ error: "Watcher not found" }, { status: 404 });
     }
 
-    const watcher = result.rows[0];
+    const watcher = watcherResult.rows[0];
 
-    // If varied, also get per-candidate settings
-    let candidateSettings = null;
-    if (watcher.observation_type === "varied") {
-      const candidatesResult = await pool.query(
-        `SELECT 
-          candidate_id, entity_name, entity_type,
-          scan_frequency_minutes, analysis_period_days
-        FROM zombie_candidates 
-        WHERE watcher_id = $1 AND status = 'active'
-        ORDER BY entity_type, entity_name`,
-        [watcherId]
-      );
-      candidateSettings = candidatesResult.rows;
-    }
+    // Get aggregated schedule info from candidates
+    const candidatesResult = await pool.query(
+      `SELECT 
+        COUNT(*) as total,
+        COUNT(*) FILTER (WHERE status = 'active') as active,
+        COUNT(*) FILTER (WHERE status = 'pending') as pending,
+        MIN(scan_frequency_minutes) as min_scan_freq,
+        MAX(scan_frequency_minutes) as max_scan_freq,
+        MIN(analysis_period_hours) as min_period,
+        MAX(analysis_period_hours) as max_period,
+        MIN(next_observation_at) as next_observation
+      FROM zombie_candidates 
+      WHERE watcher_id = $1`,
+      [watcherId]
+    );
+
+    const stats = candidatesResult.rows[0];
 
     return NextResponse.json({
       watcherId: watcher.watcher_id,
       watcherName: watcher.watcher_name,
       status: watcher.status,
-      observationType: watcher.observation_type,
-      scanFrequencyMinutes: watcher.scan_frequency_minutes,
-      analysisPeriodDays: watcher.analysis_period_days,
-      nextObservationAt: watcher.next_observation_at,
-      candidateSettings,
+      candidates: {
+        total: parseInt(stats.total) || 0,
+        active: parseInt(stats.active) || 0,
+        pending: parseInt(stats.pending) || 0,
+      },
+      schedule: {
+        scanFrequencyMinutes: stats.min_scan_freq ? {
+          min: parseFloat(stats.min_scan_freq),
+          max: parseFloat(stats.max_scan_freq),
+        } : null,
+        analysisPeriodHours: stats.min_period ? {
+          min: parseFloat(stats.min_period),
+          max: parseFloat(stats.max_period),
+        } : null,
+        nextObservationAt: stats.next_observation,
+      },
     });
   } catch (error) {
     console.error("[api/watchers/schedule] GET Error:", error);

@@ -1,3 +1,18 @@
+/**
+ * Dashboard Statistics API
+ *
+ * GET /api/stats?userId=xxx
+ * Returns aggregated statistics for the user's watchers and candidates.
+ *
+ * Response: {
+ *   stats: {
+ *     watchers: { total, active },
+ *     candidates: { total, tracked },
+ *     zombies: { highRisk, mediumRisk, potential },
+ *     observations: { last24h, candidatesObserved }
+ *   }
+ * }
+ */
 import { NextRequest, NextResponse } from "next/server";
 import { pool } from "@/lib/db";
 

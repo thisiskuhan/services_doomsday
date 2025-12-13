@@ -527,7 +527,9 @@ tasks:
                           "snippet": sanitize_snippet(sample.get("snippet", ""))[:200]
                       })
                   
-                  prompt = f"""Analyze this repository (RESCAN):
+                  prompt = f"""You are a senior software architect performing a repository RESCAN. Analyze changes since the last scan and assess service health.
+
+          IMPORTANT: This system monitors SERVICES (API endpoints, cron jobs, queue workers, serverless functions) - NOT individual files or assets.
 
           Repository: {watcher_name}
           URL: {repo_url}
@@ -536,16 +538,26 @@ tasks:
           Latest Commit: {metadata.get('last_commit_hash', 'unknown')[:8]}
           Author: {metadata.get('last_commit_author', 'unknown')}
 
-          Discovered Entities:
-          - HTTP endpoints: {entities_summary.get('http_endpoints', 0)}
-          - Cron jobs: {entities_summary.get('cron_jobs', 0)}
-          - Queue workers: {entities_summary.get('queue_workers', 0)}
-          - Serverless: {entities_summary.get('serverless_functions', 0)}
+          DISCOVERED SERVICES:
+          - HTTP API Endpoints: {entities_summary.get('http_endpoints', 0)}
+          - Scheduled Jobs (Cron): {entities_summary.get('cron_jobs', 0)}
+          - Queue Workers: {entities_summary.get('queue_workers', 0)}
+          - Serverless Functions: {entities_summary.get('serverless_functions', 0)}
 
           Sample Code:
           {json.dumps(sanitized_samples[:10], indent=2)[:1500]}
 
-          Return JSON with: business_context, tech_stack, zombie_risk (level, reasoning), architecture_summary"""
+          Return ONLY valid JSON (no markdown):
+          {{
+            "business_context": "What business problem does this application solve? Who are the users?",
+            "tech_stack": {{"languages": [], "frameworks": [], "databases": [], "infrastructure": []}},
+            "architecture_summary": "Describe the architecture pattern and how services interact",
+            "zombie_risk": {{
+              "level": "low|medium|high",
+              "reasoning": "Focus on SERVICE-LEVEL concerns: Are any API endpoints potentially unused? Any cron jobs that might be orphaned? Queue workers with unclear purpose?",
+              "high_risk_areas": ["List SERVICE CATEGORIES at risk - e.g., 'Legacy API Routes', 'Deprecated Cron Jobs', 'Unused Queue Workers'. DO NOT list individual files."]
+            }}
+          }}"""
                   
                   response = client.models.generate_content(
                       model="gemini-2.5-flash",

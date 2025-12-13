@@ -1,3 +1,20 @@
+/**
+ * Firebase Configuration Module
+ *
+ * Initializes Firebase services with singleton pattern.
+ * Handles server-side rendering by conditionally loading analytics.
+ *
+ * Environment Variables (NEXT_PUBLIC_*):
+ *   - FIREBASE_API_KEY, FIREBASE_AUTH_DOMAIN, FIREBASE_PROJECT_ID
+ *   - FIREBASE_STORAGE_BUCKET, FIREBASE_MESSAGING_SENDER_ID
+ *   - FIREBASE_APP_ID, FIREBASE_MEASUREMENT_ID
+ *
+ * Exports:
+ *   - auth: Firebase Authentication instance
+ *   - db: Firestore database instance
+ *   - analytics: Firebase Analytics (client-side only)
+ *   - default: Firebase app instance
+ */
 import { initializeApp, getApps } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getAnalytics } from "firebase/analytics";
@@ -13,7 +30,6 @@ const firebaseConfig = {
   measurementId: process.env.NEXT_PUBLIC_FIREBASE_MEASUREMENT_ID
 };
 
-// Initialize
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
 export const auth = getAuth(app);
 export const db = getFirestore(app);

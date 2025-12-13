@@ -1,3 +1,13 @@
+/**
+ * Database Initialization Module
+ *
+ * Provides singleton pattern for database initialization.
+ * Ensures database is initialized only once across the application lifecycle.
+ *
+ * Exports:
+ *   - ensureDatabaseInitialized(): Promise<boolean> - Initialize database (idempotent)
+ *   - isDatabaseInitialized(): boolean - Check initialization status
+ */
 import { initializeDatabase, checkConnection } from "@/lib/db";
 
 let initialized = false;
