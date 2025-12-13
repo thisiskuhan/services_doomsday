@@ -1,18 +1,27 @@
 -- ============================================================================
 -- SERVICES DOOMSDAY - DATABASE SCHEMA
 -- ============================================================================
--- 
--- WORKFLOW OVERVIEW:
--- W1: Watcher Creation - Discovers candidates, LLM analyzes risk
--- W2: Observation Loop - Monitors traffic, updates simple zombie_score
--- W3: AI Analysis - Final LLM verdict when observation period ends
--- W4: Kill Zombie - Creates PR to remove dead code
 --
--- SCORE LIFECYCLE:
--- 1. W1 creates candidate with llm_risk_score (initial confidence 0-1)
--- 2. W2 updates zombie_score (0-100) based on traffic observations
--- 3. W3 sets final_zombie_score (0-100) with LLM analysis
--- 4. Frontend displays normalized score (0-100) at each stage
+-- TABLES:
+--   watchers             → Repository monitors with LLM analysis context
+--   zombie_candidates    → Code entities tracked for zombie detection
+--   observation_events   → Individual traffic/health observations (W2)
+--   observation_summaries→ Aggregated observation data per batch
+--   scan_history         → Repository scan records (creation/rescan/manual)
+--   decision_log         → Human/LLM decision audit trail
+--   email_threads        → Email notification tracking for user responses
+--
+-- WORKFLOWS:
+--   W1 Creation    → Discover entities, LLM risk analysis, store candidates
+--   W1 Rescan      → GitHub webhook-triggered incremental sync
+--   W2 Observation → Scheduled traffic monitoring (every 5 min)
+--   W3 Analysis    → LLM final verdict when observation period ends
+--   W3 Response    → Handle user actions (kill/false_alert/watch_more)
+--   W4 Kill Zombie → Generate PR to remove confirmed dead code
+--
+-- SCORE FLOW:
+--   llm_risk_score (0.00-1.00) → zombie_score (0-100) → final_zombie_score
+--
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS watchers (
@@ -201,6 +210,55 @@ CREATE TABLE IF NOT EXISTS observation_events (
     
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS scan_history (
+    scan_id SERIAL PRIMARY KEY,
+    watcher_id VARCHAR(255) NOT NULL REFERENCES watchers(watcher_id) ON DELETE CASCADE,
+    
+    scan_type VARCHAR(20) NOT NULL CHECK (scan_type IN ('creation', 'rescan', 'manual')),
+    scan_number INTEGER NOT NULL DEFAULT 1,
+    kestra_execution_id VARCHAR(255),
+    
+    commit_hash VARCHAR(40),
+    commit_message TEXT,
+    commit_author VARCHAR(255),
+    commit_date TIMESTAMPTZ,
+    branch VARCHAR(255),
+    
+    trigger_source VARCHAR(50),
+    triggered_by VARCHAR(255),
+    
+    total_candidates INTEGER DEFAULT 0,
+    candidates_added INTEGER DEFAULT 0,
+    candidates_updated INTEGER DEFAULT 0,
+    candidates_removed INTEGER DEFAULT 0,
+    
+    http_endpoints INTEGER DEFAULT 0,
+    cron_jobs INTEGER DEFAULT 0,
+    queue_workers INTEGER DEFAULT 0,
+    serverless_functions INTEGER DEFAULT 0,
+    websockets INTEGER DEFAULT 0,
+    grpc_services INTEGER DEFAULT 0,
+    graphql_resolvers INTEGER DEFAULT 0,
+    
+    llm_tech_stack JSONB,
+    llm_zombie_risk JSONB,
+    
+    webhook_status VARCHAR(20),
+    webhook_message TEXT,
+    
+    started_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    duration_seconds INTEGER,
+    
+    status VARCHAR(20) DEFAULT 'running' CHECK (status IN ('running', 'completed', 'failed')),
+    error_message TEXT,    
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_scan_history_watcher ON scan_history(watcher_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scan_history_commit ON scan_history(commit_hash);
+CREATE INDEX IF NOT EXISTS idx_scan_history_type ON scan_history(scan_type);
 
 CREATE TABLE IF NOT EXISTS observation_summaries (
     summary_id SERIAL PRIMARY KEY,

@@ -21,12 +21,14 @@ import { HoverBorderGradient } from "@/components/ui/hover-border-gradient";
 import { Github } from "lucide-react";
 import { CustomCursor } from "@/components/ui/CustomCursor";
 import { DoomLoader } from "@/components/ui/DoomLoader";
+import { useAuth } from "@/contexts/AuthContext";
 
 export default function LoginPage() {
   const router = useRouter();
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [showLoader, setShowLoader] = useState(true);
+  const { setGithubToken } = useAuth();
 
   // Show DoomLoader for 1.5 seconds on initial load
   useEffect(() => {
@@ -42,7 +44,18 @@ export default function LoginPage() {
 
     try {
       const provider = new GithubAuthProvider();
-      await signInWithPopup(auth, provider);
+      // Request scopes for repo access and webhook management
+      provider.addScope("repo");              // Access private repos
+      provider.addScope("admin:repo_hook");   // Create/manage webhooks for auto-rescan
+      
+      const result = await signInWithPopup(auth, provider);
+      
+      // Extract and store GitHub access token from OAuth credential
+      const credential = GithubAuthProvider.credentialFromResult(result);
+      if (credential?.accessToken) {
+        setGithubToken(credential.accessToken);
+      }
+      
       router.push("/home");
     } catch (err: unknown) {
       console.error("GitHub login error:", err);

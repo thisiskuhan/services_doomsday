@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { motion, AnimatePresence, useMotionTemplate, useMotionValue } from "framer-motion";
 import { X, Plus, Clock, Trash2, ChevronDown, AlertCircle } from "lucide-react";
 import { Input } from "@/components/ui/input";
@@ -8,6 +8,7 @@ import { Label } from "@/components/ui/label";
 import { LokiIcon } from "@/components/ui/CustomCursor";
 import { cn, OBSERVABILITY_SOURCE_TYPES } from "@/lib/utils";
 import { AnimatedBorderGlow } from "@/components/ui/shared";
+import { useAuth } from "@/contexts/AuthContext";
 
 interface ObservabilitySource {
   url: string;
@@ -99,6 +100,8 @@ const TextareaWithGlow = ({
 };
 
 export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: WatcherFormProps) {
+  const { githubToken: authGithubToken } = useAuth();
+  
   const [formData, setFormData] = useState<WatcherFormData>({
     name: "",
     repo: "",
@@ -108,6 +111,13 @@ export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: 
     observabilitySources: [{ url: "", type: "prometheus", token: "" }],
   });
   const [expandedSource, setExpandedSource] = useState<number | null>(0);
+
+  // Auto-populate GitHub token from OAuth session
+  useEffect(() => {
+    if (authGithubToken && !formData.githubToken) {
+      setFormData(prev => ({ ...prev, githubToken: authGithubToken }));
+    }
+  }, [authGithubToken, formData.githubToken]);
 
   const handleAddSource = () => {
     setFormData({
@@ -172,7 +182,7 @@ export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: 
         className="relative shadow-input max-w-5xl w-full h-[78vh] overflow-visible p-px rounded-2xl"
       >
         {/* Animated glowing border */}
-        <AnimatedBorderGlow duration={1.5} />
+        <AnimatedBorderGlow duration={4} alwaysAnimate />
         
         {/* Inner modal content */}
         <div className="relative bg-zinc-900 border border-zinc-800/50 rounded-2xl overflow-hidden z-10 h-full flex flex-col">
@@ -272,14 +282,18 @@ export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: 
                 {/* GitHub Token */}
                 <LabelInputContainer>
                   <Label htmlFor="token">
-                    GitHub Token <span className="text-zinc-600">(Private repos)</span>
+                    GitHub Token {authGithubToken ? (
+                      <span className="text-green-500">(Auto-filled from login ✓)</span>
+                    ) : (
+                      <span className="text-zinc-600">(Private repos)</span>
+                    )}
                   </Label>
                   <Input
                     id="token"
                     type="password"
                     value={formData.githubToken}
                     onChange={(e) => setFormData({ ...formData, githubToken: e.target.value })}
-                    placeholder="ghp_xxxxxxxxxxxxx"
+                    placeholder={authGithubToken ? "Using OAuth token" : "ghp_xxxxxxxxxxxxx"}
                     disabled={isCreating}
                     className="font-mono text-sm"
                   />

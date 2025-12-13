@@ -4,16 +4,25 @@ import { useState, useEffect, useMemo, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import ReactMarkdown from "react-markdown";
 import {
-    X,
-    GitBranch,
-    Shield,
-    Server,
-    Cpu,
-    MessageSquare,
-    ExternalLink,
-    Trash2,
-    Link2,
-    AlertTriangle
+  X,
+  GitBranch,
+  Shield,
+  Server,
+  Cpu,
+  MessageSquare,
+  ExternalLink,
+  Trash2,
+  Link2,
+  AlertTriangle,
+  GitCommit,
+  Plus,
+  Minus,
+  RefreshCw,
+  Clock,
+  CheckCircle,
+  XCircle,
+  Loader2,
+  HistoryIcon
 } from "lucide-react";
 import { ObservationSources } from "./ObservationSources";
 import { CandidateList } from "./CandidateList";
@@ -93,12 +102,45 @@ interface ZombieCandidate {
   [key: string]: unknown;
 }
 
+interface ScanHistoryRecord {
+  scan_id: number;
+  scan_type: "creation" | "rescan" | "manual";
+  scan_number: number;
+  kestra_execution_id: string | null;
+  commit_hash: string | null;
+  commit_message: string | null;
+  commit_author: string | null;
+  commit_date: string | null;
+  branch: string | null;
+  trigger_source: string | null;
+  triggered_by: string | null;
+  total_candidates: number;
+  candidates_added: number;
+  candidates_updated: number;
+  candidates_removed: number;
+  http_endpoints: number;
+  cron_jobs: number;
+  queue_workers: number;
+  serverless_functions: number;
+  websockets: number;
+  grpc_services: number;
+  graphql_resolvers: number;
+  webhook_status: string | null;
+  webhook_message: string | null;
+  started_at: string;
+  completed_at: string | null;
+  duration_seconds: number | null;
+  status: "running" | "completed" | "failed";
+  error_message: string | null;
+  created_at: string;
+}
+
 interface WatcherDetailModalProps {
   watcherId: string;
   userId: string;
   onClose: () => void;
   onDelete: (watcherId: string) => Promise<void>;
-  initialTab?: "overview" | "candidates" | "analysis";
+  initialTab?: "overview" | "candidates" | "analysis" | "history";
 }
 
 // Tab component
@@ -151,11 +193,16 @@ export function WatcherDetailModal({
   const [error, setError] = useState<string | null>(null);
   const [watcher, setWatcher] = useState<WatcherDetails | null>(null);
   const [candidates, setCandidates] = useState<ZombieCandidate[]>([]);
-  const [activeTab, setActiveTab] = useState<"overview" | "candidates" | "analysis">(initialTab);
+  const [activeTab, setActiveTab] = useState<"overview" | "candidates" | "analysis" | "history">(initialTab);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [showScheduleModal, setShowScheduleModal] = useState(false);
   const [candidatesToSchedule, setCandidatesToSchedule] = useState<ZombieCandidate[]>([]);
+  
+  // Scan history state
+  const [scanHistory, setScanHistory] = useState<ScanHistoryRecord[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyLoaded, setHistoryLoaded] = useState(false);
 
   // Derive status from candidates
   const derivedStatus = useMemo(() => {
@@ -189,9 +236,36 @@ export function WatcherDetailModal({
     }
   }, [watcherId, userId]);
 
+  // Fetch scan history (lazy loaded when History tab is clicked)
+  const fetchScanHistory = useCallback(async () => {
+    if (historyLoaded) return;
+    
+    try {
+      setHistoryLoading(true);
+      const response = await fetch(`/api/watchers/${watcherId}/history`);
+      const data = await response.json();
+
+      if (response.ok && data.history) {
+        setScanHistory(data.history);
+        setHistoryLoaded(true);
+      }
+    } catch (err) {
+      console.error("Error fetching scan history:", err);
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [watcherId, historyLoaded]);
+
   useEffect(() => {
     fetchDetails();
   }, [fetchDetails]);
+
+  // Fetch history when History tab is activated
+  useEffect(() => {
+    if (activeTab === "history" && !historyLoaded) {
+      fetchScanHistory();
+    }
+  }, [activeTab, historyLoaded, fetchScanHistory]);
 
   const handleDelete = async () => {
     setIsDeleting(true);
@@ -294,7 +368,7 @@ export function WatcherDetailModal({
         onClick={(e) => e.stopPropagation()}
         className="relative max-w-4xl w-full h-[85vh] p-px rounded-2xl overflow-hidden"
       >
-        <AnimatedBorderGlow color={borderColor} duration={1.5} />
+        <AnimatedBorderGlow color={borderColor} duration={4} alwaysAnimate />
 
         <div className="relative bg-zinc-900 rounded-2xl h-full flex flex-col z-10">
           {/* Header */}
@@ -339,6 +413,7 @@ export function WatcherDetailModal({
             <Tab label="Overview" active={activeTab === "overview"} onClick={() => setActiveTab("overview")} />
             <Tab label="Candidates" active={activeTab === "candidates"} onClick={() => setActiveTab("candidates")} count={candidates.length} />
             <Tab label="Analysis" active={activeTab === "analysis"} onClick={() => setActiveTab("analysis")} />
+            <Tab label="History" active={activeTab === "history"} onClick={() => setActiveTab("history")} count={watcher.scan_count} />
           </div>
 
           {/* Content */}
@@ -669,6 +744,246 @@ export function WatcherDetailModal({
                             ))}
                           </div>
                         </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* History Tab */}
+            {activeTab === "history" && (
+              <div className="space-y-4">
+                {/* Header */}
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-2">
+                    <HistoryIcon className="w-5 h-5 text-purple-400" />
+                    <h3 className="text-lg font-medium text-white">Scan History</h3>
+                  </div>
+                  <button
+                    onClick={() => {
+                      setHistoryLoaded(false);
+                      fetchScanHistory();
+                    }}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs text-zinc-400 hover:text-white bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Refresh
+                  </button>
+                </div>
+
+                {/* Loading State */}
+                {historyLoading && (
+                  <div className="flex items-center justify-center py-12">
+                    <Loader2 className="w-8 h-8 text-purple-400 animate-spin" />
+                  </div>
+                )}
+
+                {/* Empty State */}
+                {!historyLoading && scanHistory.length === 0 && (
+                  <div className="text-center py-12">
+                    <HistoryIcon className="w-12 h-12 text-zinc-600 mx-auto mb-3" />
+                    <p className="text-zinc-400">No scan history available yet.</p>
+                    <p className="text-zinc-500 text-sm mt-1">History will appear after the first scan completes.</p>
+                  </div>
+                )}
+
+                {/* History Timeline */}
+                {!historyLoading && scanHistory.length > 0 && (
+                  <div className="relative">
+                    {/* Timeline line */}
+                    <div className="absolute left-4 top-0 bottom-0 w-px bg-gradient-to-b from-purple-500/50 via-zinc-700 to-transparent" />
+
+                    <div className="space-y-4">
+                      {scanHistory.map((scan, index) => (
+                        <motion.div
+                          key={scan.scan_id}
+                          initial={{ opacity: 0, x: -20 }}
+                          animate={{ opacity: 1, x: 0 }}
+                          transition={{ delay: index * 0.05 }}
+                          className="relative pl-10"
+                        >
+                          {/* Timeline dot */}
+                          <div className={`absolute left-2 top-4 w-4 h-4 rounded-full border-2 ${
+                            scan.scan_type === "creation" 
+                              ? "bg-emerald-500/20 border-emerald-500" 
+                              : scan.status === "failed"
+                              ? "bg-red-500/20 border-red-500"
+                              : "bg-purple-500/20 border-purple-500"
+                          }`}>
+                            {scan.status === "running" && (
+                              <div className="absolute inset-0 rounded-full bg-purple-500 animate-ping opacity-50" />
+                            )}
+                          </div>
+
+                          {/* Scan Card */}
+                          <div className={`bg-zinc-800/50 rounded-xl p-4 border ${
+                            scan.scan_type === "creation"
+                              ? "border-emerald-500/30"
+                              : scan.status === "failed"
+                              ? "border-red-500/30"
+                              : "border-zinc-700/50"
+                          } hover:border-zinc-600/50 transition-colors`}>
+                            {/* Scan Header */}
+                            <div className="flex items-start justify-between mb-3">
+                              <div className="flex items-center gap-2">
+                                <span className={`px-2 py-0.5 text-xs font-medium rounded-full ${
+                                  scan.scan_type === "creation"
+                                    ? "bg-emerald-500/20 text-emerald-400"
+                                    : scan.scan_type === "rescan"
+                                    ? "bg-purple-500/20 text-purple-400"
+                                    : "bg-blue-500/20 text-blue-400"
+                                }`}>
+                                  {scan.scan_type === "creation" ? "Initial Scan" : `Rescan #${scan.scan_number}`}
+                                </span>
+                                {scan.status === "running" && (
+                                  <span className="flex items-center gap-1 text-xs text-yellow-400">
+                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                    Running
+                                  </span>
+                                )}
+                                {scan.status === "completed" && (
+                                  <CheckCircle className="w-4 h-4 text-emerald-400" />
+                                )}
+                                {scan.status === "failed" && (
+                                  <XCircle className="w-4 h-4 text-red-400" />
+                                )}
+                              </div>
+                              <div className="flex items-center gap-1.5 text-xs text-zinc-500">
+                                <Clock className="w-3.5 h-3.5" />
+                                {formatRelativeTime(scan.created_at)}
+                              </div>
+                            </div>
+
+                            {/* Commit Info */}
+                            {scan.commit_hash && (
+                              <div className="flex items-start gap-2 mb-3 p-2 bg-zinc-900/50 rounded-lg">
+                                <GitCommit className="w-4 h-4 text-zinc-500 mt-0.5 shrink-0" />
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-2 mb-1">
+                                    <code className="text-xs font-mono text-purple-400">{scan.commit_hash.slice(0, 7)}</code>
+                                    {scan.branch && (
+                                      <span className="text-xs text-zinc-500">on {scan.branch}</span>
+                                    )}
+                                  </div>
+                                  {scan.commit_message && (
+                                    <p className="text-xs text-zinc-400 truncate">{scan.commit_message}</p>
+                                  )}
+                                  {scan.commit_author && (
+                                    <p className="text-xs text-zinc-500 mt-1">by {scan.commit_author}</p>
+                                  )}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Stats Grid */}
+                            <div className="grid grid-cols-4 gap-2 mb-3">
+                              <div className="text-center p-2 bg-zinc-900/50 rounded-lg">
+                                <p className="text-sm font-semibold text-white">{scan.total_candidates}</p>
+                                <p className="text-xs text-zinc-500">Total</p>
+                              </div>
+                              <div className="text-center p-2 bg-zinc-900/50 rounded-lg">
+                                <p className="text-sm font-semibold text-emerald-400 flex items-center justify-center gap-1">
+                                  <Plus className="w-3 h-3" />{scan.candidates_added}
+                                </p>
+                                <p className="text-xs text-zinc-500">Added</p>
+                              </div>
+                              <div className="text-center p-2 bg-zinc-900/50 rounded-lg">
+                                <p className="text-sm font-semibold text-blue-400 flex items-center justify-center gap-1">
+                                  <RefreshCw className="w-3 h-3" />{scan.candidates_updated}
+                                </p>
+                                <p className="text-xs text-zinc-500">Updated</p>
+                              </div>
+                              <div className="text-center p-2 bg-zinc-900/50 rounded-lg">
+                                <p className="text-sm font-semibold text-red-400 flex items-center justify-center gap-1">
+                                  <Minus className="w-3 h-3" />{scan.candidates_removed}
+                                </p>
+                                <p className="text-xs text-zinc-500">Removed</p>
+                              </div>
+                            </div>
+
+                            {/* Entity Breakdown (collapsible) */}
+                            <details className="group">
+                              <summary className="cursor-pointer text-xs text-zinc-500 hover:text-zinc-400 transition-colors list-none flex items-center gap-1">
+                                <span className="group-open:rotate-90 transition-transform">▶</span>
+                                Entity Breakdown
+                              </summary>
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {scan.http_endpoints > 0 && (
+                                  <span className="px-2 py-1 text-xs bg-blue-500/10 text-blue-400 rounded">
+                                    HTTP: {scan.http_endpoints}
+                                  </span>
+                                )}
+                                {scan.cron_jobs > 0 && (
+                                  <span className="px-2 py-1 text-xs bg-orange-500/10 text-orange-400 rounded">
+                                    Cron: {scan.cron_jobs}
+                                  </span>
+                                )}
+                                {scan.queue_workers > 0 && (
+                                  <span className="px-2 py-1 text-xs bg-cyan-500/10 text-cyan-400 rounded">
+                                    Queue: {scan.queue_workers}
+                                  </span>
+                                )}
+                                {scan.serverless_functions > 0 && (
+                                  <span className="px-2 py-1 text-xs bg-purple-500/10 text-purple-400 rounded">
+                                    Serverless: {scan.serverless_functions}
+                                  </span>
+                                )}
+                                {scan.websockets > 0 && (
+                                  <span className="px-2 py-1 text-xs bg-green-500/10 text-green-400 rounded">
+                                    WebSocket: {scan.websockets}
+                                  </span>
+                                )}
+                                {scan.grpc_services > 0 && (
+                                  <span className="px-2 py-1 text-xs bg-pink-500/10 text-pink-400 rounded">
+                                    gRPC: {scan.grpc_services}
+                                  </span>
+                                )}
+                                {scan.graphql_resolvers > 0 && (
+                                  <span className="px-2 py-1 text-xs bg-yellow-500/10 text-yellow-400 rounded">
+                                    GraphQL: {scan.graphql_resolvers}
+                                  </span>
+                                )}
+                              </div>
+                            </details>
+
+                            {/* Trigger Info */}
+                            {scan.trigger_source && scan.trigger_source !== "manual" && (
+                              <div className="mt-2 pt-2 border-t border-zinc-700/50 flex items-center gap-2 text-xs text-zinc-500">
+                                <span className="px-1.5 py-0.5 bg-zinc-700/50 rounded text-zinc-400">
+                                  {scan.trigger_source}
+                                </span>
+                                {scan.triggered_by && <span>by {scan.triggered_by}</span>}
+                              </div>
+                            )}
+
+                            {/* Webhook Status (for creation scans) */}
+                            {scan.scan_type === "creation" && scan.webhook_status && (
+                              <div className={`mt-2 pt-2 border-t border-zinc-700/50 flex items-center gap-2 text-xs ${
+                                scan.webhook_status === "created" ? "text-emerald-400" 
+                                : scan.webhook_status === "exists" ? "text-blue-400"
+                                : scan.webhook_status === "skipped" ? "text-zinc-500"
+                                : "text-yellow-400"
+                              }`}>
+                                {scan.webhook_status === "created" && <CheckCircle className="w-3.5 h-3.5" />}
+                                {scan.webhook_status === "exists" && <CheckCircle className="w-3.5 h-3.5" />}
+                                Webhook: {scan.webhook_status}
+                                {scan.webhook_message && (
+                                  <span className="text-zinc-500 truncate max-w-[200px]">
+                                    - {scan.webhook_message}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+
+                            {/* Error Message */}
+                            {scan.status === "failed" && scan.error_message && (
+                              <div className="mt-2 p-2 bg-red-500/10 border border-red-500/20 rounded-lg">
+                                <p className="text-xs text-red-400">{scan.error_message}</p>
+                              </div>
+                            )}
+                          </div>
+                        </motion.div>
                       ))}
                     </div>
                   </div>

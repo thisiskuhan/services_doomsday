@@ -17,7 +17,7 @@ import {
     Loader2,
     Skull,
 } from "lucide-react";
-import { formatRelativeTime } from "@/lib/utils";
+import { formatRelativeTime, getDerivedCandidateStatus } from "@/lib/utils";
 import { CandidateStatusBadge, EntityIcon, ZombieScoreBadge, VerdictBadge } from "@/components/ui/shared";
 
 // Types - Flexible candidate interface that accepts ZombieCandidate
@@ -339,7 +339,7 @@ export function CandidateList({
                     <span className="font-medium text-white text-sm truncate">
                       {candidate.entity_name || candidate.entity_signature}
                     </span>
-                    <CandidateStatusBadge status={candidate.status} />
+                    <CandidateStatusBadge status={getDerivedCandidateStatus(candidate.status, candidate.observation_end_at as string | null)} />
                     {candidate.zombie_score !== undefined && candidate.zombie_score !== null && (
                       <ZombieScoreBadge score={candidate.zombie_score} size="sm" showLabel={false} />
                     )}

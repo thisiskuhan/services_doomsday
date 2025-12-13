@@ -62,7 +62,7 @@ export function WatcherCard({ watcher, index, onClick }: WatcherCardProps) {
       onMouseLeave={() => setIsHovered(false)}
       onClick={onClick}
     >
-      <HoverBorderGlow isHovered={isHovered} duration={1} />
+      <HoverBorderGlow isHovered={isHovered} duration={4} />
       <div className="relative bg-zinc-900/90 backdrop-blur-xl rounded-2xl p-6 transition-all group z-10">
       {/* Header */}
       <div className="flex items-start justify-between mb-4">

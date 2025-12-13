@@ -2,21 +2,37 @@ id: w1_watcher_creation
 namespace: doomsday.watchers
 
 description: |
-  Watcher Creation Workflow (W1)
+  ═══════════════════════════════════════════════════════════════════════════════
+  W1 WATCHER CREATION - Initial Repository Analysis & Zombie Candidate Discovery
+  ═══════════════════════════════════════════════════════════════════════════════
   
-  EXECUTION ORDER:
-  1. Clone repository and discover code entities (with unique IDs)
-  2. REPO-LEVEL LLM analysis (full codebase context via Repomix)
-  3. GREP + AST dependency detection (find what calls what)
-  4. PER-CANDIDATE LLM analysis (with repo context + dependencies + code snippet)
-  5. Store watcher and candidates with dependency signatures
+  Creates a new watcher by performing deep repository analysis using LLM-powered
+  insights to identify potential zombie code candidates (services, endpoints, and routes).
   
-  DB Schema Compliance:
-  - Watchers: llm_business_context (TEXT), llm_tech_stack (JSONB),
-              llm_architecture (TEXT), llm_health (JSONB), llm_zombie_risk (JSONB)
-  - Candidates: llm_purpose (TEXT), llm_risk_score (DECIMAL 0.00-1.00), 
-                llm_risk_reasoning (TEXT), depends_on_signatures (TEXT[]),
-                dependency_count, caller_count
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WORKFLOW STAGES                                                             │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ 1. CLONE & DISCOVER    → Clone repo, discover code entities via AST parsing │
+  │ 2. REPO-LEVEL LLM      → Analyze full codebase context using Repomix        │
+  │ 3. DEPENDENCY MAPPING  → GREP + AST to find caller/callee relationships     │
+  │ 4. PER-CANDIDATE LLM   → Individual analysis with repo context + deps       │
+  │ 5. STORE WATCHER       → Persist watcher with LLM insights to database      │
+  │ 6. STORE CANDIDATES    → Persist candidates with dependency signatures      │
+  │ 7. GITHUB WEBHOOK      → Auto-register webhook for rescan on push           │
+  │ 8. SCAN HISTORY        → Record initial scan in scan_history table          │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WHY KESTRA?                                                                 │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ • WorkingDirectory    → Isolated clone environment with file persistence    │
+  │ • Docker TaskRunner   → Containerized Python scripts for reproducibility    │
+  │ • InputFiles/Output   → Seamless data passing between stages via JSON       │
+  │ • ForEach             → Parallel per-candidate LLM analysis with limits     │
+  │ • Secrets/KV Store    → Secure credential management (tokens, DB URLs)      │
+  │ • Conditional Flow    → If/Then for webhook registration handling           │
+  │ • Error Handlers      → Automatic rollback and admin notification on fail   │
+  └─────────────────────────────────────────────────────────────────────────────┘
 
 labels:
   team: doomsday
@@ -1476,6 +1492,281 @@ tasks:
       print(f"Candidates stored: {count}")
 
   # ============================================================================
+  # STAGE 7: Register GitHub Webhook for Auto-Rescan
+  # ============================================================================
+  - id: register_github_webhook
+    type: io.kestra.plugin.scripts.python.Script
+    description: |
+      Automatically register a GitHub webhook on the repository.
+      This enables automatic rescan on push to main/master branch.
+      Gracefully skips if token lacks permissions or webhook exists.
+    timeout: PT2M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q requests
+    env:
+      GITHUB_TOKEN: "{{ inputs.github_token ?? '' }}"
+      REPO_URL: "{{ inputs.repo_url }}"
+      KESTRA_URL: "{{ secret('KESTRA_URL') ?? 'http://100.27.208.37:8080' }}"
+      WEBHOOK_SECRET: "{{ secret('GITHUB_WEBHOOK_SECRET') ?? '' }}"
+    outputFiles:
+      - webhook_result.json
+    script: |
+      import os
+      import re
+      import json
+      import requests
+      
+      github_token = os.environ.get('GITHUB_TOKEN', '').strip()
+      repo_url = os.environ.get('REPO_URL', '')
+      kestra_url = os.environ.get('KESTRA_URL', 'http://100.27.208.37:8080')
+      webhook_secret = os.environ.get('WEBHOOK_SECRET', '')
+      
+      result = {
+          "status": "skipped",
+          "message": "",
+          "webhook_url": "",
+          "webhook_id": None
+      }
+      
+      # Skip if no GitHub token provided
+      if not github_token:
+          result["message"] = "No GitHub token provided - manual webhook setup required"
+          print(f"[WEBHOOK] {result['message']}")
+          with open('webhook_result.json', 'w') as f:
+              json.dump(result, f, indent=2)
+          exit(0)
+      
+      # Extract owner/repo from URL
+      match = re.search(r'github\.com[/:]([^/]+)/([^/.]+)', repo_url)
+      if not match:
+          result["message"] = f"Could not parse repository from URL: {repo_url}"
+          print(f"[WEBHOOK] {result['message']}")
+          with open('webhook_result.json', 'w') as f:
+              json.dump(result, f, indent=2)
+          exit(0)
+      
+      owner = match.group(1)
+      repo = match.group(2).replace('.git', '')
+      
+      # Kestra webhook URL for rescan
+      webhook_url = f"{kestra_url}/api/v1/executions/webhook/doomsday.watchers/w1_watcher_rescan/devgraveyard-rescan-webhook-2024"
+      result["webhook_url"] = webhook_url
+      
+      headers = {
+          "Authorization": f"Bearer {github_token}",
+          "Accept": "application/vnd.github.v3+json",
+          "X-GitHub-Api-Version": "2022-11-28"
+      }
+      
+      # Check existing webhooks
+      try:
+          list_url = f"https://api.github.com/repos/{owner}/{repo}/hooks"
+          response = requests.get(list_url, headers=headers, timeout=30)
+          
+          if response.status_code == 404:
+              result["status"] = "skipped"
+              result["message"] = f"Repository not found or no access: {owner}/{repo}"
+              print(f"[WEBHOOK] {result['message']}")
+              with open('webhook_result.json', 'w') as f:
+                  json.dump(result, f, indent=2)
+              exit(0)
+          
+          if response.status_code == 403:
+              result["status"] = "skipped"
+              result["message"] = "Token lacks 'admin:repo_hook' permission - manual webhook setup required"
+              print(f"[WEBHOOK] {result['message']}")
+              with open('webhook_result.json', 'w') as f:
+                  json.dump(result, f, indent=2)
+              exit(0)
+          
+          if response.status_code != 200:
+              result["status"] = "error"
+              result["message"] = f"Failed to list webhooks: {response.status_code} - {response.text[:200]}"
+              print(f"[WEBHOOK] {result['message']}")
+              with open('webhook_result.json', 'w') as f:
+                  json.dump(result, f, indent=2)
+              exit(0)
+          
+          existing_hooks = response.json()
+          
+          # Check if webhook already exists
+          for hook in existing_hooks:
+              config = hook.get('config', {})
+              if 'devgraveyard-rescan-webhook' in config.get('url', ''):
+                  result["status"] = "exists"
+                  result["message"] = f"Webhook already configured (ID: {hook['id']})"
+                  result["webhook_id"] = hook['id']
+                  print(f"[WEBHOOK] {result['message']}")
+                  with open('webhook_result.json', 'w') as f:
+                      json.dump(result, f, indent=2)
+                  exit(0)
+          
+          # Create new webhook
+          create_payload = {
+              "name": "web",
+              "active": True,
+              "events": ["push"],
+              "config": {
+                  "url": webhook_url,
+                  "content_type": "json",
+                  "insecure_ssl": "1"  # Allow HTTP (set to "0" for HTTPS only)
+              }
+          }
+          
+          # Add secret if configured
+          if webhook_secret:
+              create_payload["config"]["secret"] = webhook_secret
+          
+          create_response = requests.post(list_url, headers=headers, json=create_payload, timeout=30)
+          
+          if create_response.status_code == 201:
+              hook_data = create_response.json()
+              result["status"] = "created"
+              result["message"] = f"Webhook created successfully (ID: {hook_data['id']})"
+              result["webhook_id"] = hook_data['id']
+              print(f"[WEBHOOK] {result['message']}")
+          elif create_response.status_code == 422:
+              # Webhook might already exist with same URL
+              result["status"] = "exists"
+              result["message"] = "Webhook already exists (duplicate URL)"
+              print(f"[WEBHOOK] {result['message']}")
+          else:
+              result["status"] = "error"
+              result["message"] = f"Failed to create webhook: {create_response.status_code} - {create_response.text[:200]}"
+              print(f"[WEBHOOK] {result['message']}")
+      
+      except requests.exceptions.Timeout:
+          result["status"] = "error"
+          result["message"] = "GitHub API timeout"
+          print(f"[WEBHOOK] {result['message']}")
+      except Exception as e:
+          result["status"] = "error"
+          result["message"] = f"Unexpected error: {str(e)[:200]}"
+          print(f"[WEBHOOK] {result['message']}")
+      
+      with open('webhook_result.json', 'w') as f:
+          json.dump(result, f, indent=2)
+
+  # ============================================================================
+  # STAGE 8: Store Initial Scan History
+  # ============================================================================
+  - id: store_initial_scan_history
+    type: io.kestra.plugin.scripts.python.Script
+    description: Record this initial scan in scan_history table
+    timeout: PT1M
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+      WATCHER_ID: "{{ inputs.watcher_id }}"
+      EXECUTION_ID: "{{ execution.id }}"
+      DEFAULT_BRANCH: "{{ inputs.default_branch }}"
+    inputFiles:
+      discovery.json: "{{ outputs.discover_entities.outputFiles['discovery.json'] }}"
+      git_metadata.json: "{{ outputs.extract_git_metadata.outputFiles['git_metadata.json'] }}"
+      llm_analysis.json: "{{ outputs.llm_repo_analysis.outputFiles['llm_repo_analysis.json'] }}"
+      candidates_result.json: "{{ outputs.store_candidates.outputFiles['candidates_result.json'] }}"
+      webhook_result.json: "{{ outputs.register_github_webhook.outputFiles['webhook_result.json'] }}"
+    outputFiles:
+      - history_result.json
+    script: |
+      import json
+      import os
+      import psycopg2
+      
+      db_url = os.environ.get('DATABASE_URL')
+      watcher_id = os.environ.get('WATCHER_ID')
+      execution_id = os.environ.get('EXECUTION_ID', '')
+      default_branch = os.environ.get('DEFAULT_BRANCH', 'main')
+      
+      with open('discovery.json', 'r') as f:
+          discovery = json.load(f)
+      
+      with open('git_metadata.json', 'r') as f:
+          git_meta = json.load(f)
+      
+      with open('llm_analysis.json', 'r') as f:
+          llm_analysis = json.load(f)
+      
+      with open('candidates_result.json', 'r') as f:
+          candidates_result = json.load(f)
+      
+      with open('webhook_result.json', 'r') as f:
+          webhook_result = json.load(f)
+      
+      summary = discovery.get('summary', {})
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      # Insert initial scan history record
+      cur.execute("""
+          INSERT INTO scan_history (
+              watcher_id, scan_type, scan_number, kestra_execution_id,
+              commit_hash, commit_message, commit_author, commit_date, branch,
+              trigger_source, triggered_by,
+              total_candidates, candidates_added, candidates_updated, candidates_removed,
+              http_endpoints, cron_jobs, queue_workers, serverless_functions,
+              websockets, grpc_services, graphql_resolvers,
+              llm_tech_stack, llm_zombie_risk,
+              webhook_status, webhook_message,
+              completed_at, status
+          ) VALUES (
+              %s, 'creation', 1, %s,
+              %s, %s, %s, %s, %s,
+              'manual', NULL,
+              %s, %s, 0, 0,
+              %s, %s, %s, %s, %s, %s, %s,
+              %s, %s,
+              %s, %s,
+              NOW(), 'completed'
+          )
+          RETURNING scan_id
+      """, (
+          watcher_id, execution_id,
+          git_meta.get('last_commit_hash'),
+          git_meta.get('last_commit_message', '')[:500] if git_meta.get('last_commit_message') else None,
+          git_meta.get('last_commit_author'),
+          git_meta.get('last_commit_date') if git_meta.get('last_commit_date') else None,
+          default_branch,
+          summary.get('total', 0),
+          candidates_result.get('candidates_stored', 0),
+          summary.get('http_endpoints', 0),
+          summary.get('cron_jobs', 0),
+          summary.get('queue_workers', 0),
+          summary.get('serverless_functions', 0),
+          summary.get('websockets', 0),
+          summary.get('grpc_services', 0),
+          summary.get('graphql_resolvers', 0),
+          json.dumps(llm_analysis.get('tech_stack', {})),
+          json.dumps(llm_analysis.get('zombie_risk', {})),
+          webhook_result.get('status'),
+          webhook_result.get('message')
+      ))
+      
+      scan_id = cur.fetchone()[0]
+      conn.commit()
+      cur.close()
+      conn.close()
+      
+      result = {
+          "scan_id": scan_id,
+          "scan_number": 1,
+          "watcher_id": watcher_id
+      }
+      
+      with open('history_result.json', 'w') as f:
+          json.dump(result, f, indent=2)
+      
+      print(f"[CREATION] Initial scan history recorded: scan_id={scan_id}")
+
+  # ============================================================================
   # OUTPUT
   # ============================================================================
   - id: output_success
@@ -1486,6 +1777,8 @@ tasks:
       watcher_name: "{{ inputs.watcher_name }}"
       repo_url: "{{ inputs.repo_url }}"
       status: "created"
+      scan_id: "{{ fromJson(read(outputs.store_initial_scan_history.outputFiles['history_result.json'])).scan_id }}"
+      webhook_status: "{{ read(outputs.register_github_webhook.outputFiles['webhook_result.json']) != null ? fromJson(read(outputs.register_github_webhook.outputFiles['webhook_result.json'])).status : 'unknown' }}"
       execution_id: "{{ execution.id }}"
 
 errors:

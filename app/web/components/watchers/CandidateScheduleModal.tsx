@@ -196,7 +196,7 @@ export function CandidateScheduleModal({
         onClick={(e) => e.stopPropagation()}
         className="relative max-w-lg w-full p-px rounded-2xl overflow-hidden"
       >
-        <AnimatedBorderGlow duration={1.5} />
+        <AnimatedBorderGlow duration={4} alwaysAnimate />
 
         <div className="relative bg-zinc-900 rounded-2xl z-10">
           {/* Header */}

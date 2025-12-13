@@ -2,17 +2,44 @@ id: w1_watcher_rescan
 namespace: doomsday.watchers
 
 description: |
-  Watcher Rescan Workflow (W1-Rescan)
+  ═══════════════════════════════════════════════════════════════════════════════
+  W1 WATCHER RESCAN - Webhook-Triggered Repository Re-Analysis
+  ═══════════════════════════════════════════════════════════════════════════════
   
-  Triggered by GitHub webhook on push/PR merge to default branch.
-  Re-scans the repository and performs smart candidate sync:
-  - Updates existing candidates (same endpoint, code changed)
-  - Adds new candidates (new endpoints discovered)
-  - Marks removed candidates (endpoints deleted from code)
+  Automatically triggered by GitHub webhooks when code is pushed to the default
+  branch. Performs incremental analysis and smart candidate synchronization to
+  keep zombie detection data up-to-date.
   
-  Database updates per candidate:
-  - file_path, framework, last_seen_commit, scan_count
-  - Preserves: first_seen_commit, llm_purpose, llm_risk_score
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WORKFLOW STAGES                                                             │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ 1. VALIDATE WEBHOOK    → Parse payload, verify branch & find watcher        │
+  │ 2. CLONE REPOSITORY    → Fresh clone with latest commit from push           │
+  │ 3. DISCOVER ENTITIES   → AST parsing to find all code entities              │
+  │ 4. DEPENDENCY ANALYSIS → GREP + AST for caller/callee relationships         │
+  │ 5. SMART SYNC          → Upsert candidates (add new, update existing)       │
+  │ 6. SCAN HISTORY        → Record rescan in scan_history table                │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ SMART SYNC BEHAVIOR                                                         │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ • NEW entities      → Insert with status 'new'                              │
+  │ • EXISTING entities → Update file_path, last_seen_commit, scan_count        │
+  │ • REMOVED entities  → Keep but mark last_seen_commit (no deletion)          │
+  │ • Preserved fields  → first_seen_commit, llm_purpose, llm_risk_score        │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WHY KESTRA?                                                                 │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ • Webhook Trigger     → Native GitHub webhook integration with filtering    │
+  │ • Condition Filters   → Only process main/master branch pushes              │
+  │ • If/Then Flow        → Conditional execution based on watcher existence    │
+  │ • WorkingDirectory    → Isolated git clone with file persistence            │
+  │ • Docker TaskRunner   → Containerized Python for consistent execution       │
+  │ • Pebble Templates    → Dynamic payload parsing in trigger conditions       │
+  └─────────────────────────────────────────────────────────────────────────────┘
 
 labels:
   team: doomsday
@@ -843,7 +870,10 @@ tasks:
               "commit": commit_sha[:7] if commit_sha else "manual",
               "candidates_upserted": stats['upserted'],
               "candidates_removed": stats['removed'],
-              "total_discovered": summary.get('total', 0)
+              "candidates_added": stats.get('added', stats['upserted']),
+              "total_discovered": summary.get('total', 0),
+              "summary": summary,
+              "git_metadata": git_metadata
           }
           
           with open('sync_result.json', 'w') as f:
@@ -851,6 +881,121 @@ tasks:
           
           print(f"[RESCAN] Sync complete for {config['watcher_name']}")
           print(f"[RESCAN] Upserted: {stats['upserted']}, Removed: {stats['removed']}")
+
+      # ========================================================================
+      # STAGE 4: Store Scan History
+      # ========================================================================
+      - id: store_scan_history
+        type: io.kestra.plugin.scripts.python.Script
+        description: Record this rescan in scan_history table
+        timeout: PT1M
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install -q psycopg2-binary
+        env:
+          DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+          EXECUTION_ID: "{{ execution.id }}"
+          PUSHER: "{{ inputs.pusher ?? trigger.body.pusher.name ?? '' }}"
+          TRIGGER_SOURCE: "{{ trigger.body != null ? 'webhook' : 'manual' }}"
+        inputFiles:
+          watcher_config.json: "{{ outputs.validate_and_find_watcher.outputFiles['watcher_config.json'] }}"
+          sync_result.json: "{{ outputs.sync_candidates.outputFiles['sync_result.json'] }}"
+          llm_analysis.json: "{{ outputs.llm_analysis.outputFiles['llm_analysis.json'] }}"
+        outputFiles:
+          - history_result.json
+        script: |
+          import json
+          import os
+          import psycopg2
+          from datetime import datetime
+          
+          db_url = os.environ.get('DATABASE_URL')
+          execution_id = os.environ.get('EXECUTION_ID', '')
+          pusher = os.environ.get('PUSHER', '')
+          trigger_source = os.environ.get('TRIGGER_SOURCE', 'manual')
+          
+          with open('watcher_config.json', 'r') as f:
+              config = json.load(f)
+          
+          with open('sync_result.json', 'r') as f:
+              sync_result = json.load(f)
+          
+          with open('llm_analysis.json', 'r') as f:
+              llm_analysis = json.load(f)
+          
+          watcher_id = config['watcher_id']
+          git_meta = sync_result.get('git_metadata', {})
+          summary = sync_result.get('summary', {})
+          
+          conn = psycopg2.connect(db_url, sslmode='require')
+          cur = conn.cursor()
+          
+          # Get current scan_count to determine scan_number
+          cur.execute("SELECT scan_count FROM watchers WHERE watcher_id = %s", (watcher_id,))
+          row = cur.fetchone()
+          scan_number = row[0] if row else 1
+          
+          # Insert scan history record
+          cur.execute("""
+              INSERT INTO scan_history (
+                  watcher_id, scan_type, scan_number, kestra_execution_id,
+                  commit_hash, commit_message, commit_author, commit_date, branch,
+                  trigger_source, triggered_by,
+                  total_candidates, candidates_added, candidates_updated, candidates_removed,
+                  http_endpoints, cron_jobs, queue_workers, serverless_functions,
+                  websockets, grpc_services, graphql_resolvers,
+                  llm_tech_stack, llm_zombie_risk,
+                  completed_at, status
+              ) VALUES (
+                  %s, 'rescan', %s, %s,
+                  %s, %s, %s, %s, %s,
+                  %s, %s,
+                  %s, %s, %s, %s,
+                  %s, %s, %s, %s, %s, %s, %s,
+                  %s, %s,
+                  NOW(), 'completed'
+              )
+              RETURNING scan_id
+          """, (
+              watcher_id, scan_number, execution_id,
+              git_meta.get('last_commit_hash'),
+              git_meta.get('last_commit_message', '')[:500] if git_meta.get('last_commit_message') else None,
+              git_meta.get('last_commit_author'),
+              git_meta.get('last_commit_date') if git_meta.get('last_commit_date') else None,
+              config.get('default_branch', 'main'),
+              trigger_source, pusher or None,
+              summary.get('total', 0),
+              sync_result.get('candidates_added', 0),
+              sync_result.get('candidates_upserted', 0),
+              sync_result.get('candidates_removed', 0),
+              summary.get('http_endpoints', 0),
+              summary.get('cron_jobs', 0),
+              summary.get('queue_workers', 0),
+              summary.get('serverless_functions', 0),
+              summary.get('websockets', 0),
+              summary.get('grpc_services', 0),
+              summary.get('graphql_resolvers', 0),
+              json.dumps(llm_analysis.get('tech_stack', {})),
+              json.dumps(llm_analysis.get('zombie_risk_assessment', {}))
+          ))
+          
+          scan_id = cur.fetchone()[0]
+          conn.commit()
+          cur.close()
+          conn.close()
+          
+          result = {
+              "scan_id": scan_id,
+              "scan_number": scan_number,
+              "watcher_id": watcher_id
+          }
+          
+          with open('history_result.json', 'w') as f:
+              json.dump(result, f, indent=2)
+          
+          print(f"[RESCAN] Scan history recorded: scan_id={scan_id}, scan_number={scan_number}")
 
       # Output success result
       - id: output_success
@@ -861,6 +1006,7 @@ tasks:
           watcher_id: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).watcher_id }}"
           watcher_name: "{{ fromJson(read(outputs.validate_and_find_watcher.outputFiles['watcher_config.json'])).watcher_name }}"
           trigger_commit: "{{ inputs.commit_sha ?? 'manual' }}"
+          scan_id: "{{ fromJson(read(outputs.store_scan_history.outputFiles['history_result.json'])).scan_id }}"
           execution_id: "{{ execution.id }}"
 
     else:
@@ -889,7 +1035,7 @@ triggers:
     type: io.kestra.plugin.core.trigger.Webhook
     key: devgraveyard-rescan-webhook-2024
     conditions:
-      - type: io.kestra.plugin.core.condition.ExpressionCondition
+      - type: io.kestra.plugin.core.condition.Expression
         expression: "{{ trigger.body.ref ends with '/main' or trigger.body.ref ends with '/master' }}"
 
 pluginDefaults:

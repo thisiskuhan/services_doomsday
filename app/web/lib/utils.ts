@@ -5,13 +5,11 @@
  *   - cn(): Tailwind CSS class merging utility
  *   - formatDate(): Human-readable date formatting
  *   - formatRelativeTime(): Relative time (e.g., "2h ago")
- *   - formatRelativeTimeVerbose(): Verbose relative time with pluralization
  *   - extractRepoName(): Extract repo name from GitHub URL
  *   - parseJavaMapString(): Parse Java/Groovy Map toString format
  *   - getZombieScoreLevel(): Get zombie score classification
  *
  * Constants:
- *   - ENTITY_TYPES: Supported entity type configurations
  *   - CANDIDATE_STATUS_CONFIG: Candidate status styling
  *   - WATCHER_STATUS_CONFIG: Watcher status styling
  *   - OBSERVABILITY_SOURCE_TYPES: Supported observability sources
@@ -59,21 +57,29 @@ export function formatRelativeTime(dateString: string | null): string {
   }
 }
 
-export function formatRelativeTimeVerbose(dateString: string | null): string {
-  if (!dateString) return "N/A";
+export function formatFutureTime(dateString: string | null): string {
+  if (!dateString) return "Not set";
   try {
     const date = new Date(dateString);
     const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
+    const diffMs = date.getTime() - now.getTime();
+    
+    // If in the past, show "Now" or "Overdue"
+    if (diffMs < 0) {
+      const pastMins = Math.floor(-diffMs / 60000);
+      if (pastMins < 2) return "Now";
+      return "Overdue";
+    }
+    
     const diffMins = Math.floor(diffMs / 60000);
     const diffHours = Math.floor(diffMs / 3600000);
     const diffDays = Math.floor(diffMs / 86400000);
 
-    if (diffMins < 1) return "Just now";
-    if (diffMins < 60) return `${diffMins} min${diffMins > 1 ? "s" : ""} ago`;
-    if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? "s" : ""} ago`;
-    if (diffDays < 30) return `${diffDays} day${diffDays > 1 ? "s" : ""} ago`;
-    return formatDate(dateString);
+    if (diffMins < 1) return "< 1 min";
+    if (diffMins < 60) return `in ${diffMins}m`;
+    if (diffHours < 24) return `in ${diffHours}h ${diffMins % 60}m`;
+    if (diffDays < 7) return `in ${diffDays}d`;
+    return date.toLocaleDateString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   } catch {
     return "Unknown";
   }
@@ -104,16 +110,6 @@ export function parseJavaMapString(str: string): Record<string, string> | null {
   return Object.keys(result).length > 0 ? result : null;
 }
 
-export const ENTITY_TYPES = {
-  http_endpoint: { label: "HTTP Endpoint", color: "blue" },
-  cron_job: { label: "Cron Job", color: "purple" },
-  queue_worker: { label: "Queue Worker", color: "orange" },
-  serverless_function: { label: "Serverless Function", color: "cyan" },
-  websocket: { label: "WebSocket", color: "green" },
-  grpc_service: { label: "gRPC Service", color: "pink" },
-  graphql_resolver: { label: "GraphQL Resolver", color: "amber" },
-} as const;
-
 export const CANDIDATE_STATUS_CONFIG = {
   pending: { bg: "bg-yellow-500/20", text: "text-yellow-400", dot: "bg-yellow-500", label: "Pending Schedule" },
   active: { bg: "bg-emerald-500/20", text: "text-emerald-400", dot: "bg-emerald-500", label: "Observing" },
@@ -121,11 +117,26 @@ export const CANDIDATE_STATUS_CONFIG = {
   completed: { bg: "bg-blue-500/20", text: "text-blue-400", dot: "bg-blue-500", label: "Completed" },
   inactive: { bg: "bg-zinc-600/20", text: "text-zinc-500", dot: "bg-zinc-600", label: "Inactive" },
   // W3/W4 statuses
+  analysis_pending: { bg: "bg-cyan-500/20", text: "text-cyan-400", dot: "bg-cyan-500", label: "Analysis Pending" },
   pending_review: { bg: "bg-purple-500/20", text: "text-purple-400", dot: "bg-purple-500", label: "Pending Review" },
   confirmed_zombie: { bg: "bg-red-500/20", text: "text-red-400", dot: "bg-red-500", label: "Confirmed Zombie" },
   killed: { bg: "bg-red-600/20", text: "text-red-500", dot: "bg-red-600", label: "Killed" },
   healthy: { bg: "bg-green-500/20", text: "text-green-400", dot: "bg-green-500", label: "Healthy" },
 } as const;
+
+/**
+ * Derives the display status for a candidate based on DB status and observation_end_at.
+ * If status is 'active' but observation_end_at is in the past, shows 'analysis_pending'.
+ */
+export function getDerivedCandidateStatus(status: string, observationEndAt: string | null): string {
+  if (status === "active" && observationEndAt) {
+    const endDate = new Date(observationEndAt);
+    if (endDate <= new Date()) {
+      return "analysis_pending";
+    }
+  }
+  return status;
+}
 
 export interface ZombieScoreLevel {
   label: string;
@@ -204,3 +215,39 @@ export const OBSERVABILITY_SOURCE_TYPES = [
   { id: "newrelic", value: "newrelic", label: "New Relic", placeholder: "https://api.newrelic.com" },
   { id: "custom", value: "custom", label: "Custom", placeholder: "https://..." },
 ] as const;
+
+/**
+ * Sanitize error messages to remove sensitive data like tokens, keys, passwords
+ * This prevents accidental exposure of credentials in the UI
+ */
+export function sanitizeErrorMessage(message: string | null): string | null {
+  if (!message) return null;
+  
+  let sanitized = message;
+    // glc_ tokens (Grafana Cloud)
+  sanitized = sanitized.replace(/glc_[A-Za-z0-9_-]+/gi, '[TOKEN_MASKED]');
+  // Bearer tokens
+  sanitized = sanitized.replace(/Bearer\s+[A-Za-z0-9_.-]+/gi, 'Bearer [TOKEN_MASKED]');
+  // API keys (common patterns)
+  sanitized = sanitized.replace(/api[_-]?key[=:]\s*[A-Za-z0-9_-]+/gi, 'api_key=[KEY_MASKED]');
+  // Generic token parameter
+  sanitized = sanitized.replace(/token[=:]\s*[A-Za-z0-9_.-]+/gi, 'token=[TOKEN_MASKED]');
+  // Authorization headers
+  sanitized = sanitized.replace(/authorization[=:]\s*[A-Za-z0-9_.-]+/gi, 'authorization=[MASKED]');
+  // Password patterns
+  sanitized = sanitized.replace(/password[=:]\s*[^\s,}]+/gi, 'password=[MASKED]');
+  // Secret patterns
+  sanitized = sanitized.replace(/secret[=:]\s*[^\s,}]+/gi, 'secret=[MASKED]');
+  // AWS keys
+  sanitized = sanitized.replace(/AKIA[A-Z0-9]{16}/g, '[AWS_KEY_MASKED]');
+  // Generic long base64-like strings (likely tokens) - 40+ chars of alphanumeric
+  sanitized = sanitized.replace(/[A-Za-z0-9_-]{40,}/g, '[CREDENTIAL_MASKED]');
+  
+  // Mask full URLs with credentials (extract just the error type)
+  const urlMatch = message.match(/No connection adapters were found for '\{url=/i);
+  if (urlMatch) {
+    sanitized = 'Connection failed: Invalid or unreachable observability URL';
+  }
+  
+  return sanitized;
+}

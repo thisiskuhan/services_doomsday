@@ -2,12 +2,45 @@ id: w2_observation_loop
 namespace: doomsday.guardians
 
 description: |
-  Observation Loop Workflow (W2) - Simplified Version
+  ═══════════════════════════════════════════════════════════════════════════════
+  W2 OBSERVATION LOOP - Continuous Traffic Monitoring for Zombie Candidates
+  ═══════════════════════════════════════════════════════════════════════════════
   
-  PURPOSE: Continuously monitor zombie candidates for traffic evidence.
-  Polls every minute, observes due candidates, stores evidence, updates verdicts.
+  Scheduled workflow that continuously monitors zombie candidates for traffic
+  evidence. Queries configured endpoints (Prometheus, health checks) and updates
+  zombie scores based on consecutive zero-traffic observations.
   
-  SIMPLIFIED: Uses single Python script per candidate to avoid WorkingDirectory issues.
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WORKFLOW STAGES                                                             │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ 1. POLL DUE CANDIDATES → Query DB for candidates where next_poll_at <= NOW  │
+  │ 2. OBSERVE EACH        → ForEach loop with parallel execution (limit: 10)   │
+  │    ├─ PROMETHEUS       → Query metrics for request_count > 0                │
+  │    ├─ HEALTH_CHECK     → HTTP GET to endpoint with timeout                  │
+  │    └─ NO_DATA          → Mark as no_data when query_type not configured     │
+  │ 3. STORE EVIDENCE      → Insert observation_event with traffic status       │
+  │ 4. UPDATE SCORE        → Increment zombie_score on consecutive zero-hits    │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ ZOMBIE SCORE LOGIC                                                          │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ • Traffic detected    → Reset consecutive_zero_traffic to 0                 │
+  │ • No traffic          → Increment consecutive_zero_traffic                  │
+  │ • Score formula       → MIN(zombie_score + 5, 100) per zero observation     │
+  │ • Analysis trigger    → When observation_end_at reached (W3 picks up)       │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WHY KESTRA?                                                                 │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ • Cron Trigger        → Scheduled execution every 5 minutes (*/5 * * * *)   │
+  │ • ForEach             → Parallel candidate processing with concurrency cap  │
+  │ • Docker TaskRunner   → Isolated Python execution per observation           │
+  │ • Retry Policy        → Exponential backoff for transient DB failures       │
+  │ • Variables           → Configurable thresholds (max_candidates, limits)    │
+  │ • Conditional Logic   → Query type routing (prometheus/health/no_data)      │
+  └─────────────────────────────────────────────────────────────────────────────┘
 
 labels:
   team: doomsday
@@ -213,24 +246,47 @@ tasks:
                   except:
                       obs_urls = []
               
+              # Helper to parse Java Map toString format: {key=value, key2=value2}
+              def parse_java_map(s):
+                  if not isinstance(s, str):
+                      return s
+                  s = s.strip()
+                  if s.startswith('{') and s.endswith('}') and '=' in s and ':' not in s:
+                      # Looks like Java Map format, not JSON
+                      inner = s[1:-1]
+                      result = {}
+                      for part in inner.split(', '):
+                          if '=' in part:
+                              k, v = part.split('=', 1)
+                              result[k.strip()] = v.strip()
+                      return result
+                  return s
+              
               # =================================================================
               # BUILD SOURCE CONFIGURATIONS
               # =================================================================
               sources = []
-              for idx, url in enumerate(obs_urls):
+              for idx, item in enumerate(obs_urls):
+                  # Handle Java Map string format
+                  url = parse_java_map(item) if isinstance(item, str) else item
+                  
                   if isinstance(url, dict):
                       sources.append({
                           "source_type": url.get("type", "prometheus"),
                           "source_name": url.get("name", f"source_{idx}"),
                           "source_url": url.get("url", ""),
+                          "source_token": url.get("token", ""),
                           "query_template": url.get("query", "")
                       })
                   elif isinstance(url, str) and url.strip():
-                      sources.append({
-                          "source_type": "prometheus",
-                          "source_name": f"prometheus_{idx}",
-                          "source_url": url
-                      })
+                      # Plain URL string
+                      if url.startswith('http'):
+                          sources.append({
+                              "source_type": "prometheus",
+                              "source_name": f"prometheus_{idx}",
+                              "source_url": url
+                          })
+                      # else: skip invalid format
               
               # Add health check if applicable
               if app_url and route_path and entity_type == 'http_endpoint':
@@ -267,7 +323,13 @@ tasks:
                   url = source.get('source_url', '').rstrip('/')
                   if not url:
                       result['error_type'] = 'no_url'
-                      result['error_message'] = 'No Prometheus URL'
+                      result['error_message'] = 'No Prometheus URL configured'
+                      return result
+                  
+                  # Validate URL format
+                  if not url.startswith('http'):
+                      result['error_type'] = 'invalid_url'
+                      result['error_message'] = 'Invalid URL format (must start with http/https)'
                       return result
                   
                   # Build PromQL
@@ -277,9 +339,20 @@ tasks:
                       promql = 'sum(increase(http_requests_total[1h]))'
                   result['query_expression'] = promql
                   
+                  # Build headers (for Grafana Cloud and other auth-required endpoints)
+                  headers = {}
+                  token = source.get('source_token', '')
+                  if token:
+                      headers['Authorization'] = f'Bearer {token}'
+                  
                   try:
                       start = time.time()
-                      resp = requests.get(f"{url}/api/v1/query", params={"query": promql}, timeout=query_timeout)
+                      resp = requests.get(
+                          f"{url}/api/v1/query", 
+                          params={"query": promql}, 
+                          headers=headers if headers else None,
+                          timeout=query_timeout
+                      )
                       result['query_response_time_ms'] = int((time.time() - start) * 1000)
                       
                       if resp.status_code == 200:
@@ -293,12 +366,27 @@ tasks:
                                       except:
                                           pass
                               result['traffic_detected'] = result['raw_request_count'] > 0
+                      elif resp.status_code == 401:
+                          result['error_type'] = 'auth_error'
+                          result['error_message'] = 'Authentication failed - check API token'
+                      elif resp.status_code == 403:
+                          result['error_type'] = 'forbidden'
+                          result['error_message'] = 'Access denied - insufficient permissions'
+                      elif resp.status_code == 404:
+                          result['error_type'] = 'not_found'
+                          result['error_message'] = 'Prometheus API endpoint not found'
                       else:
                           result['error_type'] = 'http_error'
                           result['error_message'] = f"HTTP {resp.status_code}"
                   except requests.Timeout:
                       result['error_type'] = 'timeout'
                       result['error_message'] = f"Timeout after {query_timeout}s"
+                  except requests.exceptions.ConnectionError:
+                      result['error_type'] = 'connection_error'
+                      result['error_message'] = 'Connection failed - check URL and network'
+                  except requests.exceptions.JSONDecodeError:
+                      result['error_type'] = 'invalid_response'
+                      result['error_message'] = 'Invalid JSON response from Prometheus'
                   except Exception as e:
                       result['error_type'] = 'error'
                       result['error_message'] = str(e)[:200]
@@ -318,6 +406,7 @@ tasks:
                   url = source.get('source_url', '')
                   if not url:
                       result['error_type'] = 'no_url'
+                      result['error_message'] = 'No health check URL configured'
                       return result
                   
                   http_method = source.get('http_method', 'GET').upper()
@@ -332,9 +421,36 @@ tasks:
                       
                       result['http_status'] = resp.status_code
                       result['health_check_latency_ms'] = int((time.time() - start) * 1000)
-                      result['is_alive'] = resp.status_code < 500
+                      
+                      # Determine if alive based on status code
+                      if resp.status_code == 404:
+                          result['is_alive'] = False
+                          result['error_type'] = 'not_found'
+                          result['error_message'] = 'Endpoint not found (404) - check route path'
+                      elif resp.status_code == 401:
+                          result['is_alive'] = True  # Server is alive, just needs auth
+                          result['error_type'] = 'auth_required'
+                          result['error_message'] = 'Authentication required (401)'
+                      elif resp.status_code == 403:
+                          result['is_alive'] = True  # Server is alive, just forbidden
+                          result['error_type'] = 'forbidden'
+                          result['error_message'] = 'Access forbidden (403)'
+                      elif resp.status_code >= 500:
+                          result['is_alive'] = False
+                          result['error_type'] = 'server_error'
+                          result['error_message'] = f'Server error ({resp.status_code})'
+                      else:
+                          # 2xx, 3xx, other 4xx - server is responding
+                          result['is_alive'] = True
+                          # If we got a successful response, that's traffic evidence!
+                          if resp.status_code < 400:
+                              result['traffic_detected'] = True
                   except requests.Timeout:
                       result['error_type'] = 'timeout'
+                      result['error_message'] = f'Health check timeout after {query_timeout}s'
+                  except requests.exceptions.ConnectionError:
+                      result['error_type'] = 'connection_error'
+                      result['error_message'] = 'Connection failed - endpoint unreachable'
                   except Exception as e:
                       result['error_type'] = 'error'
                       result['error_message'] = str(e)[:200]
@@ -395,10 +511,11 @@ tasks:
               conn = psycopg2.connect(db_url, sslmode='require')
               cur = conn.cursor()
               
-              # Store observation_events
+              # Prepare batch data for observation_events
               health_check_performed = False
               health_check_alive = None
               health_check_status = None
+              event_rows = []
               
               for sr in results:
                   is_hc = sr.get('source_type') == 'health_check'
@@ -407,15 +524,7 @@ tasks:
                       health_check_alive = sr.get('is_alive')
                       health_check_status = sr.get('http_status')
                   
-                  cur.execute("""
-                      INSERT INTO observation_events (
-                          candidate_id, watcher_id, observation_batch_id, observed_at,
-                          source_type, source_name, source_url,
-                          raw_request_count, traffic_detected,
-                          http_status, is_alive, health_check_latency_ms,
-                          error_type, error_message, query_expression, query_response_time_ms
-                      ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                  """, (
+                  event_rows.append((
                       candidate_id, watcher_id, batch_id,
                       sr.get('observed_at', now.isoformat()),
                       sr.get('source_type'), sr.get('source_name'), sr.get('source_url'),
@@ -424,6 +533,17 @@ tasks:
                       sr.get('error_type'), sr.get('error_message'),
                       sr.get('query_expression'), sr.get('query_response_time_ms')
                   ))
+              
+              # Batch insert observation_events
+              cur.executemany("""
+                  INSERT INTO observation_events (
+                      candidate_id, watcher_id, observation_batch_id, observed_at,
+                      source_type, source_name, source_url,
+                      raw_request_count, traffic_detected,
+                      http_status, is_alive, health_check_latency_ms,
+                      error_type, error_message, query_expression, query_response_time_ms
+                  ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+              """, event_rows)
               
               # Aggregate results
               total_sources = len(results)
@@ -501,10 +621,10 @@ tasks:
                       zombie_verdict = %s,
                       observation_log = (
                           CASE 
-                              WHEN jsonb_array_length(observation_log) >= 10 
-                              THEN observation_log - 0 
-                              ELSE observation_log 
-                          END || %s::jsonb
+                              WHEN jsonb_array_length(COALESCE(observation_log, '[]'::jsonb)) >= 10 
+                              THEN (observation_log #- '{0}') || %s::jsonb
+                              ELSE COALESCE(observation_log, '[]'::jsonb) || %s::jsonb
+                          END
                       ),
                       updated_at = NOW()
                   WHERE candidate_id = %s
@@ -512,7 +632,7 @@ tasks:
                   new_obs_count, new_consecutive_zero, new_health_check_count,
                   traffic_detected, traffic_detected, total_request_count,
                   next_observation_at, new_zombie_score, zombie_verdict,
-                  log_entry, candidate_id
+                  log_entry, log_entry, candidate_id
               ))
               
               conn.commit()
@@ -528,8 +648,40 @@ tasks:
         format: "[POLL] No candidates due for observation"
 
   # ============================================================================
-  # STAGE 4: Output Results
+  # STAGE 4: Output Results & Reset Failure Counter
   # ============================================================================
+  - id: reset_failure_counter
+    type: io.kestra.plugin.scripts.python.Script
+    description: Reset consecutive failure counter on successful run
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install -q psycopg2-binary
+    env:
+      DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+    script: |
+      import os
+      import psycopg2
+      
+      db_url = os.environ.get('DATABASE_URL')
+      
+      conn = psycopg2.connect(db_url, sslmode='require')
+      cur = conn.cursor()
+      
+      # Reset consecutive failures on success
+      cur.execute("""
+          UPDATE workflow_health
+          SET consecutive_failures = 0, last_success_at = NOW(), updated_at = NOW()
+          WHERE workflow_id = 'w2_observation_loop'
+      """)
+      
+      conn.commit()
+      cur.close()
+      conn.close()
+      
+      print("[W2] Success - reset failure counter")
+
   - id: output_poll_stats
     type: io.kestra.plugin.core.output.OutputValues
     values:
@@ -539,11 +691,135 @@ tasks:
 
 errors:
   - id: observation_loop_failed
-    type: io.kestra.plugin.core.output.OutputValues
-    values:
-      status: "failed"
-      error: "Observation loop workflow encountered an error"
-      execution_id: "{{ execution.id }}"
+    type: io.kestra.plugin.core.flow.Sequential
+    tasks:
+      - id: log_w2_error
+        type: io.kestra.plugin.core.log.Log
+        message: "W2 Observation Loop Error: {{ error.message }}"
+        level: ERROR
+        
+      - id: track_consecutive_failures
+        type: io.kestra.plugin.scripts.python.Script
+        description: Track consecutive failures and alert if threshold reached
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install -q psycopg2-binary
+        env:
+          DATABASE_URL: "{{ secret('DATABASE_URL') }}"
+          EXECUTION_ID: "{{ execution.id }}"
+        outputFiles:
+          - failure_tracking.json
+        script: |
+          import os
+          import json
+          import psycopg2
+          from datetime import datetime, timezone, timedelta
+          
+          db_url = os.environ.get('DATABASE_URL')
+          execution_id = os.environ.get('EXECUTION_ID')
+          now = datetime.now(timezone.utc)
+          
+          conn = psycopg2.connect(db_url, sslmode='require')
+          cur = conn.cursor()
+          
+          # Check if w2_failure_tracking table exists, create if not
+          cur.execute("""
+              CREATE TABLE IF NOT EXISTS workflow_health (
+                  workflow_id VARCHAR(50) PRIMARY KEY,
+                  consecutive_failures INT DEFAULT 0,
+                  total_failures INT DEFAULT 0,
+                  last_failure_at TIMESTAMP WITH TIME ZONE,
+                  last_success_at TIMESTAMP WITH TIME ZONE,
+                  last_error TEXT,
+                  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                  updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+              )
+          """)
+          
+          # Get or create tracking record
+          cur.execute("""
+              INSERT INTO workflow_health (workflow_id, consecutive_failures, total_failures, last_failure_at, updated_at)
+              VALUES ('w2_observation_loop', 1, 1, NOW(), NOW())
+              ON CONFLICT (workflow_id) DO UPDATE SET
+                  consecutive_failures = workflow_health.consecutive_failures + 1,
+                  total_failures = workflow_health.total_failures + 1,
+                  last_failure_at = NOW(),
+                  updated_at = NOW()
+              RETURNING consecutive_failures, total_failures
+          """)
+          
+          result = cur.fetchone()
+          consecutive = result[0]
+          total = result[1]
+          
+          conn.commit()
+          cur.close()
+          conn.close()
+          
+          # Determine if alert needed (5+ consecutive failures)
+          should_alert = consecutive >= 5
+          
+          output = {
+              "consecutive_failures": consecutive,
+              "total_failures": total,
+              "should_alert": should_alert,
+              "threshold": 5
+          }
+          
+          with open('failure_tracking.json', 'w') as f:
+              json.dump(output, f)
+          
+          print(f"[W2 FAILURE] Consecutive: {consecutive}, Total: {total}, Alert: {should_alert}")
+          
+      - id: check_alert_needed
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ (read(outputs.track_consecutive_failures.outputFiles['failure_tracking.json']) | json).should_alert == true }}"
+        then:
+          - id: notify_admin_w2_failure
+            type: io.kestra.plugin.notifications.mail.MailSend
+            description: Alert admin about repeated W2 failures
+            host: "{{ kv('SMTP_HOST') }}"
+            port: "{{ kv('SMTP_PORT') }}"
+            username: "{{ kv('SMTP_USERNAME') }}"
+            password: "{{ kv('SMTP_PASSWORD') }}"
+            from: "{{ kv('SMTP_FROM') }}"
+            to:
+              - "{{ kv('ADMIN_EMAIL') ?? kv('SMTP_FROM') }}"
+            subject: "[ALERT] W2 Observation Loop - Repeated Failures ({{ (read(outputs.track_consecutive_failures.outputFiles['failure_tracking.json']) | json).consecutive_failures }}x)"
+            htmlTextContent: |
+              <!DOCTYPE html>
+              <html>
+              <body style="margin: 0; padding: 20px; background: #0a0a0a; font-family: -apple-system, sans-serif;">
+                <div style="max-width: 500px; margin: 0 auto; background: #111; border-radius: 12px; border: 1px solid #dc2626; padding: 24px;">
+                  <h2 style="color: #dc2626; margin: 0 0 16px;">W2 Repeated Failures</h2>
+                  <p style="color: #9ca3af; margin: 0 0 16px;">The observation loop has failed {{ (read(outputs.track_consecutive_failures.outputFiles['failure_tracking.json']) | json).consecutive_failures }} times consecutively.</p>
+                  <div style="background: #1a1a1a; padding: 12px; border-radius: 8px; margin-bottom: 12px;">
+                    <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">CONSECUTIVE FAILURES</p>
+                    <p style="color: #dc2626; font-size: 24px; font-weight: 600; margin: 0;">{{ (read(outputs.track_consecutive_failures.outputFiles['failure_tracking.json']) | json).consecutive_failures }}</p>
+                  </div>
+                  <div style="background: #1a1a1a; padding: 12px; border-radius: 8px; margin-bottom: 12px;">
+                    <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">EXECUTION ID</p>
+                    <p style="color: #f3f4f6; font-family: monospace; margin: 0;">{{ execution.id }}</p>
+                  </div>
+                  <div style="background: #1c1917; padding: 12px; border-radius: 8px; border-left: 3px solid #dc2626;">
+                    <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">LAST ERROR</p>
+                    <p style="color: #fca5a5; font-family: monospace; font-size: 12px; margin: 0;">{{ error.message }}</p>
+                  </div>
+                  <p style="color: #9ca3af; font-size: 12px; margin: 16px 0;">Zombie observation is paused. Please investigate immediately.</p>
+                  <p style="color: #4b5563; font-size: 11px; margin: 16px 0 0; text-align: center;">Services Doomsday - W2 Observation</p>
+                </div>
+              </body>
+              </html>
+              
+      - id: output_failure
+        type: io.kestra.plugin.core.output.OutputValues
+        values:
+          status: "failed"
+          error: "{{ error.message }}"
+          execution_id: "{{ execution.id }}"
+          consecutive_failures: "{{ (read(outputs.track_consecutive_failures.outputFiles['failure_tracking.json']) | json).consecutive_failures }}"
 
 triggers:
   - id: every_5_minutes

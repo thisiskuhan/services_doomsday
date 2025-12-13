@@ -67,6 +67,7 @@ interface ZombieCandidate {
   caller_count: number;
   scan_frequency_minutes: number | null;
   analysis_period_hours: number | null;
+  observation_end_at: string | null;
   first_observed_at: string | null;
   last_observed_at: string | null;
   observation_count: number;
@@ -139,7 +140,7 @@ export async function GET(
         method, route_path, schedule, queue_name, framework, status,
         llm_purpose, llm_risk_score, llm_risk_reasoning,
         dependency_count, caller_count,
-        scan_frequency_minutes, analysis_period_hours,
+        scan_frequency_minutes, analysis_period_hours, observation_end_at,
         first_observed_at, last_observed_at, observation_count,
         has_traffic, last_traffic_at, traffic_count, zombie_score, zombie_verdict,
         final_zombie_score, final_verdict, final_confidence, final_reasoning,

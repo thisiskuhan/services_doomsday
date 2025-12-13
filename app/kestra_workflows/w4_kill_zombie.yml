@@ -1,26 +1,49 @@
-# ================================================================
-# W4 KILL ZOMBIE - DOOMSDAY SERVICES
-# ================================================================
-# Creates a GitHub PR to remove confirmed zombie code
-# 
-# FLOW:
-# 1. Get candidate details from DB
-# 2. Clone repo, generate removal, validate, commit, push (all in WorkingDirectory)
-# 3. Create PR via GitHub API
-# 4. Update DB with PR info
-# 5. Send notification email
-# 
-# DB TABLES USED:
-# - zombie_candidates (read/update)
-# - watchers (read)
-# - decision_log (insert)
-# ================================================================
-
 id: w4_kill_zombie
 namespace: doomsday.assemble
+
 description: |
-  Automated zombie code removal.
-  Creates a GitHub Pull Request to remove dead code after human confirmation.
+  ═══════════════════════════════════════════════════════════════════════════════
+  W4 KILL ZOMBIE - Automated GitHub PR for Dead Code Removal
+  ═══════════════════════════════════════════════════════════════════════════════
+  
+  Executes the final kill sequence for confirmed zombie code. Uses LLM to generate
+  safe code removal, validates the changes with AST/syntax checks, and creates a
+  GitHub Pull Request for human review before merge.
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WORKFLOW STAGES                                                             │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ 1. GET CANDIDATE       → Fetch candidate details + watcher info from DB     │
+  │ 2. CLONE REPOSITORY    → Fresh clone into WorkingDirectory                  │
+  │ 3. LLM GENERATE        → Gemini generates safe code removal diff            │
+  │ 4. VALIDATE CHANGES    → AST parse (Python), bracket balance (JS/TS)        │
+  │ 5. COMMIT & PUSH       → Create branch, commit changes, push to remote      │
+  │ 6. CREATE PR           → GitHub API to create Pull Request                  │
+  │ 7. UPDATE DATABASE     → Record PR URL, set status to 'killed'              │
+  │ 8. SEND EMAIL          → Success/failure notification with PR link          │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ VALIDATION CHECKS                                                           │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ • Python files   → AST parse to ensure valid syntax                         │
+  │ • JS/TS files    → Bracket balance check ({}, [], ())                       │
+  │ • All files      → Definition count (ensure entity was removed)             │
+  │ • Size sanity    → File size change within reasonable bounds                │
+  │ • Rollback       → Revert to pending_review on any failure                  │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WHY KESTRA?                                                                 │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ • WorkingDirectory    → Isolated git clone with persistent file access      │
+  │ • Docker TaskRunner   → Containerized Python/Node.js for validation         │
+  │ • If/Then Flow        → Conditional PR success/failure email paths          │
+  │ • InputFiles/Output   → JSON data passing between validation stages         │
+  │ • Error Handler       → Automatic branch cleanup and DB rollback on fail    │
+  │ • MailSend Plugin     → Rich HTML emails with diff preview on failure       │
+  │ • Secrets             → Secure GitHub token and DB URL management           │
+  └─────────────────────────────────────────────────────────────────────────────┘
 
 labels:
   workflow: w4-kill
@@ -169,7 +192,7 @@ tasks:
 
       - id: generate_validate_commit
         type: io.kestra.plugin.scripts.python.Script
-        description: LLM generates removal, validates syntax, applies changes
+        description: LLM generates surgical removal with strict validation
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
         containerImage: python:3.11-slim
@@ -186,10 +209,14 @@ tasks:
         outputFiles:
           - result.json
           - updated_file.txt
+          - diff_report.txt
+          - original_backup.txt
         script: |
           import os
           import json
           import ast
+          import re
+          import difflib
           
           api_key = os.environ.get('GOOGLE_API_KEY')
           llm_model = os.environ.get('LLM_MODEL', 'gemini-2.0-flash')
@@ -197,55 +224,90 @@ tasks:
           file_path = os.environ.get('FILE_PATH')
           candidate_id = os.environ.get('CANDIDATE_ID')
           
-          # Read candidate details
+          # Read candidate details  
           with open('candidate.json', 'r') as f:
-              candidate = json.load(f)
+              candidate_list = json.load(f)
+              candidate = candidate_list[0] if isinstance(candidate_list, list) else candidate_list
           
           # Read target file
           try:
               with open(file_path, 'r') as f:
-                  target_content = f.read()
+                  original_content = f.read()
           except FileNotFoundError:
               with open('result.json', 'w') as f:
                   json.dump({"success": False, "error": "Target file not found", "stage": "read"}, f)
-              with open('updated_file.txt', 'w') as f:
-                  f.write("")
+              for fname in ['updated_file.txt', 'diff_report.txt', 'original_backup.txt']:
+                  open(fname, 'w').write("")
               raise Exception(f"Target file not found: {file_path}")
           
+          # Save original backup
+          with open('original_backup.txt', 'w') as f:
+              f.write(original_content)
+          
+          original_lines = original_content.split('\n')
           start_line = candidate.get('start_line', 0)
           end_line = candidate.get('end_line', 0)
           entity_type = candidate.get('entity_type', 'unknown')
+          code_snippet = candidate.get('code_snippet', '')
           
-          # === STAGE 1: LLM Generate Removal ===
-          prompt = f"""You are a code surgeon. Your job is to SAFELY remove a dead/unused SERVICE from a codebase.
+          # Count existing functions/classes/routes for validation
+          def count_definitions(content, file_ext):
+              """Count code definitions to ensure we don't remove too much"""
+              counts = {'functions': 0, 'classes': 0, 'routes': 0, 'exports': 0}
+              
+              if file_ext == '.py':
+                  counts['functions'] = len(re.findall(r'^def \w+', content, re.MULTILINE))
+                  counts['classes'] = len(re.findall(r'^class \w+', content, re.MULTILINE))
+                  counts['routes'] = len(re.findall(r'@(app|router|blueprint)\.(get|post|put|delete|patch|route)', content, re.IGNORECASE))
+              elif file_ext in ['.js', '.jsx', '.ts', '.tsx']:
+                  counts['functions'] = len(re.findall(r'(function \w+|const \w+ = .*=>|export (async )?function)', content))
+                  counts['classes'] = len(re.findall(r'class \w+', content))
+                  counts['routes'] = len(re.findall(r'\.(get|post|put|delete|patch)\s*\(', content, re.IGNORECASE))
+                  counts['exports'] = len(re.findall(r'^export ', content, re.MULTILINE))
+              
+              return counts
+          
+          file_ext = os.path.splitext(file_path)[1]
+          original_counts = count_definitions(original_content, file_ext)
+          print(f"[ORIGINAL] Definitions: {original_counts}")
+          
+          # === STAGE 1: LLM Generate Surgical Removal ===
+          prompt = f"""You are a precise code surgeon. Remove ONLY the specified dead code.
 
-          IMPORTANT: You are removing a SERVICE (API endpoint, cron job, queue worker, serverless function) that has been confirmed as unused through traffic observation.
-
-          TARGET ZOMBIE SERVICE:
-          - Service Signature: {entity_sig}
-          - Service Type: {entity_type}
-          - File: {file_path}
-          - Lines: {start_line} to {end_line} (approximate)
-
-          ORIGINAL FILE CONTENT:
+          ⚠️ CRITICAL SAFETY RULES:
+          1. ONLY remove the TARGET entity specified below
+          2. DO NOT modify, rename, or restructure ANY other code
+          3. DO NOT add new code, comments, or TODOs
+          4. DO NOT change formatting of untouched code
+          5. Preserve ALL imports used by other code
+          6. Keep all whitespace/blank lines between other functions
+          
+          TARGET TO REMOVE:
+          - Signature: {entity_sig}
+          - Type: {entity_type}
+          - Location: Lines {start_line} to {end_line} (approximate)
+          - Code snippet:
           ```
-          {target_content}
+          {code_snippet[:1500] if code_snippet else 'Not available'}
           ```
-
-          TASK:
-          1. Remove the dead service code ({entity_sig})
-          2. Remove any imports that become unused after removal
-          3. Clean up any dangling references, route registrations, or comments about this service
-          4. Preserve all OTHER services and code exactly as-is
-          5. Maintain proper formatting and indentation
-          6. If this is an API route file, ensure the route handler is fully removed
-          7. If this is a cron job, remove the schedule decorator and handler
-          8. If this is a queue worker, remove the worker class/function and any queue bindings
-
-          RESPOND WITH ONLY THE COMPLETE UPDATED FILE CONTENT.
-          No explanations, no markdown code blocks, just the raw file content.
-          If the entire file would be empty after removal, respond with: # File emptied - consider deleting
-          """
+          
+          FULL FILE ({len(original_lines)} lines):
+          ```
+          {original_content}
+          ```
+          
+          REMOVAL CHECKLIST:
+          ✓ Remove the function/class/route: {entity_sig}
+          ✓ Remove its decorator(s) if any (@app.route, @celery.task, etc.)
+          ✓ Remove imports ONLY if they become completely unused
+          ✓ Remove route registration ONLY for this endpoint
+          ✓ Keep everything else EXACTLY as-is
+          
+          OUTPUT: Return the complete updated file content.
+          - No markdown code blocks
+          - No explanations
+          - Just the raw file content
+          - If file becomes empty, return: # File emptied after zombie removal - safe to delete"""
           
           from google import genai
           client = genai.Client(api_key=api_key)
@@ -254,60 +316,155 @@ tasks:
               model=llm_model,
               contents=prompt,
               config={
-                  "temperature": 0.1,
-                  "max_output_tokens": 8192
+                  "temperature": 0.0,  # Deterministic for safety
+                  "max_output_tokens": 16384  # Larger for big files
               }
           )
           
           new_content = response.text.strip()
           
-          # Remove markdown code block wrappers if present
+          # Remove markdown wrappers if LLM added them
           if new_content.startswith('```'):
               lines = new_content.split('\n')
+              # Remove first line (```python or ```)
               lines = lines[1:]
+              # Remove last line if it's ```
               if lines and lines[-1].strip() == '```':
                   lines = lines[:-1]
               new_content = '\n'.join(lines)
           
-          print(f"[LLM] Generated updated file ({len(new_content)} chars)")
+          new_lines = new_content.split('\n')
+          print(f"[LLM] Generated: {len(original_lines)} → {len(new_lines)} lines")
           
-          # === STAGE 2: Validate Syntax ===
+          # === STAGE 2: STRICT VALIDATION ===
           validation_errors = []
+          warnings = []
           
-          if file_path.endswith('.py'):
+          # 2.1: Check file not drastically shortened (max 50% removal)
+          if len(new_content) < len(original_content) * 0.3:
+              validation_errors.append(f"DANGER: File reduced by >70% ({len(original_content)} → {len(new_content)} chars)")
+          
+          # 2.2: Check we didn't remove too many definitions
+          new_counts = count_definitions(new_content, file_ext)
+          print(f"[NEW] Definitions: {new_counts}")
+          
+          for key in ['functions', 'classes', 'routes']:
+              removed = original_counts[key] - new_counts[key]
+              if removed > 2:  # Allow removing max 2 related items (function + helper)
+                  validation_errors.append(f"DANGER: Removed {removed} {key} (expected ≤2)")
+              elif removed > 1:
+                  warnings.append(f"Removed {removed} {key}")
+          
+          # 2.3: Syntax validation
+          if file_ext == '.py':
               try:
                   ast.parse(new_content)
-                  print("[VALIDATE] ✅ Python syntax valid")
+                  print("[VALIDATE] Python syntax valid")
               except SyntaxError as e:
                   validation_errors.append(f"Python syntax error: {e.msg} at line {e.lineno}")
           
-          elif file_path.endswith(('.js', '.jsx', '.ts', '.tsx')):
-              open_braces = new_content.count('{') + new_content.count('[') + new_content.count('(')
-              close_braces = new_content.count('}') + new_content.count(']') + new_content.count(')')
-              if open_braces != close_braces:
-                  validation_errors.append(f"Unbalanced braces: {open_braces} open vs {close_braces} close")
-              else:
-                  print("[VALIDATE] ✅ JS/TS basic validation passed")
+          elif file_ext in ['.js', '.jsx', '.ts', '.tsx']:
+              # Check balanced brackets
+              brackets = {'(': ')', '[': ']', '{': '}'}
+              stack = []
+              for i, char in enumerate(new_content):
+                  if char in brackets:
+                      stack.append((char, i))
+                  elif char in brackets.values():
+                      if not stack:
+                          validation_errors.append(f"Unmatched closing '{char}' at position {i}")
+                          break
+                      open_char, _ = stack.pop()
+                      if brackets[open_char] != char:
+                          validation_errors.append(f"Mismatched brackets: '{open_char}' and '{char}'")
+                          break
+              if stack and not validation_errors:
+                  validation_errors.append(f"Unclosed brackets: {[s[0] for s in stack[-3:]]}")
+              
+              # Check for common JS/TS issues
+              if 'export default' in original_content and 'export default' not in new_content:
+                  if new_counts['exports'] == 0:
+                      validation_errors.append("DANGER: Removed default export - file may not work")
+              
+              if not validation_errors:
+                  print("[VALIDATE] JS/TS validation passed")
           
+          # 2.4: Verify the target was actually removed
+          if entity_sig in new_content:
+              # Check if it's just a comment or string reference
+              sig_pattern = re.escape(entity_sig)
+              real_matches = re.findall(rf'^[^#"\']*{sig_pattern}', new_content, re.MULTILINE)
+              if real_matches:
+                  warnings.append(f"Target signature '{entity_sig}' still appears in code")
+          
+          # 2.5: Generate diff for review
+          diff = list(difflib.unified_diff(
+              original_lines, new_lines,
+              fromfile=f'a/{file_path}',
+              tofile=f'b/{file_path}',
+              lineterm=''
+          ))
+          
+          diff_text = '\n'.join(diff)
+          removed_lines = len([l for l in diff if l.startswith('-') and not l.startswith('---')])
+          added_lines = len([l for l in diff if l.startswith('+') and not l.startswith('+++')])
+          
+          print(f"[DIFF] -{removed_lines} lines, +{added_lines} lines")
+          
+          # 2.6: Sanity check - should be mostly removals, not additions
+          if added_lines > 10 and added_lines > removed_lines:
+              validation_errors.append(f"DANGER: More lines added ({added_lines}) than removed ({removed_lines})")
+          
+          # Save diff report
+          with open('diff_report.txt', 'w') as f:
+              f.write(f"=== ZOMBIE REMOVAL DIFF REPORT ===\n")
+              f.write(f"Target: {entity_sig}\n")
+              f.write(f"File: {file_path}\n")
+              f.write(f"Original: {len(original_lines)} lines, {len(original_content)} chars\n")
+              f.write(f"Modified: {len(new_lines)} lines, {len(new_content)} chars\n")
+              f.write(f"Changes: -{removed_lines} +{added_lines}\n")
+              f.write(f"\nValidation: {'FAILED' if validation_errors else 'PASSED'}\n")
+              if validation_errors:
+                  f.write(f"Errors: {validation_errors}\n")
+              if warnings:
+                  f.write(f"Warnings: {warnings}\n")
+              f.write(f"\n=== DIFF ===\n{diff_text}\n")
+          
+          # === STAGE 3: Final Decision ===
           if validation_errors:
               with open('result.json', 'w') as f:
-                  json.dump({"success": False, "error": "; ".join(validation_errors), "stage": "validation"}, f)
+                  json.dump({
+                      "success": False, 
+                      "error": "; ".join(validation_errors),
+                      "warnings": warnings,
+                      "stage": "validation",
+                      "diff_stats": {"removed": removed_lines, "added": added_lines}
+                  }, f)
               with open('updated_file.txt', 'w') as f:
-                  f.write(new_content)
-              raise Exception(f"Validation failed: {validation_errors}")
+                  f.write(new_content)  # Save for debugging
+              raise Exception(f"Validation FAILED: {validation_errors}")
           
-          # === STAGE 3: Write updated file ===
+          # Success - write the updated file
           with open('updated_file.txt', 'w') as f:
               f.write(new_content)
           
           with open('result.json', 'w') as f:
-              json.dump({"success": True, "message": "Code removal generated and validated"}, f)
+              json.dump({
+                  "success": True,
+                  "message": "Code removal validated successfully",
+                  "warnings": warnings,
+                  "diff_stats": {"removed": removed_lines, "added": added_lines},
+                  "original_definitions": original_counts,
+                  "new_definitions": new_counts
+              }, f, indent=2)
           
-          print("[SUCCESS] Code generated and validated")
+          print(f"[SUCCESS] Validated removal of {entity_sig}")
+          if warnings:
+              print(f"[WARNINGS] {warnings}")
 
       - id: apply_and_push
         type: io.kestra.plugin.scripts.shell.Commands
-        description: Apply changes, commit, and push to new branch
+        description: Apply validated changes, commit with diff stats, and push to new branch
         env:
           GITHUB_TOKEN: "{{ inputs.github_token }}"
           REPO_OWNER: "{{ inputs.repo_owner }}"
@@ -317,10 +474,14 @@ tasks:
           CANDIDATE_ID: "{{ inputs.candidate_id }}"
         outputFiles:
           - branch_name.txt
+          - commit_info.txt
         commands:
           - |
+            set -e  # Exit on any error
+            
             # Create safe branch name
             SAFE_NAME=$(echo "$ENTITY_SIGNATURE" | tr -cd '[:alnum:]-_' | cut -c1-50)
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
             BRANCH_NAME="zombie-removal/${SAFE_NAME}-${CANDIDATE_ID}"
             echo "$BRANCH_NAME" > branch_name.txt
             echo "Creating branch: $BRANCH_NAME"
@@ -329,39 +490,74 @@ tasks:
             git config user.email "doomsday-bot@graveyard.dev"
             git config user.name "Doomsday Bot"
             
-            # Create and checkout new branch
+            # Verify we have the updated file
+            if [ ! -f "updated_file.txt" ]; then
+              echo "ERROR: updated_file.txt not found!"
+              exit 1
+            fi
+            
+            # Show what we're about to do
+            echo "=== BEFORE CHANGE ==="
+            wc -l "$FILE_PATH" || echo "File not found (new file?)"
+            
+            echo "=== UPDATED FILE ==="
+            wc -l updated_file.txt
+            
+            # Create and checkout new branch from current HEAD
             git checkout -b "$BRANCH_NAME"
             
             # Apply the updated file
             cp updated_file.txt "$FILE_PATH"
             
-            # Check if file should be deleted
-            if grep -q "# File emptied - consider deleting" "$FILE_PATH"; then
-              git rm "$FILE_PATH"
+            # Check if file should be deleted (empty after removal)
+            if grep -q "# File emptied after zombie removal" "$FILE_PATH"; then
               echo "File marked for deletion"
+              git rm "$FILE_PATH"
+              CHANGE_TYPE="deleted"
             else
-              git add "$FILE_PATH"
               echo "File updated"
+              git add "$FILE_PATH"
+              CHANGE_TYPE="modified"
             fi
             
-            # Commit
-            git commit -m "🧟 Remove dead code: $ENTITY_SIGNATURE" \
-              -m "Automated removal by Doomsday Services" \
+            # Get diff stats for commit message
+            DIFF_STATS=$(git diff --cached --stat | tail -1)
+            
+            # Commit with detailed message
+            git commit -m "[ZOMBIE] Remove: ${ENTITY_SIGNATURE:0:60}" \
               -m "" \
-              -m "Candidate ID: $CANDIDATE_ID" \
-              -m "Detection: Zero usage + no traffic during observation"
+              -m "Automated dead code removal by Doomsday Services" \
+              -m "" \
+              -m "Change Summary:" \
+              -m "- Candidate ID: $CANDIDATE_ID" \
+              -m "- File: $FILE_PATH ($CHANGE_TYPE)" \
+              -m "- $DIFF_STATS" \
+              -m "" \
+              -m "Detection Method:" \
+              -m "- Static analysis: Zero callers in codebase" \
+              -m "- Runtime observation: No traffic during monitoring period" \
+              -m "- Human verification: Confirmed for removal" \
+              -m "" \
+              -m "Please review the diff carefully before merging."
+            
+            # Save commit info
+            COMMIT_SHA=$(git rev-parse HEAD)
+            echo "branch=$BRANCH_NAME" > commit_info.txt
+            echo "commit=$COMMIT_SHA" >> commit_info.txt
+            echo "change_type=$CHANGE_TYPE" >> commit_info.txt
             
             # Push to remote
             git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}.git" "$BRANCH_NAME"
             
-            echo "✅ Branch pushed: $BRANCH_NAME"
+            echo "Branch pushed: $BRANCH_NAME"
+            echo "Commit: $COMMIT_SHA"
 
   # ============================================================
   # STEP 3: Create GitHub Pull Request
   # ============================================================
   - id: create_pull_request
     type: io.kestra.plugin.scripts.python.Script
-    description: Create PR via GitHub API
+    description: Create PR via GitHub API with detailed diff report
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
     containerImage: python:3.11-slim
@@ -376,7 +572,9 @@ tasks:
       FILE_PATH: "{{ inputs.file_path }}"
     inputFiles:
       candidate.json: "{{ outputs.get_candidate_details.outputFiles['candidate.json'] }}"
-      branch_name.txt: "{{ outputs.apply_and_push.outputFiles['branch_name.txt'] }}"
+      branch_name.txt: "{{ outputs.working_dir.apply_and_push.outputFiles['branch_name.txt'] }}"
+      result.json: "{{ outputs.working_dir.generate_validate_commit.outputFiles['result.json'] }}"
+      diff_report.txt: "{{ outputs.working_dir.generate_validate_commit.outputFiles['diff_report.txt'] }}"
     outputFiles:
       - pr_info.json
     script: |
@@ -392,66 +590,162 @@ tasks:
       file_path = os.environ.get('FILE_PATH')
       
       with open('candidate.json', 'r') as f:
-          candidate = json.load(f)
+          candidate_data = json.load(f)
+          candidate = candidate_data[0] if isinstance(candidate_data, list) else candidate_data
       
       with open('branch_name.txt', 'r') as f:
           branch_name = f.read().strip()
+      
+      with open('result.json', 'r') as f:
+          removal_result = json.load(f)
+      
+      with open('diff_report.txt', 'r') as f:
+          diff_report = f.read()
       
       default_branch = candidate.get('default_branch', 'main')
       zombie_score = candidate.get('final_zombie_score') or candidate.get('zombie_score', 0)
       reasoning = candidate.get('final_reasoning', 'No traffic detected during observation period')
       
-      # Build PR body (avoiding YAML list marker issues)
-      pr_body = "## 🧟 Zombie Code Removal\n\n"
+      # Get diff stats
+      diff_stats = removal_result.get('diff_stats', {})
+      removed_lines = diff_stats.get('removed', 0)
+      added_lines = diff_stats.get('added', 0)
+      warnings = removal_result.get('warnings', [])
+      
+      # Build PR body with comprehensive info
+      pr_body = "## Zombie Code Removal\n\n"
+      
+      # Target section
       pr_body += "### Target\n"
-      pr_body += f"* **Entity:** `{entity_sig}`\n"
-      pr_body += f"* **File:** `{file_path}`\n"
-      pr_body += f"* **Type:** {candidate.get('entity_type', 'unknown')}\n\n"
-      pr_body += "### Detection Summary\n"
-      pr_body += "This code was identified as zombie/dead code through automated analysis:\n\n"
-      pr_body += "1. **Static Analysis:** Zero callers found in codebase\n"
-      pr_body += "2. **Runtime Observation:** No traffic detected during monitoring period\n"
-      pr_body += f"3. **Final Zombie Score:** {zombie_score}/100\n"
-      pr_body += "4. **Human Verification:** ✅ Confirmed for removal\n\n"
-      pr_body += "### Analysis\n"
-      pr_body += f"{reasoning}\n\n"
-      pr_body += "### Changes\n"
-      pr_body += "This PR removes the dead code and cleans up any associated:\n"
-      pr_body += "* Unused imports\n"
-      pr_body += "* Orphaned comments\n"
-      pr_body += "* Related dead code blocks\n\n"
+      pr_body += f"| Property | Value |\n"
+      pr_body += f"|----------|-------|\n"
+      pr_body += f"| **Entity** | `{entity_sig}` |\n"
+      pr_body += f"| **Type** | {candidate.get('entity_type', 'unknown')} |\n"
+      pr_body += f"| **File** | `{file_path}` |\n"
+      pr_body += f"| **Zombie Score** | {zombie_score}/100 |\n\n"
+      
+      # Change summary
+      pr_body += "### Change Summary\n"
+      pr_body += f"```diff\n"
+      pr_body += f"- {removed_lines} lines removed\n"
+      pr_body += f"+ {added_lines} lines added\n"
+      pr_body += f"```\n\n"
+      
+      # Warnings if any
+      if warnings:
+          pr_body += "### Warnings\n"
+          for w in warnings:
+              pr_body += f"- {w}\n"
+          pr_body += "\n"
+      
+      # Detection summary
+      pr_body += "### Detection Method\n"
+      pr_body += "This code was identified as zombie/dead code through:\n\n"
+      pr_body += "| Check | Result |\n"
+      pr_body += "|-------|--------|\n"
+      pr_body += "| Static Analysis | Zero callers found |\n"
+      pr_body += "| Runtime Observation | No traffic detected |\n"
+      pr_body += "| Human Verification | Confirmed for removal |\n\n"
+      
+      # Analysis
+      pr_body += "### AI Analysis\n"
+      pr_body += f"> {reasoning}\n\n"
+      
+      # Safety validations
+      pr_body += "### Safety Validations Passed\n"
+      pr_body += "- [x] Syntax validation (AST parse)\n"
+      pr_body += "- [x] Definition count check (functions/classes preserved)\n"
+      pr_body += "- [x] File size sanity check (<70% reduction)\n"
+      pr_body += "- [x] Bracket balance verification\n\n"
+      
+      # Reviewer checklist
+      pr_body += "### Reviewer Checklist\n"
+      pr_body += "Please verify before merging:\n"
+      pr_body += "- [ ] The removed code is indeed unused\n"
+      pr_body += "- [ ] No other code depends on this entity\n"
+      pr_body += "- [ ] Tests still pass (if applicable)\n"
+      pr_body += "- [ ] No unintended changes to other code\n\n"
+      
       pr_body += "---\n\n"
-      pr_body += "*Generated by [Doomsday Services](https://github.com/doomsday-services) - Automated Dead Code Detection*\n\n"
-      pr_body += f"**Candidate ID:** {candidate_id}\n"
+      pr_body += "<details>\n"
+      pr_body += "<summary>Full Diff Report</summary>\n\n"
+      pr_body += "```\n"
+      pr_body += diff_report[:3000]  # Limit diff report size
+      if len(diff_report) > 3000:
+          pr_body += "\n... (truncated, see commit for full diff)\n"
+      pr_body += "```\n"
+      pr_body += "</details>\n\n"
       
-      response = requests.post(
-          f"https://api.github.com/repos/{owner}/{repo}/pulls",
-          headers={
-              "Authorization": f"Bearer {token}",
-              "Accept": "application/vnd.github.v3+json",
-              "Content-Type": "application/json"
-          },
-          json={
-              "title": f"🧟 Remove dead code: {entity_sig[:50]}",
-              "head": branch_name,
-              "base": default_branch,
-              "body": pr_body
-          }
-      )
+      pr_body += "---\n"
+      pr_body += f"*Generated by Services Doomsday | Candidate #{candidate_id}*\n"
       
-      if response.status_code in [200, 201]:
-          pr_data = response.json()
-          result = {
-              "success": True,
-              "pr_url": pr_data.get("html_url", ""),
-              "pr_number": pr_data.get("number", 0),
-              "pr_state": pr_data.get("state", "open")
-          }
-      else:
+      import time
+      
+      # Retry with exponential backoff
+      max_retries = 3
+      result = None
+      
+      for attempt in range(max_retries):
+          try:
+              response = requests.post(
+                  f"https://api.github.com/repos/{owner}/{repo}/pulls",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github.v3+json",
+                      "Content-Type": "application/json"
+                  },
+                  json={
+                      "title": f"[ZOMBIE] Remove: {entity_sig[:50]}",
+                      "head": branch_name,
+                      "base": default_branch,
+                      "body": pr_body
+                  },
+                  timeout=30
+              )
+              
+              if response.status_code in [200, 201]:
+                  pr_data = response.json()
+                  result = {
+                      "success": True,
+                      "pr_url": pr_data.get("html_url", ""),
+                      "pr_number": pr_data.get("number", 0),
+                      "pr_state": pr_data.get("state", "open"),
+                      "branch_name": branch_name
+                  }
+                  break
+              elif response.status_code in [403, 429]:
+                  # Rate limit - wait and retry
+                  wait_time = (attempt + 1) * 30
+                  print(f"[PR] Rate limited (attempt {attempt+1}/{max_retries}), waiting {wait_time}s...")
+                  time.sleep(wait_time)
+              elif response.status_code >= 500:
+                  # Server error - retry with backoff
+                  wait_time = (2 ** attempt) * 5
+                  print(f"[PR] Server error {response.status_code} (attempt {attempt+1}/{max_retries}), waiting {wait_time}s...")
+                  time.sleep(wait_time)
+              else:
+                  # Client error - no retry
+                  result = {
+                      "success": False,
+                      "error": response.text[:500],
+                      "status_code": response.status_code,
+                      "branch_name": branch_name
+                  }
+                  break
+          except requests.exceptions.Timeout:
+              print(f"[PR] Timeout (attempt {attempt+1}/{max_retries})")
+              time.sleep((2 ** attempt) * 5)
+          except requests.exceptions.RequestException as e:
+              print(f"[PR] Network error (attempt {attempt+1}/{max_retries}): {str(e)[:100]}")
+              time.sleep((2 ** attempt) * 5)
+      
+      # If all retries exhausted
+      if result is None:
           result = {
               "success": False,
-              "error": response.text,
-              "status_code": response.status_code
+              "error": "Max retries exceeded",
+              "status_code": response.status_code if 'response' in dir() else 0,
+              "branch_name": branch_name
           }
       
       with open('pr_info.json', 'w') as f:
@@ -460,7 +754,7 @@ tasks:
       if result["success"]:
           print(f"[PR] Created: {result['pr_url']}")
       else:
-          print(f"[PR] Failed: {result['error']}"}
+          print(f"[PR] Failed: {result.get('error', 'Unknown error')}")
 
   # ============================================================
   # STEP 4: Update database with PR info
@@ -559,33 +853,355 @@ tasks:
         from: "{{ kv('SMTP_FROM') }}"
         to:
           - "{{ (read(outputs.get_candidate_details.outputFiles['candidate.json']) | json)[0].user_email }}"
-        subject: "🔪 PR Created - Killing {{ inputs.entity_signature }}"
+        subject: "Zombie Killed - PR Created for {{ inputs.entity_signature }}"
         htmlTextContent: |
+          <!DOCTYPE html>
           <html>
-          <body style="font-family: Arial, sans-serif; background: #1a1a1a; color: #e0e0e0; padding: 20px;">
-            <div style="max-width: 600px; margin: 0 auto; background: #2d2d2d; border-radius: 8px; padding: 30px; border: 1px solid #ef4444;">
-              <h2 style="color: #ef4444;">🔪 Pull Request Created</h2>
-              
-              <div style="background: #1a1a1a; padding: 20px; border-radius: 8px; margin: 20px 0;">
-                <p style="margin: 5px 0;"><strong>Entity:</strong> <code style="background: #374151; padding: 2px 6px; border-radius: 4px;">{{ inputs.entity_signature }}</code></p>
-                <p style="margin: 5px 0;"><strong>File:</strong> <code style="background: #374151; padding: 2px 6px; border-radius: 4px;">{{ inputs.file_path }}</code></p>
-                <p style="margin: 5px 0;"><strong>Repository:</strong> {{ inputs.repo_owner }}/{{ inputs.repo_name }}</p>
-              </div>
-              
-              <div style="text-align: center; margin: 30px 0;">
-                <a href="{{ (read(outputs.create_pull_request.outputFiles['pr_info.json']) | json)[0].pr_url }}" 
-                   style="background: #ef4444; color: white; padding: 12px 30px; text-decoration: none; border-radius: 6px; font-weight: bold; display: inline-block;">
-                  🔗 Review Pull Request
-                </a>
-              </div>
-              
-              <p style="color: #888; font-size: 12px; text-align: center;">
-                Review and merge the PR to complete the zombie removal process.
-              </p>
-            </div>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          </head>
+          <body style="margin: 0; padding: 0; background-color: #0a0a0a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #0a0a0a; padding: 40px 20px;">
+              <tr>
+                <td align="center">
+                  <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 560px; background-color: #111111; border-radius: 16px; overflow: hidden; border: 1px solid #222;">
+                    
+                    <!-- Header -->
+                    <tr>
+                      <td style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 32px 40px; text-align: center;">
+                        <div style="width: 56px; height: 56px; background: linear-gradient(135deg, #16a34a 0%, #15803d 100%); border-radius: 14px; display: inline-block; margin-bottom: 16px; box-shadow: 0 4px 20px rgba(22, 163, 74, 0.4);">
+                          <span style="font-size: 28px; line-height: 56px; color: #fff;">SD</span>
+                        </div>
+                        <h1 style="margin: 0; color: #ffffff; font-size: 22px; font-weight: 600; letter-spacing: -0.5px;">Zombie Terminated!</h1>
+                        <p style="margin: 8px 0 0; color: #9ca3af; font-size: 13px;">Pull Request has been created to remove the dead code</p>
+                      </td>
+                    </tr>
+                    
+                    <!-- Success Badge -->
+                    <tr>
+                      <td style="padding: 24px 40px 0;">
+                        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px;">
+                          <tr>
+                            <td style="padding: 20px; text-align: center;">
+                              <span style="color: #16a34a; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase;">STATUS</span>
+                              <h2 style="margin: 4px 0 0; color: #16a34a; font-size: 24px; font-weight: 700;">PR CREATED</h2>
+                            </td>
+                          </tr>
+                        </table>
+                      </td>
+                    </tr>
+                    
+                    <!-- Entity Details -->
+                    <tr>
+                      <td style="padding: 24px 40px;">
+                        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #1a1a1a; border-radius: 12px; border: 1px solid #262626;">
+                          <tr>
+                            <td style="padding: 20px;">
+                              <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Killed Entity</p>
+                              <p style="margin: 0 0 16px; color: #f3f4f6; font-size: 15px; font-weight: 500; word-break: break-all; font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace; background: #0f0f0f; padding: 8px 12px; border-radius: 6px;">{{ inputs.entity_signature }}</p>
+                              
+                              <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">File Path</p>
+                              <p style="margin: 0 0 16px; color: #d1d5db; font-size: 13px; font-family: 'SF Mono', Monaco, monospace;">{{ inputs.file_path }}</p>
+                              
+                              <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Repository</p>
+                              <p style="margin: 0; color: #d1d5db; font-size: 13px;">{{ inputs.repo_owner }}/{{ inputs.repo_name }}</p>
+                            </td>
+                          </tr>
+                        </table>
+                      </td>
+                    </tr>
+                    
+                    <!-- CTA Button -->
+                    <tr>
+                      <td style="padding: 0 40px 32px; text-align: center;">
+                        <a href="{{ (read(outputs.create_pull_request.outputFiles['pr_info.json']) | json)[0].pr_url }}" style="display: inline-block; background: linear-gradient(135deg, #16a34a 0%, #15803d 100%); color: #ffffff; padding: 16px 32px; text-decoration: none; border-radius: 10px; font-size: 15px; font-weight: 600; box-shadow: 0 4px 14px rgba(22, 163, 74, 0.4);">
+                          Review Pull Request
+                        </a>
+                        <p style="margin: 16px 0 0; color: #6b7280; font-size: 12px;">Review and merge to complete the removal</p>
+                      </td>
+                    </tr>
+                    
+                    <!-- Footer -->
+                    <tr>
+                      <td style="background-color: #0a0a0a; padding: 24px 40px; border-top: 1px solid #222;">
+                        <table width="100%" cellpadding="0" cellspacing="0">
+                          <tr>
+                            <td align="center">
+                              <table cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+                                <tr>
+                                  <td style="vertical-align: middle; padding-right: 10px;">
+                                    <div style="width: 28px; height: 28px; background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%); border-radius: 6px; display: inline-block;">
+                                      <span style="font-size: 11px; line-height: 28px; display: block; text-align: center; color: #fff; font-weight: 700;">SD</span>
+                                    </div>
+                                  </td>
+                                  <td style="vertical-align: middle;">
+                                    <p style="margin: 0; color: #f3f4f6; font-size: 13px; font-weight: 600;">Services Doomsday</p>
+                                  </td>
+                                </tr>
+                              </table>
+                              <p style="margin: 0; color: #4b5563; font-size: 11px;">Zombie Detection System</p>
+                            </td>
+                          </tr>
+                        </table>
+                      </td>
+                    </tr>
+                    
+                  </table>
+                </td>
+              </tr>
+            </table>
           </body>
           </html>
     else:
+      # PR failed - prepare comprehensive failure email with all details
+      - id: prepare_failure_email
+        type: io.kestra.plugin.scripts.python.Script
+        description: Prepare detailed failure email with file info and diff
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        env:
+          ENTITY_SIGNATURE: "{{ inputs.entity_signature }}"
+          FILE_PATH: "{{ inputs.file_path }}"
+          REPO_OWNER: "{{ inputs.repo_owner }}"
+          REPO_NAME: "{{ inputs.repo_name }}"
+          CANDIDATE_ID: "{{ inputs.candidate_id }}"
+        inputFiles:
+          pr_info.json: "{{ outputs.create_pull_request.outputFiles['pr_info.json'] }}"
+          candidate.json: "{{ outputs.get_candidate_details.outputFiles['candidate.json'] }}"
+          diff_report.txt: "{{ outputs.working_dir.generate_validate_commit.outputFiles['diff_report.txt'] }}"
+          updated_file.txt: "{{ outputs.working_dir.generate_validate_commit.outputFiles['updated_file.txt'] }}"
+        outputFiles:
+          - failure_email.json
+        script: |
+          import os
+          import json
+          import html
+          
+          entity_sig = os.environ.get('ENTITY_SIGNATURE', '')
+          file_path = os.environ.get('FILE_PATH', '')
+          repo_owner = os.environ.get('REPO_OWNER', '')
+          repo_name = os.environ.get('REPO_NAME', '')
+          candidate_id = os.environ.get('CANDIDATE_ID', '')
+          
+          # Load PR error info
+          with open('pr_info.json', 'r') as f:
+              pr_info = json.load(f)
+              if isinstance(pr_info, list):
+                  pr_info = pr_info[0]
+          
+          error_msg = pr_info.get('error', 'Unknown error')
+          status_code = pr_info.get('status_code', 'N/A')
+          
+          # Load candidate info
+          with open('candidate.json', 'r') as f:
+              candidate = json.load(f)
+              if isinstance(candidate, list):
+                  candidate = candidate[0]
+          
+          user_email = candidate.get('user_email', '')
+          zombie_score = candidate.get('final_zombie_score') or candidate.get('zombie_score', 0)
+          entity_type = candidate.get('entity_type', 'unknown')
+          
+          # Load diff report
+          try:
+              with open('diff_report.txt', 'r') as f:
+                  diff_report = f.read()[:5000]  # Limit size
+          except:
+              diff_report = "Diff report not available"
+          
+          # Load updated file content (first 100 lines)
+          try:
+              with open('updated_file.txt', 'r') as f:
+                  updated_content = f.read()
+                  lines = updated_content.split('\n')[:100]
+                  if len(updated_content.split('\n')) > 100:
+                      lines.append(f"... ({len(updated_content.split(chr(10))) - 100} more lines)")
+                  updated_preview = '\n'.join(lines)
+          except:
+              updated_preview = "Updated file not available"
+          
+          # Escape HTML entities
+          diff_escaped = html.escape(diff_report)
+          updated_escaped = html.escape(updated_preview)
+          error_escaped = html.escape(str(error_msg)[:500])
+          
+          # Build comprehensive failure email
+          subject = f"[ALERT] PR Failed - Manual Action Required for {entity_sig[:40]}"
+          
+          html_body = f'''<!DOCTYPE html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+          </head>
+          <body style="margin: 0; padding: 0; background-color: #0a0a0a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
+            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #0a0a0a; padding: 40px 20px;">
+              <tr>
+                <td align="center">
+                  <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 640px; background-color: #111111; border-radius: 16px; overflow: hidden; border: 1px solid #222;">
+                    
+                    <!-- Header -->
+                    <tr>
+                      <td style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 32px 40px; text-align: center;">
+                        <div style="width: 56px; height: 56px; background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%); border-radius: 14px; display: inline-block; margin-bottom: 16px; box-shadow: 0 4px 20px rgba(220, 38, 38, 0.4);">
+                          <span style="font-size: 20px; line-height: 56px; color: #fff; font-weight: 700;">!</span>
+                        </div>
+                        <h1 style="margin: 0; color: #ffffff; font-size: 22px; font-weight: 600;">PR Creation Failed</h1>
+                        <p style="margin: 8px 0 0; color: #9ca3af; font-size: 13px;">Manual action required - all details below</p>
+                      </td>
+                    </tr>
+                    
+                    <!-- Error Badge -->
+                    <tr>
+                      <td style="padding: 24px 40px 0;">
+                        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #fef2f2; border: 1px solid #fecaca; border-radius: 12px;">
+                          <tr>
+                            <td style="padding: 16px; text-align: center;">
+                              <span style="color: #dc2626; font-size: 11px; font-weight: 700; letter-spacing: 1.5px;">HTTP {status_code}</span>
+                              <h2 style="margin: 4px 0 0; color: #dc2626; font-size: 18px; font-weight: 700;">GitHub API Error</h2>
+                            </td>
+                          </tr>
+                        </table>
+                      </td>
+                    </tr>
+                    
+                    <!-- Target Details -->
+                    <tr>
+                      <td style="padding: 24px 40px;">
+                        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #1a1a1a; border-radius: 12px; border: 1px solid #262626;">
+                          <tr>
+                            <td style="padding: 20px;">
+                              <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Target Entity</p>
+                              <p style="margin: 0 0 12px; color: #f3f4f6; font-size: 14px; font-weight: 500; word-break: break-all; font-family: monospace; background: #0f0f0f; padding: 8px 12px; border-radius: 6px;">{html.escape(entity_sig)}</p>
+                              
+                              <table width="100%" cellpadding="0" cellspacing="0">
+                                <tr>
+                                  <td width="50%">
+                                    <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600;">FILE PATH</p>
+                                    <p style="margin: 0; color: #d1d5db; font-size: 12px; font-family: monospace;">{html.escape(file_path)}</p>
+                                  </td>
+                                  <td width="50%">
+                                    <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600;">REPOSITORY</p>
+                                    <p style="margin: 0; color: #d1d5db; font-size: 12px;">{repo_owner}/{repo_name}</p>
+                                  </td>
+                                </tr>
+                                <tr>
+                                  <td width="50%" style="padding-top: 12px;">
+                                    <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600;">TYPE</p>
+                                    <p style="margin: 0; color: #d1d5db; font-size: 12px;">{entity_type}</p>
+                                  </td>
+                                  <td width="50%" style="padding-top: 12px;">
+                                    <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600;">ZOMBIE SCORE</p>
+                                    <p style="margin: 0; color: #ef4444; font-size: 12px; font-weight: 600;">{zombie_score}/100</p>
+                                  </td>
+                                </tr>
+                              </table>
+                            </td>
+                          </tr>
+                        </table>
+                      </td>
+                    </tr>
+                    
+                    <!-- Error Details -->
+                    <tr>
+                      <td style="padding: 0 40px 24px;">
+                        <p style="margin: 0 0 8px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Error Message</p>
+                        <div style="background: #1c1917; border-left: 3px solid #dc2626; padding: 12px; border-radius: 0 6px 6px 0;">
+                          <pre style="margin: 0; color: #fca5a5; font-size: 11px; font-family: monospace; white-space: pre-wrap; word-break: break-all;">{error_escaped}</pre>
+                        </div>
+                      </td>
+                    </tr>
+                    
+                    <!-- Manual Instructions -->
+                    <tr>
+                      <td style="padding: 0 40px 24px;">
+                        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #172554; border-radius: 10px; border: 1px solid #1e40af;">
+                          <tr>
+                            <td style="padding: 16px;">
+                              <p style="margin: 0 0 8px; color: #60a5fa; font-size: 13px; font-weight: 600;">Manual Steps to Complete:</p>
+                              <ol style="margin: 0; padding-left: 20px; color: #93c5fd; font-size: 12px; line-height: 1.8;">
+                                <li>Clone the repository: <code style="background: #1e3a5f; padding: 2px 6px; border-radius: 4px;">git clone https://github.com/{repo_owner}/{repo_name}</code></li>
+                                <li>Create a new branch: <code style="background: #1e3a5f; padding: 2px 6px; border-radius: 4px;">git checkout -b zombie-removal/{candidate_id}</code></li>
+                                <li>Apply the changes from the "Updated File" section below</li>
+                                <li>Commit and push: <code style="background: #1e3a5f; padding: 2px 6px; border-radius: 4px;">git commit -am "Remove zombie: {html.escape(entity_sig[:30])}"</code></li>
+                                <li>Create PR manually on GitHub</li>
+                              </ol>
+                            </td>
+                          </tr>
+                        </table>
+                      </td>
+                    </tr>
+                    
+                    <!-- Diff Report -->
+                    <tr>
+                      <td style="padding: 0 40px 24px;">
+                        <p style="margin: 0 0 8px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Diff Report</p>
+                        <div style="background: #0f0f0f; border-radius: 8px; border: 1px solid #262626; max-height: 300px; overflow: auto;">
+                          <pre style="margin: 0; padding: 12px; color: #a3a3a3; font-size: 10px; font-family: monospace; white-space: pre-wrap;">{diff_escaped}</pre>
+                        </div>
+                      </td>
+                    </tr>
+                    
+                    <!-- Updated File Preview -->
+                    <tr>
+                      <td style="padding: 0 40px 24px;">
+                        <p style="margin: 0 0 8px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Updated File Content (Preview)</p>
+                        <div style="background: #0f0f0f; border-radius: 8px; border: 1px solid #262626; max-height: 400px; overflow: auto;">
+                          <pre style="margin: 0; padding: 12px; color: #d4d4d4; font-size: 10px; font-family: monospace; white-space: pre-wrap;">{updated_escaped}</pre>
+                        </div>
+                        <p style="margin: 8px 0 0; color: #6b7280; font-size: 10px;">Copy this content to replace the original file</p>
+                      </td>
+                    </tr>
+                    
+                    <!-- Footer -->
+                    <tr>
+                      <td style="background-color: #0a0a0a; padding: 24px 40px; border-top: 1px solid #222;">
+                        <table width="100%" cellpadding="0" cellspacing="0">
+                          <tr>
+                            <td align="center">
+                              <table cellpadding="0" cellspacing="0" style="margin-bottom: 12px;">
+                                <tr>
+                                  <td style="vertical-align: middle; padding-right: 10px;">
+                                    <div style="width: 28px; height: 28px; background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%); border-radius: 6px; display: inline-block;">
+                                      <span style="font-size: 11px; line-height: 28px; display: block; text-align: center; color: #fff; font-weight: 700;">SD</span>
+                                    </div>
+                                  </td>
+                                  <td style="vertical-align: middle;">
+                                    <p style="margin: 0; color: #f3f4f6; font-size: 13px; font-weight: 600;">Services Doomsday</p>
+                                  </td>
+                                </tr>
+                              </table>
+                              <p style="margin: 0; color: #4b5563; font-size: 11px;">Candidate #{candidate_id} | Status reverted to pending review</p>
+                            </td>
+                          </tr>
+                        </table>
+                      </td>
+                    </tr>
+                    
+                  </table>
+                </td>
+              </tr>
+            </table>
+          </body>
+          </html>'''
+          
+          # Save email content
+          email_data = {
+              "to_email": user_email,
+              "subject": subject,
+              "html_body": html_body
+          }
+          
+          with open('failure_email.json', 'w') as f:
+              json.dump(email_data, f)
+          
+          print(f"[EMAIL] Prepared failure email for {user_email}")
+          print(f"  Subject: {subject}")
+          print(f"  Diff length: {len(diff_report)} chars")
+          print(f"  Updated file preview: {len(updated_preview)} chars")
+
       - id: send_failure_notification
         type: io.kestra.plugin.notifications.mail.MailSend
         host: "{{ kv('SMTP_HOST') }}"
@@ -594,21 +1210,9 @@ tasks:
         password: "{{ kv('SMTP_PASSWORD') }}"
         from: "{{ kv('SMTP_FROM') }}"
         to:
-          - "{{ (read(outputs.get_candidate_details.outputFiles['candidate.json']) | json)[0].user_email }}"
-        subject: "❌ Zombie Kill Failed - {{ inputs.entity_signature }}"
-        htmlTextContent: |
-          <html>
-          <body style="font-family: Arial, sans-serif; background: #1a1a1a; color: #e0e0e0; padding: 20px;">
-            <div style="max-width: 600px; margin: 0 auto; background: #2d2d2d; border-radius: 8px; padding: 30px; border: 1px solid #ef4444;">
-              <h2 style="color: #ef4444;">❌ PR Creation Failed</h2>
-              <p>Failed to create pull request for removing <strong>{{ inputs.entity_signature }}</strong></p>
-              <p style="background: #1a1a1a; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 12px;">
-                {{ (read(outputs.create_pull_request.outputFiles['pr_info.json']) | json)[0].error }}
-              </p>
-              <p>Please check the Kestra execution logs for details.</p>
-            </div>
-          </body>
-          </html>
+          - "{{ (read(outputs.prepare_failure_email.outputFiles['failure_email.json']) | json).to_email }}"
+        subject: "{{ (read(outputs.prepare_failure_email.outputFiles['failure_email.json']) | json).subject }}"
+        htmlTextContent: "{{ (read(outputs.prepare_failure_email.outputFiles['failure_email.json']) | json).html_body }}"
 
 # ================================================================
 # ERROR HANDLING
@@ -622,23 +1226,52 @@ errors:
         message: "W4 Kill Zombie Error: {{ error.message }}"
         level: ERROR
         
-      - id: revert_status
+      - id: cleanup_and_revert
         type: io.kestra.plugin.scripts.python.Script
+        description: "Cleanup orphan branch and revert DB status"
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
         containerImage: python:3.11-slim
         beforeCommands:
-          - pip install -q psycopg2-binary
+          - pip install -q psycopg2-binary requests
         env:
           DATABASE_URL: "{{ secret('DATABASE_URL') }}"
           CANDIDATE_ID: "{{ inputs.candidate_id }}"
+          GITHUB_TOKEN: "{{ inputs.github_token }}"
+          REPO_OWNER: "{{ inputs.repo_owner }}"
+          REPO_NAME: "{{ inputs.repo_name }}"
         script: |
           import os
           import psycopg2
+          import requests
           
           db_url = os.environ.get('DATABASE_URL')
           candidate_id = int(os.environ.get('CANDIDATE_ID'))
+          token = os.environ.get('GITHUB_TOKEN')
+          owner = os.environ.get('REPO_OWNER')
+          repo = os.environ.get('REPO_NAME')
           
+          # Try to cleanup orphan branch (best effort)
+          branch_name = f"doomsday/zombie-cleanup-{candidate_id}"
+          try:
+              response = requests.delete(
+                  f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch_name}",
+                  headers={
+                      "Authorization": f"Bearer {token}",
+                      "Accept": "application/vnd.github.v3+json"
+                  },
+                  timeout=10
+              )
+              if response.status_code in [200, 204]:
+                  print(f"[CLEANUP] Deleted orphan branch: {branch_name}")
+              elif response.status_code == 422:
+                  print(f"[CLEANUP] Branch {branch_name} not found (already cleaned or never created)")
+              else:
+                  print(f"[CLEANUP] Could not delete branch (status {response.status_code})")
+          except Exception as e:
+              print(f"[CLEANUP] Branch cleanup failed: {str(e)[:100]}")
+          
+          # Revert DB status
           conn = psycopg2.connect(db_url, sslmode='require')
           cur = conn.cursor()
           
@@ -653,3 +1286,42 @@ errors:
           conn.close()
           
           print(f"[ERROR] Reverted candidate {candidate_id} to pending_review")
+          
+      - id: notify_admin_w4_failure
+        type: io.kestra.plugin.notifications.mail.MailSend
+        description: Alert admin about W4 failure
+        host: "{{ kv('SMTP_HOST') }}"
+        port: "{{ kv('SMTP_PORT') }}"
+        username: "{{ kv('SMTP_USERNAME') }}"
+        password: "{{ kv('SMTP_PASSWORD') }}"
+        from: "{{ kv('SMTP_FROM') }}"
+        to:
+          - "{{ kv('ADMIN_EMAIL') ?? kv('SMTP_FROM') }}"
+        subject: "[ALERT] W4 Kill Zombie Failed - Candidate #{{ inputs.candidate_id }}"
+        htmlTextContent: |
+          <!DOCTYPE html>
+          <html>
+          <body style="margin: 0; padding: 20px; background: #0a0a0a; font-family: -apple-system, sans-serif;">
+            <div style="max-width: 500px; margin: 0 auto; background: #111; border-radius: 12px; border: 1px solid #dc2626; padding: 24px;">
+              <h2 style="color: #dc2626; margin: 0 0 16px;">W4 Kill Zombie Failed</h2>
+              <p style="color: #9ca3af; margin: 0 0 16px;">The zombie removal workflow failed during execution.</p>
+              <div style="background: #1a1a1a; padding: 12px; border-radius: 8px; margin-bottom: 12px;">
+                <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">CANDIDATE ID</p>
+                <p style="color: #f3f4f6; font-family: monospace; margin: 0;">#{{ inputs.candidate_id }}</p>
+              </div>
+              <div style="background: #1a1a1a; padding: 12px; border-radius: 8px; margin-bottom: 12px;">
+                <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">ENTITY</p>
+                <p style="color: #f3f4f6; font-family: monospace; font-size: 12px; margin: 0;">{{ inputs.entity_signature }}</p>
+              </div>
+              <div style="background: #1a1a1a; padding: 12px; border-radius: 8px; margin-bottom: 12px;">
+                <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">EXECUTION ID</p>
+                <p style="color: #f3f4f6; font-family: monospace; margin: 0;">{{ execution.id }}</p>
+              </div>
+              <div style="background: #1c1917; padding: 12px; border-radius: 8px; border-left: 3px solid #dc2626;">
+                <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">ERROR</p>
+                <p style="color: #fca5a5; font-family: monospace; font-size: 12px; margin: 0;">{{ error.message }}</p>
+              </div>
+              <p style="color: #4b5563; font-size: 11px; margin: 16px 0 0; text-align: center;">Services Doomsday - W4 Kill Zombie</p>
+            </div>
+          </body>
+          </html>

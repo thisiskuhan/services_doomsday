@@ -2,22 +2,46 @@ id: w3_analysis
 namespace: doomsday.avengers
 
 description: |
-  W3: AI Analysis & Decision Workflow
+  ═══════════════════════════════════════════════════════════════════════════════
+  W3 ANALYSIS - LLM-Powered Final Verdict & User Notification
+  ═══════════════════════════════════════════════════════════════════════════════
   
-  TRIGGERS:
-  - Schedule: Every hour, checks for candidates with observation_end_at <= NOW()
+  Scheduled workflow that processes candidates whose observation period has ended.
+  Uses LLM analysis to make final zombie/healthy verdict and notifies users via
+  email with actionable buttons.
   
-  PURPOSE:
-  1. Gather all evidence from observation period (W2 data)
-  2. LLM analyzes evidence and makes final verdict
-  3. Update candidate with final_zombie_score and verdict
-  4. Send email to user with decision + action links
-  5. Track email thread for Gmail reply detection
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WORKFLOW STAGES                                                             │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ 1. POLL READY          → Query candidates where observation_end_at <= NOW   │
+  │ 2. GATHER EVIDENCE     → Collect all observation_events from W2             │
+  │ 3. LLM ANALYSIS        → Gemini analyzes evidence + code context            │
+  │ 4. DETERMINE VERDICT   → zombie (>70%) | healthy (<20%) | inconclusive      │
+  │ 5. UPDATE DATABASE     → Set final_zombie_score, final_verdict, status      │
+  │ 6. SEND EMAIL          → HTML email with Kill/False Alert/Watch More        │
+  │ 7. TRACK THREAD        → Store email_thread for Gmail reply detection       │
+  └─────────────────────────────────────────────────────────────────────────────┘
   
-  OUTPUTS:
-  - final_zombie_score (0-100)
-  - final_verdict: 'zombie', 'healthy', 'inconclusive'
-  - Email sent to user with action buttons + reply option
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ VERDICT LOGIC                                                               │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ • ZOMBIE       → LLM confidence ≥ 70%, zero traffic during observation      │
+  │ • HEALTHY      → LLM confidence < 20%, or traffic detected consistently     │
+  │ • INCONCLUSIVE → Between thresholds, needs extended observation             │
+  │ • Status       → Updated to 'pending_review' awaiting user action           │
+  └─────────────────────────────────────────────────────────────────────────────┘
+  
+  ┌─────────────────────────────────────────────────────────────────────────────┐
+  │ WHY KESTRA?                                                                 │
+  ├─────────────────────────────────────────────────────────────────────────────┤
+  │ • Cron Trigger        → Hourly execution (0 * * * *) with missed recovery   │
+  │ • ForEach             → Parallel candidate analysis with concurrency cap    │
+  │ • MailSend Plugin     → Native SMTP integration for rich HTML emails        │
+  │ • Docker TaskRunner   → Isolated Gemini API calls per candidate             │
+  │ • KV Store            → Dynamic LLM model selection (w3_llm key)            │
+  │ • Variables           → Configurable confidence thresholds                  │
+  │ • Pebble Templates    → Dynamic email content generation                    │
+  └─────────────────────────────────────────────────────────────────────────────┘
 
 labels:
   team: doomsday
@@ -275,6 +299,12 @@ tasks:
           - id: llm_final_verdict
             type: io.kestra.plugin.scripts.python.Script
             description: LLM analyzes evidence and makes final verdict
+            retry:
+              type: exponential
+              maxAttempts: 3
+              interval: PT10S
+              maxInterval: PT60S
+            timeout: PT3M
             taskRunner:
               type: io.kestra.plugin.scripts.runner.docker.Docker
             containerImage: python:3.11-slim
@@ -518,11 +548,11 @@ tasks:
               conn.close()
               
               # Build action URLs
-              # Option 1: Kestra webhook URLs
-              webhook_base = f"{kestra_url}/api/v1/executions/webhook/doomsday.watchers/w3_handle_response"
+              # Kestra webhook URLs - must match w3_handle_response namespace
+              webhook_base = f"{kestra_url}/api/v1/executions/webhook/doomsday.avengers/w3_handle_response"
               
-              # Option 2: Frontend URLs (better UX)
-              frontend_base = f"{app_base_url}/api/actions/w3"
+              # Frontend page URLs (nice UX with loading states and feedback)
+              frontend_base = f"{app_base_url}/actions/w3"
               
               email_data = {
                   "candidate_id": candidate_id,
@@ -582,62 +612,207 @@ tasks:
                   data = json.load(f)
               
               # Build email content
-              verdict_emoji = "🧟" if data['verdict'] == 'zombie' else "✅" if data['verdict'] == 'healthy' else "🤔"
+              verdict_label = "ZOMBIE" if data['verdict'] == 'zombie' else "HEALTHY" if data['verdict'] == 'healthy' else "REVIEW"
+              verdict_color = "#dc2626" if data['verdict'] == 'zombie' else "#16a34a" if data['verdict'] == 'healthy' else "#d97706"
+              verdict_bg = "#fef2f2" if data['verdict'] == 'zombie' else "#f0fdf4" if data['verdict'] == 'healthy' else "#fffbeb"
+              verdict_border = "#fecaca" if data['verdict'] == 'zombie' else "#bbf7d0" if data['verdict'] == 'healthy' else "#fde68a"
               
-              subject = f"{verdict_emoji} Zombie Analysis: {data['entity_signature'][:50]} [{data['repo_name']}]"
+              subject = f"[{data['verdict'].upper()}] {data['entity_signature'][:40]} - {data['repo_name']}"
               
-              body = f"""
+              body = f"""<!DOCTYPE html>
               <html>
-              <body style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-                <h2>{verdict_emoji} Zombie Analysis Complete</h2>
-                
-                <div style="background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                  <h3 style="margin-top: 0;">📍 {data['entity_signature']}</h3>
-                  <p><strong>Repository:</strong> {data['repo_name']}</p>
-                  <p><strong>Watcher:</strong> {data['watcher_name']}</p>
-                </div>
-                
-                <div style="background: {'#ffebee' if data['verdict'] == 'zombie' else '#e8f5e9' if data['verdict'] == 'healthy' else '#fff3e0'}; padding: 15px; border-radius: 8px; margin: 20px 0;">
-                  <h3 style="margin-top: 0;">Verdict: {data['verdict'].upper()}</h3>
-                  <p><strong>Confidence:</strong> {data['confidence']}%</p>
-                  <p><strong>Zombie Score:</strong> {data['zombie_score']}/100</p>
-                  <p><strong>Analysis:</strong> {data['reasoning']}</p>
-                  <p><strong>Recommendation:</strong> {data['recommendation']}</p>
-                </div>
-                
-                <h3>🎯 What would you like to do?</h3>
-                
-                <div style="margin: 20px 0;">
-                  <a href="{data['action_urls']['kill']}" 
-                     style="display: inline-block; background: #d32f2f; color: white; padding: 12px 24px; 
-                            text-decoration: none; border-radius: 6px; margin: 5px;">
-                    🗑️ KILL ZOMBIE
-                  </a>
-                  <a href="{data['action_urls']['false_alert']}" 
-                     style="display: inline-block; background: #388e3c; color: white; padding: 12px 24px; 
-                            text-decoration: none; border-radius: 6px; margin: 5px;">
-                    ✅ FALSE ALERT
-                  </a>
-                  <a href="{data['action_urls']['watch_more']}" 
-                     style="display: inline-block; background: #1976d2; color: white; padding: 12px 24px; 
-                            text-decoration: none; border-radius: 6px; margin: 5px;">
-                    👁️ WATCH MORE
-                  </a>
-                </div>
-                
-                <p style="color: #666; font-size: 12px;">
-                  Or simply <strong>reply to this email</strong> with your decision and feedback!<br>
-                  Example: "Kill it, we deprecated this in v2.0" or "Watch for 2 more weeks, it's seasonal"
-                </p>
-                
-                <hr style="margin: 30px 0; border: none; border-top: 1px solid #ddd;">
-                <p style="color: #999; font-size: 11px;">
-                  This alert was generated by Services Doomsday.<br>
-                  Token expires: {data['token_expires'][:10]}
-                </p>
+              <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              </head>
+              <body style="margin: 0; padding: 0; background-color: #0a0a0a; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;">
+                <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #0a0a0a; padding: 40px 20px;">
+                  <tr>
+                    <td align="center">
+                      <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 560px; background-color: #111111; border-radius: 16px; overflow: hidden; border: 1px solid #222;">
+                        
+                        <!-- Header -->
+                        <tr>
+                          <td style="background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); padding: 32px 40px; text-align: center;">
+                            <table width="100%" cellpadding="0" cellspacing="0">
+                              <tr>
+                                <td align="center">
+                                  <!-- Doom Icon -->
+                                  <div style="width: 56px; height: 56px; background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%); border-radius: 14px; display: inline-block; margin-bottom: 16px; box-shadow: 0 4px 20px rgba(220, 38, 38, 0.4);">
+                                    <span style="font-size: 28px; line-height: 56px; color: #fff;">SD</span>
+                                  </div>
+                                  <h1 style="margin: 0; color: #ffffff; font-size: 22px; font-weight: 600; letter-spacing: -0.5px;">Zombie Analysis Complete</h1>
+                                  <p style="margin: 8px 0 0; color: #9ca3af; font-size: 13px;">Services Doomsday has finished analyzing your candidate</p>
+                                </td>
+                              </tr>
+                            </table>
+                          </td>
+                        </tr>
+                        
+                        <!-- Verdict Badge -->
+                        <tr>
+                          <td style="padding: 24px 40px 0;">
+                            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: {verdict_bg}; border: 1px solid {verdict_border}; border-radius: 12px;">
+                              <tr>
+                                <td style="padding: 20px; text-align: center;">
+                                  <span style="color: {verdict_color}; font-size: 11px; font-weight: 700; letter-spacing: 1.5px; text-transform: uppercase;">VERDICT</span>
+                                  <h2 style="margin: 4px 0 0; color: {verdict_color}; font-size: 28px; font-weight: 700;">{data['verdict'].upper()}</h2>
+                                </td>
+                              </tr>
+                            </table>
+                          </td>
+                        </tr>
+                        
+                        <!-- Entity Info -->
+                        <tr>
+                          <td style="padding: 24px 40px;">
+                            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #1a1a1a; border-radius: 12px; border: 1px solid #262626;">
+                              <tr>
+                                <td style="padding: 20px;">
+                                  <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Entity</p>
+                                  <p style="margin: 0 0 16px; color: #f3f4f6; font-size: 15px; font-weight: 500; word-break: break-all;">{data['entity_signature']}</p>
+                                  
+                                  <table width="100%" cellpadding="0" cellspacing="0">
+                                    <tr>
+                                      <td width="50%" style="padding-right: 10px;">
+                                        <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Repository</p>
+                                        <p style="margin: 0; color: #d1d5db; font-size: 13px;">{data['repo_name']}</p>
+                                      </td>
+                                      <td width="50%" style="padding-left: 10px;">
+                                        <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Watcher</p>
+                                        <p style="margin: 0; color: #d1d5db; font-size: 13px;">{data['watcher_name']}</p>
+                                      </td>
+                                    </tr>
+                                  </table>
+                                </td>
+                              </tr>
+                            </table>
+                          </td>
+                        </tr>
+                        
+                        <!-- Metrics -->
+                        <tr>
+                          <td style="padding: 0 40px;">
+                            <table width="100%" cellpadding="0" cellspacing="0">
+                              <tr>
+                                <td width="50%" style="padding-right: 8px;">
+                                  <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #1a1a1a; border-radius: 10px; border: 1px solid #262626;">
+                                    <tr>
+                                      <td style="padding: 16px; text-align: center;">
+                                        <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Confidence</p>
+                                        <p style="margin: 0; color: #f3f4f6; font-size: 24px; font-weight: 700;">{data['confidence']}%</p>
+                                      </td>
+                                    </tr>
+                                  </table>
+                                </td>
+                                <td width="50%" style="padding-left: 8px;">
+                                  <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #1a1a1a; border-radius: 10px; border: 1px solid #262626;">
+                                    <tr>
+                                      <td style="padding: 16px; text-align: center;">
+                                        <p style="margin: 0 0 4px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Zombie Score</p>
+                                        <p style="margin: 0; color: {verdict_color}; font-size: 24px; font-weight: 700;">{data['zombie_score']}/100</p>
+                                      </td>
+                                    </tr>
+                                  </table>
+                                </td>
+                              </tr>
+                            </table>
+                          </td>
+                        </tr>
+                        
+                        <!-- Analysis -->
+                        <tr>
+                          <td style="padding: 24px 40px;">
+                            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #1a1a1a; border-radius: 12px; border: 1px solid #262626;">
+                              <tr>
+                                <td style="padding: 20px;">
+                                  <p style="margin: 0 0 8px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Analysis</p>
+                                  <p style="margin: 0 0 16px; color: #d1d5db; font-size: 14px; line-height: 1.6;">{data['reasoning']}</p>
+                                  
+                                  <p style="margin: 0 0 8px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Recommendation</p>
+                                  <p style="margin: 0; color: #f3f4f6; font-size: 14px; line-height: 1.6; font-weight: 500;">{data['recommendation']}</p>
+                                </td>
+                              </tr>
+                            </table>
+                          </td>
+                        </tr>
+                        
+                        <!-- Action Buttons -->
+                        <tr>
+                          <td style="padding: 0 40px 24px;">
+                            <p style="margin: 0 0 16px; color: #9ca3af; font-size: 13px; font-weight: 500; text-align: center;">Take Action</p>
+                            <table width="100%" cellpadding="0" cellspacing="0">
+                              <tr>
+                                <td align="center" style="padding: 4px;">
+                                  <a href="{data['action_urls']['kill']}" style="display: inline-block; background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%); color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 10px; font-size: 14px; font-weight: 600; box-shadow: 0 4px 14px rgba(220, 38, 38, 0.4);">
+                                    Kill Zombie
+                                  </a>
+                                </td>
+                              </tr>
+                              <tr>
+                                <td align="center" style="padding: 12px 4px 4px;">
+                                  <a href="{data['action_urls']['false_alert']}" style="display: inline-block; background-color: #1a1a1a; color: #10b981; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-size: 13px; font-weight: 600; border: 1px solid #10b981; margin-right: 8px;">
+                                    False Alert
+                                  </a>
+                                  <a href="{data['action_urls']['watch_more']}" style="display: inline-block; background-color: #1a1a1a; color: #3b82f6; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-size: 13px; font-weight: 600; border: 1px solid #3b82f6;">
+                                    Watch More
+                                  </a>
+                                </td>
+                              </tr>
+                            </table>
+                          </td>
+                        </tr>
+                        
+                        <!-- Reply Option -->
+                        <tr>
+                          <td style="padding: 0 40px 24px;">
+                            <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #0f172a; border-radius: 10px; border: 1px dashed #334155;">
+                              <tr>
+                                <td style="padding: 16px; text-align: center;">
+                                  <p style="margin: 0 0 4px; color: #94a3b8; font-size: 13px;"><strong style="color: #e2e8f0;">Reply to this email</strong> with your decision</p>
+                                  <p style="margin: 0; color: #64748b; font-size: 12px;">e.g., "Kill it, deprecated in v2.0" or "Watch 2 more weeks"</p>
+                                </td>
+                              </tr>
+                            </table>
+                          </td>
+                        </tr>
+                        
+                        <!-- Footer -->
+                        <tr>
+                          <td style="background-color: #0a0a0a; padding: 24px 40px; border-top: 1px solid #222;">
+                            <table width="100%" cellpadding="0" cellspacing="0">
+                              <tr>
+                                <td align="center">
+                                  <!-- Doomsday Signature -->
+                                  <table cellpadding="0" cellspacing="0" style="margin-bottom: 16px;">
+                                    <tr>
+                                      <td style="vertical-align: middle; padding-right: 10px;">
+                                        <div style="width: 32px; height: 32px; background: linear-gradient(135deg, #dc2626 0%, #991b1b 100%); border-radius: 8px; display: inline-block;">
+                                          <span style="font-size: 12px; line-height: 32px; display: block; text-align: center; color: #fff; font-weight: 700;">SD</span>
+                                        </div>
+                                      </td>
+                                      <td style="vertical-align: middle;">
+                                        <p style="margin: 0; color: #f3f4f6; font-size: 14px; font-weight: 600;">Services Doomsday</p>
+                                        <p style="margin: 0; color: #6b7280; font-size: 11px;">Zombie Detection System</p>
+                                      </td>
+                                    </tr>
+                                  </table>
+                                  <p style="margin: 0; color: #4b5563; font-size: 11px;">
+                                    Action token expires: {data['token_expires'][:10]}<br>
+                                    <span style="color: #374151;">Candidate ID: {data['candidate_id']}</span>
+                                  </p>
+                                </td>
+                              </tr>
+                            </table>
+                          </td>
+                        </tr>
+                        
+                      </table>
+                    </td>
+                  </tr>
+                </table>
               </body>
-              </html>
-              """
+              </html>"""
               
               # Store email thread for Gmail trigger matching
               conn = psycopg2.connect(db_url, sslmode='require')
@@ -696,6 +871,12 @@ tasks:
           - id: send_alert_email
             type: io.kestra.plugin.notifications.mail.MailSend
             description: Send verdict email to user via SMTP
+            retry:
+              type: exponential
+              maxAttempts: 3
+              interval: PT5S
+              maxInterval: PT30S
+            timeout: PT1M
             host: "{{ kv('SMTP_HOST') }}"
             port: "{{ kv('SMTP_PORT') }}"
             username: "{{ kv('SMTP_USERNAME') }}"
@@ -724,8 +905,47 @@ tasks:
 
 errors:
   - id: analysis_failed
-    type: io.kestra.plugin.core.output.OutputValues
-    values:
-      status: "failed"
-      error: "W3 analysis workflow encountered an error"
-      execution_id: "{{ execution.id }}"
+    type: io.kestra.plugin.core.flow.Sequential
+    tasks:
+      - id: log_w3_error
+        type: io.kestra.plugin.core.log.Log
+        message: "W3 Analysis Error: {{ error.message }}"
+        level: ERROR
+        
+      - id: notify_admin_w3_failure
+        type: io.kestra.plugin.notifications.mail.MailSend
+        description: Alert admin about W3 failure
+        host: "{{ kv('SMTP_HOST') }}"
+        port: "{{ kv('SMTP_PORT') }}"
+        username: "{{ kv('SMTP_USERNAME') }}"
+        password: "{{ kv('SMTP_PASSWORD') }}"
+        from: "{{ kv('SMTP_FROM') }}"
+        to:
+          - "{{ kv('ADMIN_EMAIL') ?? kv('SMTP_FROM') }}"
+        subject: "[ALERT] W3 Analysis Workflow Failed"
+        htmlTextContent: |
+          <!DOCTYPE html>
+          <html>
+          <body style="margin: 0; padding: 20px; background: #0a0a0a; font-family: -apple-system, sans-serif;">
+            <div style="max-width: 500px; margin: 0 auto; background: #111; border-radius: 12px; border: 1px solid #dc2626; padding: 24px;">
+              <h2 style="color: #dc2626; margin: 0 0 16px;">W3 Analysis Failed</h2>
+              <p style="color: #9ca3af; margin: 0 0 16px;">The scheduled analysis workflow encountered an error.</p>
+              <div style="background: #1a1a1a; padding: 12px; border-radius: 8px; margin-bottom: 16px;">
+                <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">EXECUTION ID</p>
+                <p style="color: #f3f4f6; font-family: monospace; margin: 0;">{{ execution.id }}</p>
+              </div>
+              <div style="background: #1c1917; padding: 12px; border-radius: 8px; border-left: 3px solid #dc2626;">
+                <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">ERROR</p>
+                <p style="color: #fca5a5; font-family: monospace; font-size: 12px; margin: 0;">{{ error.message }}</p>
+              </div>
+              <p style="color: #4b5563; font-size: 11px; margin: 16px 0 0; text-align: center;">Services Doomsday - W3 Analysis</p>
+            </div>
+          </body>
+          </html>
+          
+      - id: output_failure
+        type: io.kestra.plugin.core.output.OutputValues
+        values:
+          status: "failed"
+          error: "{{ error.message }}"
+          execution_id: "{{ execution.id }}"

@@ -26,7 +26,7 @@ interface ScheduleRequest {
   userId: string;
   scanFrequencyMinutes: number;
   analysisPeriodMinutes: number;
-  action?: "schedule" | "pause" | "resume" | "opt_out";
+  action?: "schedule" | "reschedule" | "pause" | "resume" | "opt_out";
   pauseReason?: string;  // Optional reason when pausing
 }
 
@@ -142,79 +142,84 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       });
     }
 
-    // Schedule action - validate inputs
-    if (body.scanFrequencyMinutes === undefined || body.analysisPeriodMinutes === undefined) {
-      return NextResponse.json(
-        { error: "Missing scanFrequencyMinutes or analysisPeriodMinutes" },
-        { status: 400 }
+    // Schedule or Reschedule action - validate inputs
+    if (action === "schedule" || action === "reschedule") {
+      if (body.scanFrequencyMinutes === undefined || body.analysisPeriodMinutes === undefined) {
+        return NextResponse.json(
+          { error: "Missing scanFrequencyMinutes or analysisPeriodMinutes" },
+          { status: 400 }
+        );
+      }
+
+      if (
+        body.scanFrequencyMinutes < MIN_SCAN_FREQUENCY_MINUTES ||
+        body.scanFrequencyMinutes > MAX_SCAN_FREQUENCY_MINUTES
+      ) {
+        return NextResponse.json(
+          { error: `Scan frequency must be between ${MIN_SCAN_FREQUENCY_MINUTES} minute and ${MAX_SCAN_FREQUENCY_MINUTES} minutes (24 hours)` },
+          { status: 400 }
+        );
+      }
+
+      if (
+        body.analysisPeriodMinutes < MIN_ANALYSIS_PERIOD_MINUTES ||
+        body.analysisPeriodMinutes > MAX_ANALYSIS_PERIOD_MINUTES
+      ) {
+        return NextResponse.json(
+          { error: `Analysis period must be between ${MIN_ANALYSIS_PERIOD_MINUTES} minutes and ${MAX_ANALYSIS_PERIOD_MINUTES} minutes (365 days)` },
+          { status: 400 }
+        );
+      }
+
+      // Analysis period must be greater than scan frequency
+      if (body.analysisPeriodMinutes <= body.scanFrequencyMinutes) {
+        return NextResponse.json(
+          { error: "Analysis period must be greater than scan frequency" },
+          { status: 400 }
+        );
+      }
+
+      const now = new Date();
+      const nextObservationAt = new Date(now.getTime() + body.scanFrequencyMinutes * 60 * 1000);
+      const observationEndAt = new Date(now.getTime() + body.analysisPeriodMinutes * 60 * 1000);
+      const analysisPeriodHours = Math.max(1, Math.round(body.analysisPeriodMinutes / 60));
+
+      // Update candidate with schedule
+      await client.query(
+        `UPDATE zombie_candidates 
+         SET 
+           status = 'active',
+           scan_frequency_minutes = $1,
+           analysis_period_hours = $2,
+           next_observation_at = $3,
+           observation_end_at = $4,
+           first_observed_at = COALESCE(first_observed_at, NOW()),
+           updated_at = NOW()
+         WHERE candidate_id = $5`,
+        [body.scanFrequencyMinutes, analysisPeriodHours, nextObservationAt, observationEndAt, candidateId]
       );
+
+      // Update watcher status based on candidates
+      await updateWatcherStatus(client, candidate.watcher_id);
+
+      await client.query("COMMIT");
+
+      return NextResponse.json({
+        success: true,
+        message: action === "reschedule" ? "Candidate rescheduled successfully" : "Candidate scheduled successfully",
+        schedule: {
+          candidateId,
+          status: "active",
+          scanFrequencyMinutes: body.scanFrequencyMinutes,
+          analysisPeriodHours,
+          nextObservationAt,
+          observationEndAt,
+        },
+      });
     }
 
-    if (
-      body.scanFrequencyMinutes < MIN_SCAN_FREQUENCY_MINUTES ||
-      body.scanFrequencyMinutes > MAX_SCAN_FREQUENCY_MINUTES
-    ) {
-      return NextResponse.json(
-        { error: `Scan frequency must be between ${MIN_SCAN_FREQUENCY_MINUTES} minute and ${MAX_SCAN_FREQUENCY_MINUTES} minutes (24 hours)` },
-        { status: 400 }
-      );
-    }
-
-    if (
-      body.analysisPeriodMinutes < MIN_ANALYSIS_PERIOD_MINUTES ||
-      body.analysisPeriodMinutes > MAX_ANALYSIS_PERIOD_MINUTES
-    ) {
-      return NextResponse.json(
-        { error: `Analysis period must be between ${MIN_ANALYSIS_PERIOD_MINUTES} minutes and ${MAX_ANALYSIS_PERIOD_MINUTES} minutes (365 days)` },
-        { status: 400 }
-      );
-    }
-
-    // Analysis period must be greater than scan frequency
-    if (body.analysisPeriodMinutes <= body.scanFrequencyMinutes) {
-      return NextResponse.json(
-        { error: "Analysis period must be greater than scan frequency" },
-        { status: 400 }
-      );
-    }
-
-    const now = new Date();
-    const nextObservationAt = new Date(now.getTime() + body.scanFrequencyMinutes * 60 * 1000);
-    const observationEndAt = new Date(now.getTime() + body.analysisPeriodMinutes * 60 * 1000);
-    const analysisPeriodHours = Math.max(1, Math.round(body.analysisPeriodMinutes / 60));
-
-    // Update candidate with schedule
-    await client.query(
-      `UPDATE zombie_candidates 
-       SET 
-         status = 'active',
-         scan_frequency_minutes = $1,
-         analysis_period_hours = $2,
-         next_observation_at = $3,
-         observation_end_at = $4,
-         first_observed_at = COALESCE(first_observed_at, NOW()),
-         updated_at = NOW()
-       WHERE candidate_id = $5`,
-      [body.scanFrequencyMinutes, analysisPeriodHours, nextObservationAt, observationEndAt, candidateId]
-    );
-
-    // Update watcher status based on candidates
-    await updateWatcherStatus(client, candidate.watcher_id);
-
-    await client.query("COMMIT");
-
-    return NextResponse.json({
-      success: true,
-      message: "Candidate scheduled successfully",
-      schedule: {
-        candidateId,
-        status: "active",
-        scanFrequencyMinutes: body.scanFrequencyMinutes,
-        analysisPeriodHours,
-        nextObservationAt,
-        observationEndAt,
-      },
-    });
+    // Unknown action
+    return NextResponse.json({ error: "Invalid action" }, { status: 400 });
   } catch (error) {
     await client.query("ROLLBACK");
     console.error("[candidate/schedule] Error:", error);

@@ -15,7 +15,7 @@ import { useParams, useRouter } from "next/navigation";
 import { motion } from "framer-motion";
 import { useAuth } from "@/contexts/AuthContext";
 import { DoomLoader } from "@/components/ui/DoomLoader";
-import { formatDate, formatRelativeTime } from "@/lib/utils";
+import { formatDate, formatRelativeTime, formatFutureTime, sanitizeErrorMessage, getDerivedCandidateStatus } from "@/lib/utils";
 import {
   AnimatedCard,
   EntityIcon,
@@ -107,7 +107,7 @@ interface ObservationEvent {
 }
 
 export default function CandidateDetailPage() {
-  const { user, loading: authLoading } = useAuth();
+  const { user, loading: authLoading, githubToken: authGithubToken } = useAuth();
   const params = useParams();
   const router = useRouter();
 
@@ -236,6 +236,9 @@ export default function CandidateDetailPage() {
   const handleKillZombie = async (token?: string) => {
     if (!candidate || !user?.uid) return;
 
+    // Use token priority: passed token > local state > auth context token
+    const effectiveToken = token || githubToken || authGithubToken || undefined;
+
     setShowKillConfirm(false);
     setKillLoading(true);
     try {
@@ -244,15 +247,18 @@ export default function CandidateDetailPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           userId: user.uid,
-          githubToken: token || githubToken || undefined,
+          githubToken: effectiveToken,
         }),
       });
 
       const data = await response.json();
 
       if (!response.ok) {
-        // If no token, prompt for one
+        // If no token, prompt for one (pre-fill with auth token if available)
         if (data.error?.includes("GitHub token required")) {
+          if (authGithubToken) {
+            setGithubToken(authGithubToken);
+          }
           setShowGithubTokenModal(true);
           return;
         }
@@ -297,6 +303,36 @@ export default function CandidateDetailPage() {
       await fetchCandidate();
     } catch (err) {
       console.error("Start observation failed:", err);
+    } finally {
+      setActionLoading(false);
+    }
+  };
+
+  const handleReschedule = async () => {
+    if (!candidate || !user?.uid) return;
+
+    setActionLoading(true);
+    try {
+      const response = await fetch(`/api/candidates/${candidateId}/schedule`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          userId: user.uid,
+          action: "reschedule",
+          scanFrequencyMinutes: scheduleForm.scanFrequencyMinutes,
+          analysisPeriodMinutes: scheduleForm.analysisPeriodMinutes,
+        }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.error || "Failed to reschedule");
+      }
+
+      setShowScheduleForm(false);
+      await fetchCandidate();
+    } catch (err) {
+      console.error("Reschedule failed:", err);
     } finally {
       setActionLoading(false);
     }
@@ -362,7 +398,7 @@ export default function CandidateDetailPage() {
                   <h1 className="text-2xl font-bold text-white">
                     {candidate.entityName || candidate.entitySignature}
                   </h1>
-                  <CandidateStatusBadge status={candidate.status} />
+                  <CandidateStatusBadge status={getDerivedCandidateStatus(candidate.status, candidate.observationEndAt)} />
                 </div>
                 <p className="text-zinc-500 text-sm mt-1">
                   {candidate.entityType.replace("_", " ")}
@@ -465,13 +501,17 @@ export default function CandidateDetailPage() {
               </div>
               <p className="text-zinc-400 text-sm mb-4">
                 To create a Pull Request, we need a GitHub token with repo write access.
-                This token will only be used for this action.
+                {githubToken && authGithubToken && githubToken === authGithubToken && (
+                  <span className="block mt-2 text-emerald-400">
+                    ✓ Token auto-filled from your login session
+                  </span>
+                )}
               </p>
               <input
                 type="password"
                 value={githubToken}
                 onChange={(e) => setGithubToken(e.target.value)}
-                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                placeholder={authGithubToken ? "Using OAuth token" : "ghp_xxxxxxxxxxxxxxxxxxxx"}
                 className="w-full px-4 py-3 bg-zinc-800 border border-zinc-700 rounded-lg text-white placeholder-zinc-500 focus:outline-none focus:border-red-500 mb-4"
               />
               <div className="flex gap-3">
@@ -616,36 +656,119 @@ export default function CandidateDetailPage() {
                 initialAnimation={!hasAnimated.current}
                 delay={0.2}
               >
-                <div className="flex items-center gap-2 mb-4">
-                  <Calendar className="w-5 h-5 text-emerald-400" />
-                  <h2 className="font-semibold text-white">Observation Schedule</h2>
+                <div className="flex items-center justify-between mb-4">
+                  <div className="flex items-center gap-2">
+                    <Calendar className="w-5 h-5 text-emerald-400" />
+                    <h2 className="font-semibold text-white">Observation Schedule</h2>
+                  </div>
+                  {!showScheduleForm && (
+                    <button
+                      onClick={() => {
+                        setScheduleForm({
+                          scanFrequencyMinutes: candidate.scanFrequencyMinutes || 5,
+                          analysisPeriodMinutes: (candidate.analysisPeriodHours || 1) * 60,
+                        });
+                        setShowScheduleForm(true);
+                      }}
+                      className="text-xs text-emerald-400 hover:text-emerald-300 bg-emerald-500/10 hover:bg-emerald-500/20 px-2.5 py-1 rounded-lg transition-colors"
+                    >
+                      Reschedule
+                    </button>
+                  )}
                 </div>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                  <div>
-                    <p className="text-xs text-zinc-500 mb-1">Scan Frequency</p>
-                    <p className="text-sm font-medium text-white">
-                      Every {candidate.scanFrequencyMinutes} min
-                    </p>
+                
+                {showScheduleForm ? (
+                  <div className="space-y-4">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="text-xs text-zinc-500 mb-1.5 block">Scan Frequency</label>
+                        <select
+                          value={scheduleForm.scanFrequencyMinutes}
+                          onChange={(e) => setScheduleForm(prev => ({ ...prev, scanFrequencyMinutes: parseInt(e.target.value) }))}
+                          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white focus:border-emerald-500 focus:outline-none"
+                        >
+                          <option value={1}>Every 1 min</option>
+                          <option value={5}>Every 5 min</option>
+                          <option value={15}>Every 15 min</option>
+                          <option value={30}>Every 30 min</option>
+                          <option value={60}>Every 1 hour</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="text-xs text-zinc-500 mb-1.5 block">Analysis Period</label>
+                        <select
+                          value={scheduleForm.analysisPeriodMinutes}
+                          onChange={(e) => setScheduleForm(prev => ({ ...prev, analysisPeriodMinutes: parseInt(e.target.value) }))}
+                          className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg text-sm text-white focus:border-emerald-500 focus:outline-none"
+                        >
+                          <option value={60}>1 hour</option>
+                          <option value={180}>3 hours</option>
+                          <option value={360}>6 hours</option>
+                          <option value={720}>12 hours</option>
+                          <option value={1440}>24 hours</option>
+                          <option value={4320}>3 days</option>
+                          <option value={10080}>7 days</option>
+                        </select>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 pt-2">
+                      <button
+                        onClick={handleReschedule}
+                        disabled={actionLoading}
+                        className="px-4 py-2 text-sm font-medium text-white bg-emerald-600 hover:bg-emerald-700 rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
+                      >
+                        {actionLoading ? (
+                          <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                        ) : null}
+                        Save Changes
+                      </button>
+                      <button
+                        onClick={() => setShowScheduleForm(false)}
+                        disabled={actionLoading}
+                        className="px-4 py-2 text-sm font-medium text-zinc-400 hover:text-white bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors disabled:opacity-50"
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-xs text-zinc-500 mb-1">Analysis Period</p>
-                    <p className="text-sm font-medium text-white">
-                      {candidate.analysisPeriodHours ? `${candidate.analysisPeriodHours}h` : "N/A"}
-                    </p>
+                ) : (
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                    <div>
+                      <p className="text-xs text-zinc-500 mb-1">Scan Frequency</p>
+                      <p className="text-sm font-medium text-white">
+                        Every {candidate.scanFrequencyMinutes} min
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-zinc-500 mb-1">Analysis Period</p>
+                      <p className="text-sm font-medium text-white">
+                        {candidate.analysisPeriodHours ? `${candidate.analysisPeriodHours}h` : "N/A"}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-zinc-500 mb-1">Next Observation</p>
+                      <p className="text-sm font-medium text-white">
+                        {formatFutureTime(candidate.nextObservationAt)}
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-zinc-500 mb-1">
+                        {candidate.observationEndAt && new Date(candidate.observationEndAt) <= new Date() 
+                          ? "Observation Ended" 
+                          : "Ends At"}
+                      </p>
+                      <p className={`text-sm font-medium ${
+                        candidate.observationEndAt && new Date(candidate.observationEndAt) <= new Date()
+                          ? "text-cyan-400"
+                          : "text-white"
+                      }`}>
+                        {candidate.observationEndAt && new Date(candidate.observationEndAt) <= new Date()
+                          ? formatRelativeTime(candidate.observationEndAt)
+                          : formatFutureTime(candidate.observationEndAt)}
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <p className="text-xs text-zinc-500 mb-1">Next Observation</p>
-                    <p className="text-sm font-medium text-white">
-                      {formatRelativeTime(candidate.nextObservationAt)}
-                    </p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-zinc-500 mb-1">Ends At</p>
-                    <p className="text-sm font-medium text-white">
-                      {formatRelativeTime(candidate.observationEndAt)}
-                    </p>
-                  </div>
-                </div>
+                )}
               </AnimatedCard>
             )}
 
@@ -780,7 +903,7 @@ export default function CandidateDetailPage() {
                             )}
                           </div>
                           {event.errorMessage && (
-                            <p className="text-[10px] text-red-400 mt-0.5 line-clamp-2">{event.errorMessage}</p>
+                            <p className="text-[10px] text-red-400 mt-0.5 line-clamp-2">{sanitizeErrorMessage(event.errorMessage)}</p>
                           )}
                           <p className="text-[10px] text-zinc-600 mt-1">
                             {formatRelativeTime(event.observedAt)}

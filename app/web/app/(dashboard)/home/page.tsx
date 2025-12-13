@@ -100,7 +100,7 @@ export default function HomePage() {
           transition={{ duration: 0.6, delay: 0.2 }}
           className="relative rounded-2xl p-px"
         >
-          <AnimatedBorderGlow color="grey" duration={1.5} alwaysAnimate />
+          <AnimatedBorderGlow color="grey" duration={4} alwaysAnimate />
           <div className="relative bg-zinc-900/90 backdrop-blur-xl rounded-2xl p-8 shadow-xl z-10">
             <div className="flex items-center justify-center gap-3 mb-4">
               <div className="w-3 h-3 bg-emerald-500 rounded-full animate-pulse" />

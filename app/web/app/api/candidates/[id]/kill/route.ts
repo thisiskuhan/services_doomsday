@@ -169,16 +169,19 @@ export async function POST(
          status = 'confirmed_zombie',
          human_action = 'kill',
          human_action_at = NOW(),
+         kill_execution_id = $2,
          updated_at = NOW()
        WHERE candidate_id = $1`,
-      [candidateId]
+      [candidateId, execution.id]
     );
 
-    // Log the decision
+    // Log the decision with correct schema columns
     await query(
-      `INSERT INTO decision_log (candidate_id, decision, decided_by, decided_at, notes)
-       VALUES ($1, 'kill', $2, NOW(), $3)`,
-      [candidateId, body.userId, `Triggered W4 workflow: ${execution.id}`]
+      `INSERT INTO decision_log (
+        candidate_id, watcher_id, action_type, action_source, 
+        actor_type, actor_id, decision, kestra_execution_id, created_at
+      ) VALUES ($1, $2, 'kill', 'frontend', 'user', $3, 'kill', $4, NOW())`,
+      [candidateId, candidate.watcher_id, body.userId, execution.id]
     );
 
     return NextResponse.json({
