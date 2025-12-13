@@ -1,5 +1,19 @@
-# Kestra KV Store Source Data
-# Namespace: doomsday.watchers
+# ============================================================================
+# KESTRA KV STORE - DOOMSDAY SERVICES
+# ============================================================================
 
-w1_llm: "gemini-2.5-flash-lite"
+# ===== LLM MODELS =====
+# Get free limited LLM from AI Studio
+w1_llm: "gemini-2.5-flash-lite"     # W1: Repo analysis, entity discovery
+w3_llm: "gemini-2.5-flash-lite"     # W3: Final verdict analysis  
+w4_llm: "gemini-2.5-flash-lite"     # W4: Code removal generation
 
+# ===== SMTP (Gmail App Password) =====
+SMTP_HOST: ""                       # SMTP server
+SMTP_PORT: ""                       # SMTP port (587 for TLS)
+SMTP_USERNAME: ""                   # Gmail address for auth
+SMTP_PASSWORD: ""                   # 16-char App Password
+SMTP_FROM: ""                       # From address
+
+# ===== APPLICATION URL =====
+app_base_url: ""                    # Frontend URL for action links
