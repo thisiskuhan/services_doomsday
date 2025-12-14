@@ -65,46 +65,38 @@ Instead of manual hunting, Doomsday:
 
 ```mermaid
 graph TB
-    Start([🎯 Create Watcher]) --> Clone[📦 Clone Repository]
-    Clone --> Scan[🔍 Scan Codebase]
-    Scan --> Discover[💀 Discover Zombies]
-    Discover --> Register[📡 Register Webhook]
-    Register --> Monitor[⏰ Observation Loop Every 5min]
+    subgraph W1["🎯 W1: Watcher Setup"]
+        Start[Create Watcher] --> Clone[Clone Repository]
+        Clone --> Scan[Scan Codebase]
+        Scan --> Discover[Discover Zombies]
+        Discover --> Register[Register Webhook]
+    end
     
-    Monitor --> Prometheus[📊 Query Prometheus]
-    Monitor --> Loki[📝 Query Loki Logs]
-    Monitor --> Health[💊 Health Check]
+    subgraph W2["📊 W2: Observation Loop"]
+        Monitor[Poll Every 30min] --> Query[Query Prometheus/Loki]
+        Query --> Store[Store Evidence]
+        Store --> Score[Update Zombie Score]
+    end
     
-    Prometheus --> Evidence[(🗄️ Evidence DB)]
-    Loki --> Evidence
-    Health --> Evidence
+    subgraph W3["🤖 W3: AI Analysis"]
+        Analyze[Gather Evidence] --> LLM[Gemini Analysis]
+        LLM --> Verdict{Verdict?}
+        Verdict -->|Zombie| Email[Send Email Alert]
+        Verdict -->|Healthy| Keep[Mark Active]
+        Verdict -->|Uncertain| Extend[Extend Observation]
+    end
     
-    Evidence --> Wait{⏳ Period<br/>Complete?}
-    Wait -->|No| Monitor
-    Wait -->|Yes| AI[🤖 Gemini Analysis]
+    subgraph W4["💀 W4: Kill Zombie"]
+        Human{Human Decision}
+        Human -->|Kill| PR[Create GitHub PR]
+        Human -->|Reject| Archive[Mark False Positive]
+        Human -->|Watch More| Back[Extend Period]
+    end
     
-    AI --> Verdict{🎭 Verdict?}
-    Verdict -->|🧟 Zombie| Alert[📧 Email Alert]
-    Verdict -->|✅ Active| Continue[♻️ Keep Watching]
-    Verdict -->|❓ Uncertain| Extend[⏱️ Extend Period]
-    
-    Alert --> Human{👤 Human<br/>Decision}
-    Human -->|💀 Kill| PR[📝 Create PR]
-    Human -->|❌ Reject| Archive[📦 Archive]
-    Human -->|⏰ Watch More| Extend
-    
-    PR --> Review([👀 Code Review])
-    Archive --> End([✨ Zombie Killed])
-    Review --> End
-    
-    style Start fill:#dc2626,stroke:#991b1b,color:#fff
-    style Discover fill:#dc2626,stroke:#991b1b,color:#fff
-    style AI fill:#8b5cf6,stroke:#6d28d9,color:#fff
-    style Verdict fill:#f59e0b,stroke:#d97706,color:#000
-    style Human fill:#3b82f6,stroke:#2563eb,color:#fff
-    style PR fill:#10b981,stroke:#059669,color:#fff
-    style End fill:#6366f1,stroke:#4f46e5,color:#fff
-    style Evidence fill:#1f2937,stroke:#111827,color:#fff
+    Register --> Monitor
+    Score --> Analyze
+    Email --> Human
+    PR --> Done[Zombie Eliminated!]
 ```
 
 ### **Phase 1: Watcher Setup** (W1)
@@ -552,9 +544,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 ## Contact & Support
 
-- **Author:** Kuhan ([@thisiskuhan](https://github.com/thisiskuhan))
-- **Issues:** [GitHub Issues](https://github.com/thisiskuhan/services-doomsday/issues)
-- **Discussions:** [GitHub Discussions](https://github.com/thisiskuhan/services-doomsday/discussions)
+- **Author:** Kuhan ([@thisiskuhan](https://www.linkedin.com/in/thisiskuhan/))
 
 ---
 
