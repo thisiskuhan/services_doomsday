@@ -211,6 +211,7 @@ export const OBSERVABILITY_SOURCE_TYPES = [
   { id: "loki", value: "loki", label: "Loki", placeholder: "https://loki.example.com" },
   { id: "grafana", value: "grafana", label: "Grafana", placeholder: "https://your-stack.grafana.net" },
   { id: "datadog", value: "datadog", label: "Datadog", placeholder: "https://api.datadoghq.com" },
+  { id: "custom", value: "custom", label: "Custom", placeholder: "https://your-observability-endpoint.com" },
 ] as const;
 
 /**
