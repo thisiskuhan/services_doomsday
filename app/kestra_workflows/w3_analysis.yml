@@ -51,7 +51,7 @@ labels:
 
 variables:
   # LLM Configuration
-  llm_model: "{{ kv('w3_llm') ?? 'gemini-2.0-flash' }}"
+  llm_model: "{{ kv('w3_llm') ?? 'gemini-2.5-flash' }}"
   
   # Thresholds
   zombie_confidence_threshold: 70   # LLM confidence to declare zombie
@@ -329,7 +329,7 @@ tasks:
               close_brace = "}"
               
               api_key = os.environ.get('GOOGLE_API_KEY')
-              llm_model = os.environ.get('LLM_MODEL', 'gemini-2.0-flash')
+              llm_model = os.environ.get('LLM_MODEL', 'gemini-2.5-flash')
               zombie_threshold = int(os.environ.get('ZOMBIE_THRESHOLD', '70'))
               healthy_threshold = int(os.environ.get('HEALTHY_THRESHOLD', '80'))
               

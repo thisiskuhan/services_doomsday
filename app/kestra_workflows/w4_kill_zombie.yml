@@ -90,7 +90,7 @@ inputs:
     description: "GitHub OAuth token for repo access"
 
 variables:
-  llm_model: "{{ kv('w4_llm') ?? 'gemini-2.0-flash' }}"
+  llm_model: "{{ kv('w4_llm') ?? 'gemini-2.5-flash' }}"
 
 # ================================================================
 # MAIN WORKFLOW TASKS  
@@ -227,7 +227,7 @@ tasks:
           import subprocess
           
           api_key = os.environ.get('GOOGLE_API_KEY')
-          llm_model = os.environ.get('LLM_MODEL', 'gemini-2.0-flash')
+          llm_model = os.environ.get('LLM_MODEL', 'gemini-2.5-flash')
           entity_sig = os.environ.get('ENTITY_SIGNATURE')
           file_path = os.environ.get('FILE_PATH')
           candidate_id = os.environ.get('CANDIDATE_ID')
