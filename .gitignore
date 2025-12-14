@@ -68,6 +68,4 @@ ENV/
 # Vercel
 .vercel
 
-
-whiteboard/
-app/logo/
+app/web/scripts

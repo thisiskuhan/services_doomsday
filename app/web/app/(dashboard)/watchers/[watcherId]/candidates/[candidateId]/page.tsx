@@ -17,34 +17,35 @@ import { useAuth } from "@/contexts/AuthContext";
 import { DoomLoader } from "@/components/ui/DoomLoader";
 import { formatDate, formatRelativeTime, formatFutureTime, sanitizeErrorMessage, getDerivedCandidateStatus } from "@/lib/utils";
 import {
-  AnimatedCard,
-  EntityIcon,
-  CandidateStatusBadge,
-  RiskScore,
-  StatCard,
+    AnimatedCard,
+    EntityIcon,
+    CandidateStatusBadge,
+    RiskScore,
+    StatCard,
 } from "@/components/ui/shared";
 import {
-  ArrowLeft,
-  RefreshCw,
-  Clock,
-  Activity,
-  AlertTriangle,
-  CheckCircle,
-  XCircle,
-  Calendar,
-  FileCode,
-  GitBranch,
-  ExternalLink,
-  PlayCircle,
-  PauseCircle,
-  Radio,
-  TrendingUp,
-  Zap,
-  Skull,
-  Loader2,
+    ArrowLeft,
+    RefreshCw,
+    Clock,
+    Activity,
+    AlertTriangle,
+    CheckCircle,
+    XCircle,
+    Calendar,
+    FileCode,
+    GitBranch,
+    ExternalLink,
+    PlayCircle,
+    PauseCircle,
+    Radio,
+    TrendingUp,
+    Zap,
+    Skull,
+    Loader2,
 } from "lucide-react";
 import { TrafficChart } from "@/components/ui/TrafficChart";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { KillSuccessDialog } from "@/components/ui/KillSuccessDialog";
 
 // Types
 interface CandidateDetails {
@@ -127,6 +128,8 @@ export default function CandidateDetailPage() {
   const [githubToken, setGithubToken] = useState("");
   const [showOptOutConfirm, setShowOptOutConfirm] = useState(false);
   const [showKillConfirm, setShowKillConfirm] = useState(false);
+  const [killSuccessOpen, setKillSuccessOpen] = useState(false);
+  const [killExecutionId, setKillExecutionId] = useState("");
   const hasAnimated = useRef(false);
 
   const fetchCandidate = useCallback(async (isRefresh = false) => {
@@ -265,8 +268,9 @@ export default function CandidateDetailPage() {
         throw new Error(data.error || "Failed to trigger kill workflow");
       }
 
-      // Success - show message and refresh
-      alert(`Kill workflow triggered!\n\nExecution ID: ${data.executionId}\n\nA Pull Request will be created to remove the dead code.`);
+      // Success - show styled dialog
+      setKillExecutionId(data.executionId);
+      setKillSuccessOpen(true);
       setShowGithubTokenModal(false);
       setGithubToken("");
       await fetchCandidate();
@@ -1085,6 +1089,14 @@ export default function CandidateDetailPage() {
         cancelText="Cancel"
         variant="zombie"
         isLoading={killLoading}
+      />
+
+      {/* Kill Success Dialog */}
+      <KillSuccessDialog
+        isOpen={killSuccessOpen}
+        onClose={() => setKillSuccessOpen(false)}
+        executionId={killExecutionId}
+        entitySignature={candidate?.entitySignature}
       />
     </div>
   );

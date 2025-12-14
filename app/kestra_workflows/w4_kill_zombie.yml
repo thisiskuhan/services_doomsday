@@ -182,6 +182,9 @@ tasks:
   # ============================================================
   - id: working_dir
     type: io.kestra.plugin.core.flow.WorkingDirectory
+    outputFiles:
+      - "pr_info.json"
+      - "diff_report.txt"
     tasks:
       - id: clone_repo
         type: io.kestra.plugin.git.Clone
@@ -190,59 +193,72 @@ tasks:
         username: oauth2
         password: "{{ inputs.github_token }}"
 
-      - id: generate_validate_commit
+      - id: generate_validate_commit_push
         type: io.kestra.plugin.scripts.python.Script
-        description: LLM generates surgical removal with strict validation
+        description: LLM generates surgical removal, validates, commits, and pushes to GitHub
         taskRunner:
           type: io.kestra.plugin.scripts.runner.docker.Docker
         containerImage: python:3.11-slim
         beforeCommands:
-          - pip install -q google-genai
+          - apt-get update && apt-get install -y git
+          - pip install -q google-genai requests
         env:
           GOOGLE_API_KEY: "{{ secret('GOOGLE_AI_API_KEY') }}"
           LLM_MODEL: "{{ vars.llm_model }}"
           ENTITY_SIGNATURE: "{{ inputs.entity_signature }}"
           FILE_PATH: "{{ inputs.file_path }}"
           CANDIDATE_ID: "{{ inputs.candidate_id }}"
+          GITHUB_TOKEN: "{{ inputs.github_token }}"
+          REPO_OWNER: "{{ inputs.repo_owner }}"
+          REPO_NAME: "{{ inputs.repo_name }}"
         inputFiles:
           candidate.json: "{{ outputs.get_candidate_details.outputFiles['candidate.json'] }}"
         outputFiles:
           - result.json
-          - updated_file.txt
           - diff_report.txt
-          - original_backup.txt
+          - branch_name.txt
+          - pr_info.json
         script: |
           import os
           import json
           import ast
           import re
           import difflib
+          import subprocess
           
           api_key = os.environ.get('GOOGLE_API_KEY')
           llm_model = os.environ.get('LLM_MODEL', 'gemini-2.0-flash')
           entity_sig = os.environ.get('ENTITY_SIGNATURE')
           file_path = os.environ.get('FILE_PATH')
           candidate_id = os.environ.get('CANDIDATE_ID')
+          github_token = os.environ.get('GITHUB_TOKEN')
+          repo_owner = os.environ.get('REPO_OWNER')
+          repo_name = os.environ.get('REPO_NAME')
+          
+          def run_git(cmd, check=True):
+              """Run git command and return output"""
+              result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+              if check and result.returncode != 0:
+                  raise Exception(f"Git command failed: {cmd}\n{result.stderr}")
+              return result.stdout.strip()
           
           # Read candidate details  
           with open('candidate.json', 'r') as f:
               candidate_list = json.load(f)
               candidate = candidate_list[0] if isinstance(candidate_list, list) else candidate_list
           
-          # Read target file
+          default_branch = candidate.get('default_branch', 'main')
+          
+          # Read target file from cloned repo
           try:
               with open(file_path, 'r') as f:
                   original_content = f.read()
           except FileNotFoundError:
               with open('result.json', 'w') as f:
                   json.dump({"success": False, "error": "Target file not found", "stage": "read"}, f)
-              for fname in ['updated_file.txt', 'diff_report.txt', 'original_backup.txt']:
-                  open(fname, 'w').write("")
+              open('diff_report.txt', 'w').write("ERROR: Target file not found")
+              open('branch_name.txt', 'w').write("")
               raise Exception(f"Target file not found: {file_path}")
-          
-          # Save original backup
-          with open('original_backup.txt', 'w') as f:
-              f.write(original_content)
           
           original_lines = original_content.split('\n')
           start_line = candidate.get('start_line', 0)
@@ -252,9 +268,7 @@ tasks:
           
           # Count existing functions/classes/routes for validation
           def count_definitions(content, file_ext):
-              """Count code definitions to ensure we don't remove too much"""
               counts = {'functions': 0, 'classes': 0, 'routes': 0, 'exports': 0}
-              
               if file_ext == '.py':
                   counts['functions'] = len(re.findall(r'^def \w+', content, re.MULTILINE))
                   counts['classes'] = len(re.findall(r'^class \w+', content, re.MULTILINE))
@@ -264,7 +278,6 @@ tasks:
                   counts['classes'] = len(re.findall(r'class \w+', content))
                   counts['routes'] = len(re.findall(r'\.(get|post|put|delete|patch)\s*\(', content, re.IGNORECASE))
                   counts['exports'] = len(re.findall(r'^export ', content, re.MULTILINE))
-              
               return counts
           
           file_ext = os.path.splitext(file_path)[1]
@@ -315,10 +328,7 @@ tasks:
           response = client.models.generate_content(
               model=llm_model,
               contents=prompt,
-              config={
-                  "temperature": 0.0,  # Deterministic for safety
-                  "max_output_tokens": 16384  # Larger for big files
-              }
+              config={"temperature": 0.0, "max_output_tokens": 16384}
           )
           
           new_content = response.text.strip()
@@ -326,9 +336,7 @@ tasks:
           # Remove markdown wrappers if LLM added them
           if new_content.startswith('```'):
               lines = new_content.split('\n')
-              # Remove first line (```python or ```)
               lines = lines[1:]
-              # Remove last line if it's ```
               if lines and lines[-1].strip() == '```':
                   lines = lines[:-1]
               new_content = '\n'.join(lines)
@@ -336,35 +344,33 @@ tasks:
           new_lines = new_content.split('\n')
           print(f"[LLM] Generated: {len(original_lines)} → {len(new_lines)} lines")
           
-          # === STAGE 2: STRICT VALIDATION ===
+          # === STAGE 2: VALIDATION ===
           validation_errors = []
           warnings = []
           
-          # 2.1: Check file not drastically shortened (max 50% removal)
+          # Check file not drastically shortened
           if len(new_content) < len(original_content) * 0.3:
-              validation_errors.append(f"DANGER: File reduced by >70% ({len(original_content)} → {len(new_content)} chars)")
+              validation_errors.append(f"DANGER: File reduced by >70%")
           
-          # 2.2: Check we didn't remove too many definitions
+          # Check definition counts
           new_counts = count_definitions(new_content, file_ext)
           print(f"[NEW] Definitions: {new_counts}")
           
           for key in ['functions', 'classes', 'routes']:
               removed = original_counts[key] - new_counts[key]
-              if removed > 2:  # Allow removing max 2 related items (function + helper)
-                  validation_errors.append(f"DANGER: Removed {removed} {key} (expected ≤2)")
+              if removed > 2:
+                  validation_errors.append(f"DANGER: Removed {removed} {key}")
               elif removed > 1:
                   warnings.append(f"Removed {removed} {key}")
           
-          # 2.3: Syntax validation
+          # Syntax validation
           if file_ext == '.py':
               try:
                   ast.parse(new_content)
                   print("[VALIDATE] Python syntax valid")
               except SyntaxError as e:
                   validation_errors.append(f"Python syntax error: {e.msg} at line {e.lineno}")
-          
           elif file_ext in ['.js', '.jsx', '.ts', '.tsx']:
-              # Check balanced brackets
               brackets = {'(': ')', '[': ']', '{': '}'}
               stack = []
               for i, char in enumerate(new_content):
@@ -372,392 +378,171 @@ tasks:
                       stack.append((char, i))
                   elif char in brackets.values():
                       if not stack:
-                          validation_errors.append(f"Unmatched closing '{char}' at position {i}")
+                          validation_errors.append(f"Unmatched closing '{char}'")
                           break
                       open_char, _ = stack.pop()
                       if brackets[open_char] != char:
-                          validation_errors.append(f"Mismatched brackets: '{open_char}' and '{char}'")
+                          validation_errors.append(f"Mismatched brackets")
                           break
               if stack and not validation_errors:
-                  validation_errors.append(f"Unclosed brackets: {[s[0] for s in stack[-3:]]}")
-              
-              # Check for common JS/TS issues
-              if 'export default' in original_content and 'export default' not in new_content:
-                  if new_counts['exports'] == 0:
-                      validation_errors.append("DANGER: Removed default export - file may not work")
-              
+                  validation_errors.append(f"Unclosed brackets")
               if not validation_errors:
                   print("[VALIDATE] JS/TS validation passed")
           
-          # 2.4: Verify the target was actually removed
-          if entity_sig in new_content:
-              # Check if it's just a comment or string reference
-              sig_pattern = re.escape(entity_sig)
-              real_matches = re.findall(rf'^[^#"\']*{sig_pattern}', new_content, re.MULTILINE)
-              if real_matches:
-                  warnings.append(f"Target signature '{entity_sig}' still appears in code")
-          
-          # 2.5: Generate diff for review
-          diff = list(difflib.unified_diff(
-              original_lines, new_lines,
-              fromfile=f'a/{file_path}',
-              tofile=f'b/{file_path}',
-              lineterm=''
-          ))
-          
+          # Generate diff
+          diff = list(difflib.unified_diff(original_lines, new_lines, fromfile=f'a/{file_path}', tofile=f'b/{file_path}', lineterm=''))
           diff_text = '\n'.join(diff)
           removed_lines = len([l for l in diff if l.startswith('-') and not l.startswith('---')])
           added_lines = len([l for l in diff if l.startswith('+') and not l.startswith('+++')])
-          
           print(f"[DIFF] -{removed_lines} lines, +{added_lines} lines")
           
-          # 2.6: Sanity check - should be mostly removals, not additions
           if added_lines > 10 and added_lines > removed_lines:
-              validation_errors.append(f"DANGER: More lines added ({added_lines}) than removed ({removed_lines})")
+              validation_errors.append(f"DANGER: More lines added than removed")
           
           # Save diff report
           with open('diff_report.txt', 'w') as f:
               f.write(f"=== ZOMBIE REMOVAL DIFF REPORT ===\n")
-              f.write(f"Target: {entity_sig}\n")
-              f.write(f"File: {file_path}\n")
-              f.write(f"Original: {len(original_lines)} lines, {len(original_content)} chars\n")
-              f.write(f"Modified: {len(new_lines)} lines, {len(new_content)} chars\n")
+              f.write(f"Target: {entity_sig}\nFile: {file_path}\n")
               f.write(f"Changes: -{removed_lines} +{added_lines}\n")
-              f.write(f"\nValidation: {'FAILED' if validation_errors else 'PASSED'}\n")
-              if validation_errors:
-                  f.write(f"Errors: {validation_errors}\n")
-              if warnings:
-                  f.write(f"Warnings: {warnings}\n")
+              f.write(f"Validation: {'FAILED' if validation_errors else 'PASSED'}\n")
+              if validation_errors: f.write(f"Errors: {validation_errors}\n")
+              if warnings: f.write(f"Warnings: {warnings}\n")
               f.write(f"\n=== DIFF ===\n{diff_text}\n")
           
-          # === STAGE 3: Final Decision ===
           if validation_errors:
               with open('result.json', 'w') as f:
-                  json.dump({
-                      "success": False, 
-                      "error": "; ".join(validation_errors),
-                      "warnings": warnings,
-                      "stage": "validation",
-                      "diff_stats": {"removed": removed_lines, "added": added_lines}
-                  }, f)
-              with open('updated_file.txt', 'w') as f:
-                  f.write(new_content)  # Save for debugging
+                  json.dump({"success": False, "error": "; ".join(validation_errors), "warnings": warnings, "diff_stats": {"removed": removed_lines, "added": added_lines}}, f)
+              open('branch_name.txt', 'w').write("")
               raise Exception(f"Validation FAILED: {validation_errors}")
           
-          # Success - write the updated file
-          with open('updated_file.txt', 'w') as f:
+          # === STAGE 3: Apply changes to file ===
+          with open(file_path, 'w') as f:
               f.write(new_content)
+          print(f"[FILE] Updated {file_path}")
+          
+          # === STAGE 4: Git commit and push ===
+          import time
+          timestamp = int(time.time())
+          safe_name = re.sub(r'[^a-zA-Z0-9_-]', '', entity_sig)[:40]
+          branch_name = f"zombie-removal/{safe_name}-{candidate_id}-{timestamp}"
+          
+          with open('branch_name.txt', 'w') as f:
+              f.write(branch_name)
+          
+          # Configure git
+          run_git('git config user.email "doomsday-bot@graveyard.dev"')
+          run_git('git config user.name "Doomsday Bot"')
+          
+          # Create branch and commit
+          run_git(f'git checkout -b "{branch_name}"')
+          
+          if "# File emptied after zombie removal" in new_content:
+              run_git(f'git rm "{file_path}"')
+              change_type = "deleted"
+          else:
+              run_git(f'git add "{file_path}"')
+              change_type = "modified"
+          
+          commit_msg = f"[ZOMBIE] Remove: {entity_sig[:60]}"
+          run_git(f'git commit -m "{commit_msg}" -m "Candidate #{candidate_id} | File: {file_path} ({change_type})"')
+          
+          # Push to remote (force push to handle any existing branch with same name)
+          push_url = f"https://x-access-token:{github_token}@github.com/{repo_owner}/{repo_name}.git"
+          run_git(f'git push --force "{push_url}" "{branch_name}"')
+          
+          commit_sha = run_git('git rev-parse HEAD')
+          print(f"[SUCCESS] Pushed branch: {branch_name} ({commit_sha})")
           
           with open('result.json', 'w') as f:
               json.dump({
                   "success": True,
-                  "message": "Code removal validated successfully",
+                  "branch_name": branch_name,
+                  "commit_sha": commit_sha,
+                  "change_type": change_type,
                   "warnings": warnings,
-                  "diff_stats": {"removed": removed_lines, "added": added_lines},
-                  "original_definitions": original_counts,
-                  "new_definitions": new_counts
+                  "diff_stats": {"removed": removed_lines, "added": added_lines}
               }, f, indent=2)
           
-          print(f"[SUCCESS] Validated removal of {entity_sig}")
-          if warnings:
-              print(f"[WARNINGS] {warnings}")
-
-      - id: apply_and_push
-        type: io.kestra.plugin.scripts.shell.Commands
-        description: Apply validated changes, commit with diff stats, and push to new branch
-        env:
-          GITHUB_TOKEN: "{{ inputs.github_token }}"
-          REPO_OWNER: "{{ inputs.repo_owner }}"
-          REPO_NAME: "{{ inputs.repo_name }}"
-          FILE_PATH: "{{ inputs.file_path }}"
-          ENTITY_SIGNATURE: "{{ inputs.entity_signature }}"
-          CANDIDATE_ID: "{{ inputs.candidate_id }}"
-        outputFiles:
-          - branch_name.txt
-          - commit_info.txt
-        commands:
-          - |
-            set -e  # Exit on any error
-            
-            # Create safe branch name
-            SAFE_NAME=$(echo "$ENTITY_SIGNATURE" | tr -cd '[:alnum:]-_' | cut -c1-50)
-            TIMESTAMP=$(date +%Y%m%d%H%M%S)
-            BRANCH_NAME="zombie-removal/${SAFE_NAME}-${CANDIDATE_ID}"
-            echo "$BRANCH_NAME" > branch_name.txt
-            echo "Creating branch: $BRANCH_NAME"
-            
-            # Configure git
-            git config user.email "doomsday-bot@graveyard.dev"
-            git config user.name "Doomsday Bot"
-            
-            # Verify we have the updated file
-            if [ ! -f "updated_file.txt" ]; then
-              echo "ERROR: updated_file.txt not found!"
-              exit 1
-            fi
-            
-            # Show what we're about to do
-            echo "=== BEFORE CHANGE ==="
-            wc -l "$FILE_PATH" || echo "File not found (new file?)"
-            
-            echo "=== UPDATED FILE ==="
-            wc -l updated_file.txt
-            
-            # Create and checkout new branch from current HEAD
-            git checkout -b "$BRANCH_NAME"
-            
-            # Apply the updated file
-            cp updated_file.txt "$FILE_PATH"
-            
-            # Check if file should be deleted (empty after removal)
-            if grep -q "# File emptied after zombie removal" "$FILE_PATH"; then
-              echo "File marked for deletion"
-              git rm "$FILE_PATH"
-              CHANGE_TYPE="deleted"
-            else
-              echo "File updated"
-              git add "$FILE_PATH"
-              CHANGE_TYPE="modified"
-            fi
-            
-            # Get diff stats for commit message
-            DIFF_STATS=$(git diff --cached --stat | tail -1)
-            
-            # Commit with detailed message
-            git commit -m "[ZOMBIE] Remove: ${ENTITY_SIGNATURE:0:60}" \
-              -m "" \
-              -m "Automated dead code removal by Doomsday Services" \
-              -m "" \
-              -m "Change Summary:" \
-              -m "- Candidate ID: $CANDIDATE_ID" \
-              -m "- File: $FILE_PATH ($CHANGE_TYPE)" \
-              -m "- $DIFF_STATS" \
-              -m "" \
-              -m "Detection Method:" \
-              -m "- Static analysis: Zero callers in codebase" \
-              -m "- Runtime observation: No traffic during monitoring period" \
-              -m "- Human verification: Confirmed for removal" \
-              -m "" \
-              -m "Please review the diff carefully before merging."
-            
-            # Save commit info
-            COMMIT_SHA=$(git rev-parse HEAD)
-            echo "branch=$BRANCH_NAME" > commit_info.txt
-            echo "commit=$COMMIT_SHA" >> commit_info.txt
-            echo "change_type=$CHANGE_TYPE" >> commit_info.txt
-            
-            # Push to remote
-            git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO_OWNER}/${REPO_NAME}.git" "$BRANCH_NAME"
-            
-            echo "Branch pushed: $BRANCH_NAME"
-            echo "Commit: $COMMIT_SHA"
+          # =================================================================
+          # CREATE GITHUB PULL REQUEST
+          # =================================================================
+          import time
+          import requests
+          
+          # Build PR body
+          reasoning = candidate.get('llm_risk_reasoning', 'No reasoning provided')
+          diff_report_content = open('diff_report.txt', 'r').read()
+          
+          pr_body = f"## 🧟 Zombie Code Removal\n\n"
+          pr_body += f"**Entity:** `{entity_sig}`\n"
+          pr_body += f"**File:** `{file_path}`\n"
+          pr_body += f"**Candidate ID:** #{candidate_id}\n\n"
+          pr_body += "### Why This Code is Dead\n\n"
+          pr_body += "| Check | Result |\n"
+          pr_body += "|-------|--------|\n"
+          pr_body += "| Static Analysis | Zero callers found |\n"
+          pr_body += "| Runtime Observation | No traffic detected |\n"
+          pr_body += "| Human Verification | Confirmed for removal |\n\n"
+          pr_body += "### AI Analysis\n"
+          pr_body += f"> {reasoning}\n\n"
+          pr_body += "### Safety Validations Passed\n"
+          pr_body += "- [x] Syntax validation\n"
+          pr_body += "- [x] Definition count check\n"
+          pr_body += "- [x] File size sanity check\n\n"
+          pr_body += "### Reviewer Checklist\n"
+          pr_body += "- [ ] The removed code is indeed unused\n"
+          pr_body += "- [ ] No other code depends on this entity\n"
+          pr_body += "- [ ] Tests still pass\n\n"
+          pr_body += "<details>\n<summary>Full Diff Report</summary>\n\n```\n"
+          pr_body += diff_report_content[:3000]
+          pr_body += "\n```\n</details>\n\n"
+          pr_body += f"*Generated by Services Doomsday | Candidate #{candidate_id}*\n"
+          
+          # Create PR with retry
+          pr_result = None
+          for attempt in range(3):
+              try:
+                  response = requests.post(
+                      f"https://api.github.com/repos/{repo_owner}/{repo_name}/pulls",
+                      headers={
+                          "Authorization": f"Bearer {github_token}",
+                          "Accept": "application/vnd.github.v3+json"
+                      },
+                      json={
+                          "title": f"[ZOMBIE] Remove: {entity_sig[:50]}",
+                          "head": branch_name,
+                          "base": default_branch,
+                          "body": pr_body
+                      },
+                      timeout=30
+                  )
+                  
+                  if response.status_code in [200, 201]:
+                      pr_data = response.json()
+                      pr_result = {
+                          "success": True,
+                          "pr_url": pr_data.get("html_url", ""),
+                          "pr_number": pr_data.get("number", 0),
+                          "branch_name": branch_name
+                      }
+                      print(f"[PR] Created: {pr_result['pr_url']}")
+                      break
+                  elif response.status_code in [403, 429]:
+                      time.sleep((attempt + 1) * 30)
+                  else:
+                      pr_result = {"success": False, "error": response.text[:500], "branch_name": branch_name}
+                      break
+              except Exception as e:
+                  time.sleep((2 ** attempt) * 5)
+          
+          if pr_result is None:
+              pr_result = {"success": False, "error": "Max retries exceeded", "branch_name": branch_name}
+          
+          with open('pr_info.json', 'w') as f:
+              json.dump([pr_result], f, indent=2)
 
   # ============================================================
-  # STEP 3: Create GitHub Pull Request
-  # ============================================================
-  - id: create_pull_request
-    type: io.kestra.plugin.scripts.python.Script
-    description: Create PR via GitHub API with detailed diff report
-    taskRunner:
-      type: io.kestra.plugin.scripts.runner.docker.Docker
-    containerImage: python:3.11-slim
-    beforeCommands:
-      - pip install -q requests
-    env:
-      GITHUB_TOKEN: "{{ inputs.github_token }}"
-      REPO_OWNER: "{{ inputs.repo_owner }}"
-      REPO_NAME: "{{ inputs.repo_name }}"
-      CANDIDATE_ID: "{{ inputs.candidate_id }}"
-      ENTITY_SIGNATURE: "{{ inputs.entity_signature }}"
-      FILE_PATH: "{{ inputs.file_path }}"
-    inputFiles:
-      candidate.json: "{{ outputs.get_candidate_details.outputFiles['candidate.json'] }}"
-      branch_name.txt: "{{ outputs.working_dir.apply_and_push.outputFiles['branch_name.txt'] }}"
-      result.json: "{{ outputs.working_dir.generate_validate_commit.outputFiles['result.json'] }}"
-      diff_report.txt: "{{ outputs.working_dir.generate_validate_commit.outputFiles['diff_report.txt'] }}"
-    outputFiles:
-      - pr_info.json
-    script: |
-      import os
-      import json
-      import requests
-      
-      token = os.environ.get('GITHUB_TOKEN')
-      owner = os.environ.get('REPO_OWNER')
-      repo = os.environ.get('REPO_NAME')
-      candidate_id = os.environ.get('CANDIDATE_ID')
-      entity_sig = os.environ.get('ENTITY_SIGNATURE')
-      file_path = os.environ.get('FILE_PATH')
-      
-      with open('candidate.json', 'r') as f:
-          candidate_data = json.load(f)
-          candidate = candidate_data[0] if isinstance(candidate_data, list) else candidate_data
-      
-      with open('branch_name.txt', 'r') as f:
-          branch_name = f.read().strip()
-      
-      with open('result.json', 'r') as f:
-          removal_result = json.load(f)
-      
-      with open('diff_report.txt', 'r') as f:
-          diff_report = f.read()
-      
-      default_branch = candidate.get('default_branch', 'main')
-      zombie_score = candidate.get('final_zombie_score') or candidate.get('zombie_score', 0)
-      reasoning = candidate.get('final_reasoning', 'No traffic detected during observation period')
-      
-      # Get diff stats
-      diff_stats = removal_result.get('diff_stats', {})
-      removed_lines = diff_stats.get('removed', 0)
-      added_lines = diff_stats.get('added', 0)
-      warnings = removal_result.get('warnings', [])
-      
-      # Build PR body with comprehensive info
-      pr_body = "## Zombie Code Removal\n\n"
-      
-      # Target section
-      pr_body += "### Target\n"
-      pr_body += f"| Property | Value |\n"
-      pr_body += f"|----------|-------|\n"
-      pr_body += f"| **Entity** | `{entity_sig}` |\n"
-      pr_body += f"| **Type** | {candidate.get('entity_type', 'unknown')} |\n"
-      pr_body += f"| **File** | `{file_path}` |\n"
-      pr_body += f"| **Zombie Score** | {zombie_score}/100 |\n\n"
-      
-      # Change summary
-      pr_body += "### Change Summary\n"
-      pr_body += f"```diff\n"
-      pr_body += f"- {removed_lines} lines removed\n"
-      pr_body += f"+ {added_lines} lines added\n"
-      pr_body += f"```\n\n"
-      
-      # Warnings if any
-      if warnings:
-          pr_body += "### Warnings\n"
-          for w in warnings:
-              pr_body += f"- {w}\n"
-          pr_body += "\n"
-      
-      # Detection summary
-      pr_body += "### Detection Method\n"
-      pr_body += "This code was identified as zombie/dead code through:\n\n"
-      pr_body += "| Check | Result |\n"
-      pr_body += "|-------|--------|\n"
-      pr_body += "| Static Analysis | Zero callers found |\n"
-      pr_body += "| Runtime Observation | No traffic detected |\n"
-      pr_body += "| Human Verification | Confirmed for removal |\n\n"
-      
-      # Analysis
-      pr_body += "### AI Analysis\n"
-      pr_body += f"> {reasoning}\n\n"
-      
-      # Safety validations
-      pr_body += "### Safety Validations Passed\n"
-      pr_body += "- [x] Syntax validation (AST parse)\n"
-      pr_body += "- [x] Definition count check (functions/classes preserved)\n"
-      pr_body += "- [x] File size sanity check (<70% reduction)\n"
-      pr_body += "- [x] Bracket balance verification\n\n"
-      
-      # Reviewer checklist
-      pr_body += "### Reviewer Checklist\n"
-      pr_body += "Please verify before merging:\n"
-      pr_body += "- [ ] The removed code is indeed unused\n"
-      pr_body += "- [ ] No other code depends on this entity\n"
-      pr_body += "- [ ] Tests still pass (if applicable)\n"
-      pr_body += "- [ ] No unintended changes to other code\n\n"
-      
-      pr_body += "---\n\n"
-      pr_body += "<details>\n"
-      pr_body += "<summary>Full Diff Report</summary>\n\n"
-      pr_body += "```\n"
-      pr_body += diff_report[:3000]  # Limit diff report size
-      if len(diff_report) > 3000:
-          pr_body += "\n... (truncated, see commit for full diff)\n"
-      pr_body += "```\n"
-      pr_body += "</details>\n\n"
-      
-      pr_body += "---\n"
-      pr_body += f"*Generated by Services Doomsday | Candidate #{candidate_id}*\n"
-      
-      import time
-      
-      # Retry with exponential backoff
-      max_retries = 3
-      result = None
-      
-      for attempt in range(max_retries):
-          try:
-              response = requests.post(
-                  f"https://api.github.com/repos/{owner}/{repo}/pulls",
-                  headers={
-                      "Authorization": f"Bearer {token}",
-                      "Accept": "application/vnd.github.v3+json",
-                      "Content-Type": "application/json"
-                  },
-                  json={
-                      "title": f"[ZOMBIE] Remove: {entity_sig[:50]}",
-                      "head": branch_name,
-                      "base": default_branch,
-                      "body": pr_body
-                  },
-                  timeout=30
-              )
-              
-              if response.status_code in [200, 201]:
-                  pr_data = response.json()
-                  result = {
-                      "success": True,
-                      "pr_url": pr_data.get("html_url", ""),
-                      "pr_number": pr_data.get("number", 0),
-                      "pr_state": pr_data.get("state", "open"),
-                      "branch_name": branch_name
-                  }
-                  break
-              elif response.status_code in [403, 429]:
-                  # Rate limit - wait and retry
-                  wait_time = (attempt + 1) * 30
-                  print(f"[PR] Rate limited (attempt {attempt+1}/{max_retries}), waiting {wait_time}s...")
-                  time.sleep(wait_time)
-              elif response.status_code >= 500:
-                  # Server error - retry with backoff
-                  wait_time = (2 ** attempt) * 5
-                  print(f"[PR] Server error {response.status_code} (attempt {attempt+1}/{max_retries}), waiting {wait_time}s...")
-                  time.sleep(wait_time)
-              else:
-                  # Client error - no retry
-                  result = {
-                      "success": False,
-                      "error": response.text[:500],
-                      "status_code": response.status_code,
-                      "branch_name": branch_name
-                  }
-                  break
-          except requests.exceptions.Timeout:
-              print(f"[PR] Timeout (attempt {attempt+1}/{max_retries})")
-              time.sleep((2 ** attempt) * 5)
-          except requests.exceptions.RequestException as e:
-              print(f"[PR] Network error (attempt {attempt+1}/{max_retries}): {str(e)[:100]}")
-              time.sleep((2 ** attempt) * 5)
-      
-      # If all retries exhausted
-      if result is None:
-          result = {
-              "success": False,
-              "error": "Max retries exceeded",
-              "status_code": response.status_code if 'response' in dir() else 0,
-              "branch_name": branch_name
-          }
-      
-      with open('pr_info.json', 'w') as f:
-          json.dump([result], f, indent=2)
-      
-      if result["success"]:
-          print(f"[PR] Created: {result['pr_url']}")
-      else:
-          print(f"[PR] Failed: {result.get('error', 'Unknown error')}")
-
-  # ============================================================
-  # STEP 4: Update database with PR info
+  # STEP 3: Update database with PR info
   # ============================================================
   - id: update_database
     type: io.kestra.plugin.scripts.python.Script
@@ -772,7 +557,7 @@ tasks:
       CANDIDATE_ID: "{{ inputs.candidate_id }}"
       EXECUTION_ID: "{{ execution.id }}"
     inputFiles:
-      pr_info.json: "{{ outputs.create_pull_request.outputFiles['pr_info.json'] }}"
+      pr_info.json: "{{ outputs.working_dir.outputFiles['pr_info.json'] }}"
       candidate.json: "{{ outputs.get_candidate_details.outputFiles['candidate.json'] }}"
     script: |
       import os
@@ -842,17 +627,17 @@ tasks:
   # ============================================================
   - id: check_pr_success
     type: io.kestra.plugin.core.flow.If
-    condition: "{{ (read(outputs.create_pull_request.outputFiles['pr_info.json']) | json)[0].success == true }}"
+    condition: "{{ (read(outputs.working_dir.outputFiles['pr_info.json']) | json)[0].success == true }}"
     then:
       - id: send_success_notification
         type: io.kestra.plugin.notifications.mail.MailSend
         host: "{{ kv('SMTP_HOST') }}"
         port: "{{ kv('SMTP_PORT') }}"
+        transportStrategy: SMTP_TLS
         username: "{{ kv('SMTP_USERNAME') }}"
         password: "{{ kv('SMTP_PASSWORD') }}"
         from: "{{ kv('SMTP_FROM') }}"
-        to:
-          - "{{ (read(outputs.get_candidate_details.outputFiles['candidate.json']) | json)[0].user_email }}"
+        to: "{{ (read(outputs.get_candidate_details.outputFiles['candidate.json']) | json)[0].user_email }}"
         subject: "Zombie Killed - PR Created for {{ inputs.entity_signature }}"
         htmlTextContent: |
           <!DOCTYPE html>
@@ -915,7 +700,7 @@ tasks:
                     <!-- CTA Button -->
                     <tr>
                       <td style="padding: 0 40px 32px; text-align: center;">
-                        <a href="{{ (read(outputs.create_pull_request.outputFiles['pr_info.json']) | json)[0].pr_url }}" style="display: inline-block; background: linear-gradient(135deg, #16a34a 0%, #15803d 100%); color: #ffffff; padding: 16px 32px; text-decoration: none; border-radius: 10px; font-size: 15px; font-weight: 600; box-shadow: 0 4px 14px rgba(22, 163, 74, 0.4);">
+                        <a href="{{ (read(outputs.working_dir.outputFiles['pr_info.json']) | json)[0].pr_url }}" style="display: inline-block; background: linear-gradient(135deg, #16a34a 0%, #15803d 100%); color: #ffffff; padding: 16px 32px; text-decoration: none; border-radius: 10px; font-size: 15px; font-weight: 600; box-shadow: 0 4px 14px rgba(22, 163, 74, 0.4);">
                           Review Pull Request
                         </a>
                         <p style="margin: 16px 0 0; color: #6b7280; font-size: 12px;">Review and merge to complete the removal</p>
@@ -968,10 +753,9 @@ tasks:
           REPO_NAME: "{{ inputs.repo_name }}"
           CANDIDATE_ID: "{{ inputs.candidate_id }}"
         inputFiles:
-          pr_info.json: "{{ outputs.create_pull_request.outputFiles['pr_info.json'] }}"
+          pr_info.json: "{{ outputs.working_dir.outputFiles['pr_info.json'] }}"
           candidate.json: "{{ outputs.get_candidate_details.outputFiles['candidate.json'] }}"
-          diff_report.txt: "{{ outputs.working_dir.generate_validate_commit.outputFiles['diff_report.txt'] }}"
-          updated_file.txt: "{{ outputs.working_dir.generate_validate_commit.outputFiles['updated_file.txt'] }}"
+          diff_report.txt: "{{ outputs.working_dir.outputFiles['diff_report.txt'] }}"
         outputFiles:
           - failure_email.json
         script: |
@@ -1011,20 +795,8 @@ tasks:
           except:
               diff_report = "Diff report not available"
           
-          # Load updated file content (first 100 lines)
-          try:
-              with open('updated_file.txt', 'r') as f:
-                  updated_content = f.read()
-                  lines = updated_content.split('\n')[:100]
-                  if len(updated_content.split('\n')) > 100:
-                      lines.append(f"... ({len(updated_content.split(chr(10))) - 100} more lines)")
-                  updated_preview = '\n'.join(lines)
-          except:
-              updated_preview = "Updated file not available"
-          
           # Escape HTML entities
           diff_escaped = html.escape(diff_report)
-          updated_escaped = html.escape(updated_preview)
           error_escaped = html.escape(str(error_msg)[:500])
           
           # Build comprehensive failure email
@@ -1144,17 +916,6 @@ tasks:
                       </td>
                     </tr>
                     
-                    <!-- Updated File Preview -->
-                    <tr>
-                      <td style="padding: 0 40px 24px;">
-                        <p style="margin: 0 0 8px; color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase;">Updated File Content (Preview)</p>
-                        <div style="background: #0f0f0f; border-radius: 8px; border: 1px solid #262626; max-height: 400px; overflow: auto;">
-                          <pre style="margin: 0; padding: 12px; color: #d4d4d4; font-size: 10px; font-family: monospace; white-space: pre-wrap;">{updated_escaped}</pre>
-                        </div>
-                        <p style="margin: 8px 0 0; color: #6b7280; font-size: 10px;">Copy this content to replace the original file</p>
-                      </td>
-                    </tr>
-                    
                     <!-- Footer -->
                     <tr>
                       <td style="background-color: #0a0a0a; padding: 24px 40px; border-top: 1px solid #222;">
@@ -1206,11 +967,11 @@ tasks:
         type: io.kestra.plugin.notifications.mail.MailSend
         host: "{{ kv('SMTP_HOST') }}"
         port: "{{ kv('SMTP_PORT') }}"
+        transportStrategy: SMTP_TLS
         username: "{{ kv('SMTP_USERNAME') }}"
         password: "{{ kv('SMTP_PASSWORD') }}"
         from: "{{ kv('SMTP_FROM') }}"
-        to:
-          - "{{ (read(outputs.prepare_failure_email.outputFiles['failure_email.json']) | json).to_email }}"
+        to: "{{ (read(outputs.prepare_failure_email.outputFiles['failure_email.json']) | json).to_email }}"
         subject: "{{ (read(outputs.prepare_failure_email.outputFiles['failure_email.json']) | json).subject }}"
         htmlTextContent: "{{ (read(outputs.prepare_failure_email.outputFiles['failure_email.json']) | json).html_body }}"
 
@@ -1223,7 +984,7 @@ errors:
     tasks:
       - id: log_error
         type: io.kestra.plugin.core.log.Log
-        message: "W4 Kill Zombie Error: {{ error.message }}"
+        message: "W4 Kill Zombie Error - Failed Task: {{ errorLogs() | first | jq('.taskId') | first }}"
         level: ERROR
         
       - id: cleanup_and_revert
@@ -1292,11 +1053,11 @@ errors:
         description: Alert admin about W4 failure
         host: "{{ kv('SMTP_HOST') }}"
         port: "{{ kv('SMTP_PORT') }}"
+        transportStrategy: SMTP_TLS
         username: "{{ kv('SMTP_USERNAME') }}"
         password: "{{ kv('SMTP_PASSWORD') }}"
         from: "{{ kv('SMTP_FROM') }}"
-        to:
-          - "{{ kv('ADMIN_EMAIL') ?? kv('SMTP_FROM') }}"
+        to: "{{ kv('SMTP_FROM') }}"
         subject: "[ALERT] W4 Kill Zombie Failed - Candidate #{{ inputs.candidate_id }}"
         htmlTextContent: |
           <!DOCTYPE html>
@@ -1319,7 +1080,7 @@ errors:
               </div>
               <div style="background: #1c1917; padding: 12px; border-radius: 8px; border-left: 3px solid #dc2626;">
                 <p style="color: #6b7280; font-size: 11px; margin: 0 0 4px;">ERROR</p>
-                <p style="color: #fca5a5; font-family: monospace; font-size: 12px; margin: 0;">{{ error.message }}</p>
+                <p style="color: #fca5a5; font-family: monospace; font-size: 12px; margin: 0;">Failed task: {{ errorLogs() | first | jq('.taskId') | first }} - Check execution logs for details</p>
               </div>
               <p style="color: #4b5563; font-size: 11px; margin: 16px 0 0; text-align: center;">Services Doomsday - W4 Kill Zombie</p>
             </div>

@@ -207,13 +207,10 @@ export const WATCHER_STATUS_CONFIG = {
 } as const;
 
 export const OBSERVABILITY_SOURCE_TYPES = [
-  { id: "prometheus", value: "prometheus", label: "Prometheus", placeholder: "https://prometheus.example.com/api/v1/query" },
-  { id: "grafana", value: "grafana", label: "Grafana", placeholder: "https://grafana.example.com" },
-  { id: "loki", value: "loki", label: "Loki", placeholder: "https://loki.example.com/loki/api/v1/query" },
+  { id: "prometheus", value: "prometheus", label: "Prometheus", placeholder: "https://prometheus.example.com" },
+  { id: "loki", value: "loki", label: "Loki", placeholder: "https://loki.example.com" },
+  { id: "grafana", value: "grafana", label: "Grafana", placeholder: "https://your-stack.grafana.net" },
   { id: "datadog", value: "datadog", label: "Datadog", placeholder: "https://api.datadoghq.com" },
-  { id: "cloudwatch", value: "cloudwatch", label: "CloudWatch", placeholder: "arn:aws:logs:region:account:log-group" },
-  { id: "newrelic", value: "newrelic", label: "New Relic", placeholder: "https://api.newrelic.com" },
-  { id: "custom", value: "custom", label: "Custom", placeholder: "https://..." },
 ] as const;
 
 /**

@@ -3,22 +3,23 @@
 import { useState, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import {
-    Clock,
-    CheckSquare,
-    Square,
-    PlayCircle,
-    PauseCircle,
-    Calendar,
-    ChevronRight,
-    Filter,
-    Radio,
-    RefreshCw,
-    Play,
-    Loader2,
-    Skull,
+  Clock,
+  CheckSquare,
+  Square,
+  PlayCircle,
+  PauseCircle,
+  Calendar,
+  ChevronRight,
+  Filter,
+  Radio,
+  RefreshCw,
+  Play,
+  Loader2,
+  Skull,
 } from "lucide-react";
 import { formatRelativeTime, getDerivedCandidateStatus } from "@/lib/utils";
 import { CandidateStatusBadge, EntityIcon, ZombieScoreBadge, VerdictBadge } from "@/components/ui/shared";
+import { KillSuccessDialog } from "@/components/ui/KillSuccessDialog";
 
 // Types - Flexible candidate interface that accepts ZombieCandidate
 interface Candidate {
@@ -82,6 +83,11 @@ export function CandidateList({
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [actionLoading, setActionLoading] = useState<number | null>(null);
+  
+  // Kill success dialog state
+  const [killSuccessOpen, setKillSuccessOpen] = useState(false);
+  const [killExecutionId, setKillExecutionId] = useState("");
+  const [killEntitySignature, setKillEntitySignature] = useState("");
 
   // Filter candidates
   const filteredCandidates = useMemo(() => {
@@ -172,7 +178,10 @@ export function CandidateList({
         throw new Error(data.error || "Failed to kill zombie");
       }
       
-      alert(`🎯 Kill workflow triggered!\nExecution ID: ${data.executionId}`);
+      // Show success dialog
+      setKillExecutionId(data.executionId);
+      setKillEntitySignature(entitySignature);
+      setKillSuccessOpen(true);
       onRefresh();
     } catch (error) {
       console.error("Failed to kill zombie:", error);
@@ -488,6 +497,14 @@ export function CandidateList({
           ))
         )}
       </div>
+      
+      {/* Kill Success Dialog */}
+      <KillSuccessDialog
+        isOpen={killSuccessOpen}
+        onClose={() => setKillSuccessOpen(false)}
+        executionId={killExecutionId}
+        entitySignature={killEntitySignature}
+      />
     </div>
   );
 }

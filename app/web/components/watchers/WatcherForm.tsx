@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { motion, AnimatePresence, useMotionTemplate, useMotionValue } from "framer-motion";
 import { X, Plus, Clock, Trash2, ChevronDown, AlertCircle } from "lucide-react";
 import { Input } from "@/components/ui/input";
@@ -14,6 +14,7 @@ interface ObservabilitySource {
   url: string;
   type: string;
   token: string;
+  userId?: string;
 }
 
 interface WatcherFormData {
@@ -107,24 +108,17 @@ export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: 
     repo: "",
     repoDescription: "",
     applicationUrl: "",
-    githubToken: "",
-    observabilitySources: [{ url: "", type: "prometheus", token: "" }],
+    githubToken: authGithubToken || "",
+    observabilitySources: [{ url: "", type: "prometheus", token: "", userId: "" }],
   });
   const [expandedSource, setExpandedSource] = useState<number | null>(0);
-
-  // Auto-populate GitHub token from OAuth session
-  useEffect(() => {
-    if (authGithubToken && !formData.githubToken) {
-      setFormData(prev => ({ ...prev, githubToken: authGithubToken }));
-    }
-  }, [authGithubToken, formData.githubToken]);
 
   const handleAddSource = () => {
     setFormData({
       ...formData,
       observabilitySources: [
         ...formData.observabilitySources,
-        { url: "", type: "prometheus", token: "" },
+        { url: "", type: "prometheus", token: "", userId: "" },
       ],
     });
     setExpandedSource(formData.observabilitySources.length);
@@ -144,6 +138,17 @@ export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: 
   const handleSourceChange = (index: number, field: keyof ObservabilitySource, value: string) => {
     const newSources = [...formData.observabilitySources];
     newSources[index] = { ...newSources[index], [field]: value };
+    
+    // Auto-extract userId from Grafana Cloud tokens
+    if (field === "token" && value.startsWith("glc_")) {
+      try {
+        const tokenData = JSON.parse(atob(value.substring(4)));
+        newSources[index].userId = tokenData.o || "";
+      } catch {
+        // Invalid token format, ignore
+      }
+    }
+    
     setFormData({ ...formData, observabilitySources: newSources });
   };
 
@@ -363,9 +368,7 @@ export function WatcherForm({ onSubmit, onClose, isCreating, validationError }: 
                                 source.type === "prometheus" && "text-orange-400 bg-orange-500/10",
                                 source.type === "grafana" && "text-yellow-400 bg-yellow-500/10",
                                 source.type === "loki" && "text-cyan-400 bg-cyan-500/10",
-                                source.type === "datadog" && "text-purple-400 bg-purple-500/10",
-                                source.type === "cloudwatch" && "text-blue-400 bg-blue-500/10",
-                                source.type === "newrelic" && "text-green-400 bg-green-500/10"
+                                source.type === "datadog" && "text-purple-400 bg-purple-500/10"
                               )}
                             >
                               {getTypeConfig(source.type).label}

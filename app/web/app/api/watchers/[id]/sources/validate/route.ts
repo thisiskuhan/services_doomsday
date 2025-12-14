@@ -17,7 +17,7 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 
 interface ValidateRequest {
-  sourceType: "grafana" | "datadog" | "prometheus" | "newrelic" | "sentry" | "custom";
+  sourceType: "prometheus" | "loki" | "grafana" | "datadog";
   sourceUrl: string;
 }
 
@@ -31,14 +31,12 @@ interface ValidationResult {
   };
 }
 
-// URL validation patterns for known observability platforms
+// URL validation patterns for the 4 supported observability platforms
 const URL_PATTERNS: Record<string, RegExp> = {
-  grafana: /^https?:\/\/.*\/(d\/|dashboard\/|api\/)/i,
-  datadog: /^https?:\/\/(app\.)?datadoghq\.(com|eu)/i,
-  prometheus: /^https?:\/\/.*\/(api\/v1|prometheus)/i,
-  newrelic: /^https?:\/\/(one\.)?newrelic\.com/i,
-  sentry: /^https?:\/\/(.*\.)?sentry\.io/i,
-  custom: /^https?:\/\/.+/i,
+  prometheus: /^https?:\/\/.+/i,
+  loki: /^https?:\/\/.+/i,
+  grafana: /^https?:\/\/.+(grafana|\.net)/i,
+  datadog: /^https?:\/\/(api\.)?datadoghq\.(com|eu|us3|us5|ap1)/i,
 };
 
 async function validateSourceUrl(sourceType: string, sourceUrl: string): Promise<ValidationResult> {
@@ -50,7 +48,14 @@ async function validateSourceUrl(sourceType: string, sourceUrl: string): Promise
   }
 
   // Check URL pattern for known platforms
-  const pattern = URL_PATTERNS[sourceType] || URL_PATTERNS.custom;
+  const pattern = URL_PATTERNS[sourceType];
+  if (!pattern) {
+    return { 
+      valid: false, 
+      message: `Invalid source type. Must be one of: prometheus, loki, grafana, datadog`
+    };
+  }
+  
   if (!pattern.test(sourceUrl)) {
     return { 
       valid: false, 
@@ -136,7 +141,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const validTypes = ["grafana", "datadog", "prometheus", "newrelic", "sentry", "custom"];
+    const validTypes = ["prometheus", "loki", "grafana", "datadog"];
     if (!validTypes.includes(body.sourceType)) {
       return NextResponse.json(
         { error: `Invalid sourceType. Must be one of: ${validTypes.join(", ")}` },

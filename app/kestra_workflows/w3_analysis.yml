@@ -316,7 +316,7 @@ tasks:
               ZOMBIE_THRESHOLD: "{{ vars.zombie_confidence_threshold }}"
               HEALTHY_THRESHOLD: "{{ vars.healthy_confidence_threshold }}"
             inputFiles:
-              evidence.json: "{{ outputs.gather_evidence.outputFiles['evidence.json'] }}"
+              evidence.json: "{{ parent.outputs.gather_evidence.outputFiles['evidence.json'] }}"
             outputFiles:
               - verdict.json
             script: |
@@ -457,7 +457,7 @@ tasks:
               APP_BASE_URL: "{{ vars.app_base_url }}"
               KESTRA_URL: "http://host.docker.internal:8080"
             inputFiles:
-              verdict.json: "{{ outputs.llm_final_verdict.outputFiles['verdict.json'] }}"
+              verdict.json: "{{ parent.outputs.llm_final_verdict.outputFiles['verdict.json'] }}"
             outputFiles:
               - email_data.json
             script: |
@@ -596,7 +596,7 @@ tasks:
             env:
               DATABASE_URL: "{{ secret('DATABASE_URL') }}"
             inputFiles:
-              email_data.json: "{{ outputs.update_candidate.outputFiles['email_data.json'] }}"
+              email_data.json: "{{ parent.outputs.update_candidate.outputFiles['email_data.json'] }}"
             outputFiles:
               - email_content.json
             script: |
@@ -879,13 +879,13 @@ tasks:
             timeout: PT1M
             host: "{{ kv('SMTP_HOST') }}"
             port: "{{ kv('SMTP_PORT') }}"
+            transportStrategy: SMTP_TLS
             username: "{{ kv('SMTP_USERNAME') }}"
             password: "{{ kv('SMTP_PASSWORD') }}"
             from: "{{ kv('SMTP_FROM') }}"
-            to:
-              - "{{ (read(outputs.prepare_email.outputFiles['email_content.json']) | json)[0].to_email }}"
-            subject: "{{ (read(outputs.prepare_email.outputFiles['email_content.json']) | json)[0].subject }}"
-            htmlTextContent: "{{ (read(outputs.prepare_email.outputFiles['email_content.json']) | json)[0].html_body }}"
+            to: "{{ (read(parent.outputs.prepare_email.outputFiles['email_content.json']) | json)[0].to_email }}"
+            subject: "{{ (read(parent.outputs.prepare_email.outputFiles['email_content.json']) | json)[0].subject }}"
+            htmlTextContent: "{{ (read(parent.outputs.prepare_email.outputFiles['email_content.json']) | json)[0].html_body }}"
 
     else:
       - id: no_candidates_ready
@@ -917,11 +917,11 @@ errors:
         description: Alert admin about W3 failure
         host: "{{ kv('SMTP_HOST') }}"
         port: "{{ kv('SMTP_PORT') }}"
+        transportStrategy: SMTP_TLS
         username: "{{ kv('SMTP_USERNAME') }}"
         password: "{{ kv('SMTP_PASSWORD') }}"
         from: "{{ kv('SMTP_FROM') }}"
-        to:
-          - "{{ kv('ADMIN_EMAIL') ?? kv('SMTP_FROM') }}"
+        to: "{{ kv('ADMIN_EMAIL') ?? kv('SMTP_FROM') }}"
         subject: "[ALERT] W3 Analysis Workflow Failed"
         htmlTextContent: |
           <!DOCTYPE html>

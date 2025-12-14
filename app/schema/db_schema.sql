@@ -342,6 +342,22 @@ CREATE TABLE IF NOT EXISTS email_threads (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- ============================================================================
+-- WORKFLOW HEALTH TRACKING TABLE
+-- ============================================================================
+-- Tracks workflow execution health for alerting on repeated failures
+
+CREATE TABLE IF NOT EXISTS workflow_health (
+    workflow_id VARCHAR(50) PRIMARY KEY,
+    consecutive_failures INT DEFAULT 0,
+    total_failures INT DEFAULT 0,
+    last_failure_at TIMESTAMP WITH TIME ZONE,
+    last_success_at TIMESTAMP WITH TIME ZONE,
+    last_error TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 CREATE INDEX IF NOT EXISTS idx_watchers_user_id ON watchers(user_id);
 CREATE INDEX IF NOT EXISTS idx_watchers_status ON watchers(status);
 CREATE INDEX IF NOT EXISTS idx_watchers_repo_name ON watchers(repo_name);

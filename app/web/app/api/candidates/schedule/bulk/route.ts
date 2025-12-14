@@ -31,7 +31,7 @@ interface BulkScheduleRequest {
 // Validation constants
 const MIN_SCAN_FREQUENCY_MINUTES = 5;  // Must match DB constraint
 const MAX_SCAN_FREQUENCY_MINUTES = 1440; // 24 hours
-const MIN_ANALYSIS_PERIOD_MINUTES = 10;
+const MIN_ANALYSIS_PERIOD_MINUTES = 7;
 const MAX_ANALYSIS_PERIOD_MINUTES = 525600; // 365 days
 const MAX_BATCH_SIZE = 100;
 

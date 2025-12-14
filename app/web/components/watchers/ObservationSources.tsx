@@ -197,8 +197,6 @@ export function ObservationSources({
       case "grafana": return "text-yellow-400 bg-yellow-500/10";
       case "loki": return "text-cyan-400 bg-cyan-500/10";
       case "datadog": return "text-purple-400 bg-purple-500/10";
-      case "cloudwatch": return "text-blue-400 bg-blue-500/10";
-      case "newrelic": return "text-green-400 bg-green-500/10";
       default: return "text-zinc-400 bg-zinc-500/10";
     }
   };

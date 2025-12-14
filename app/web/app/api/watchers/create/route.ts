@@ -191,37 +191,55 @@ async function validateObservabilitySource(source: ObservabilitySource): Promise
     // Check if it's a Grafana Cloud token (starts with glc_)
     const isGrafanaCloudToken = token.startsWith("glc_");
     
-    // Extract user ID from Grafana Cloud token for Basic Auth
+    // Extract user ID and API key from Grafana Cloud token for Basic Auth
     let grafanaUserId = overrideUserId || ""; // Use override if provided
-    if (isGrafanaCloudToken && !grafanaUserId) {
+    let grafanaApiKey = "";
+    if (isGrafanaCloudToken) {
       try {
         // Grafana Cloud tokens are base64 encoded JSON after "glc_"
         const tokenData = JSON.parse(atob(token.substring(4)));
-        // Use override userId if provided, otherwise fall back to token's "o" field
-        grafanaUserId = tokenData.o || "";
+        // Extract organization ID and API key
+        if (!grafanaUserId) {
+          grafanaUserId = tokenData.o || "";
+        }
+        grafanaApiKey = tokenData.k || "";
       } catch {
         // If parsing fails, userId stays empty
       }
     }
 
+    console.log(`[${type}] Validating source:`, {
+      isGrafanaCloudToken,
+      hasOverrideUserId: !!overrideUserId,
+      grafanaUserId,
+      hasApiKey: !!grafanaApiKey,
+      urlPreview: url.substring(0, 30) + '...'
+    });
+
     switch (type) {
       case "prometheus":
       case "loki":
-        // Grafana Cloud uses Basic Auth with user ID and the FULL token (not just API key)
-        if (isGrafanaCloudToken && grafanaUserId) {
-          headers["Authorization"] = `Basic ${btoa(`${grafanaUserId}:${token}`)}`;
+        // Grafana Cloud uses Basic Auth with organization ID and API key
+        if (isGrafanaCloudToken && grafanaUserId && grafanaApiKey) {
+          headers["Authorization"] = `Basic ${btoa(`${grafanaUserId}:${grafanaApiKey}`)}`;
+          console.log(`[${type}] Using Basic Auth with userId: ${grafanaUserId} and API key`);
         } else {
           headers["Authorization"] = `Bearer ${token}`;
+          console.log(`[${type}] Using Bearer token`);
         }
         break;
       case "grafana":
         headers["Authorization"] = `Bearer ${token}`;
         break;
       case "datadog":
-        headers["DD-API-KEY"] = token;
-        break;
-      case "newrelic":
-        headers["Api-Key"] = token;
+        // Datadog uses DD-API-KEY header, optionally DD-APPLICATION-KEY for app key
+        if (token.includes(":")) {
+          const [apiKey, appKey] = token.split(":", 2);
+          headers["DD-API-KEY"] = apiKey;
+          headers["DD-APPLICATION-KEY"] = appKey;
+        } else {
+          headers["DD-API-KEY"] = token;
+        }
         break;
       default:
         headers["Authorization"] = `Bearer ${token}`;
@@ -229,7 +247,7 @@ async function validateObservabilitySource(source: ObservabilitySource): Promise
   }
 
   try {
-    // Build test endpoint based on type
+    // Build test endpoint based on type (only 4 supported: prometheus, loki, grafana, datadog)
     let testUrl = url;
     switch (type) {
       case "prometheus":
@@ -248,18 +266,9 @@ async function validateObservabilitySource(source: ObservabilitySource): Promise
         // Datadog validate endpoint
         testUrl = `${url.replace(/\/$/, "")}/api/v1/validate`;
         break;
-      case "newrelic":
-        // New Relic doesn't have a simple health check, just verify URL format
-        return { valid: true };
-      case "cloudwatch":
-        // CloudWatch ARN format validation only
-        if (url.startsWith("arn:aws:logs:")) {
-          return { valid: true };
-        }
-        return { valid: false, error: "Invalid CloudWatch ARN format" };
       default:
-        // For unknown types, just check if URL is reachable
-        break;
+        // Unknown type - just check if URL is reachable
+        return { valid: false, error: `Unsupported source type: ${type}. Only prometheus, loki, grafana, datadog are supported.` };
     }
 
     const response = await fetch(testUrl, {
@@ -268,8 +277,20 @@ async function validateObservabilitySource(source: ObservabilitySource): Promise
       signal: AbortSignal.timeout(10000),
     });
 
+    console.log(`[${type}] Response status: ${response.status} for URL: ${testUrl}`);
+
     if (response.ok) {
+      console.log(`[${type}] Validation successful`);
       return { valid: true };
+    }
+
+    // Try to get response body for more details
+    let responseBody = '';
+    try {
+      responseBody = await response.text();
+      console.log(`[${type}] Error response body:`, responseBody.substring(0, 200));
+    } catch {
+      // Ignore if we can't read the body
     }
 
     // Check specific error codes
@@ -281,6 +302,7 @@ async function validateObservabilitySource(source: ObservabilitySource): Promise
       case 404:
         // 404 might be okay for some endpoints (Prometheus query without params)
         if (type === "prometheus" || type === "loki") {
+          console.log(`[${type}] Accepting 404 as valid for ${type}`);
           return { valid: true };
         }
         return { valid: false, error: `${type}: Endpoint not found (HTTP 404)` };

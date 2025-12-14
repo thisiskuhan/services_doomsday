@@ -45,6 +45,7 @@ export interface NewWatcherForm {
     url: string;
     type: string;
     token: string;
+    userId?: string;
   }>;
 }
 

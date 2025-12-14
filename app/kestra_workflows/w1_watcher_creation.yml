@@ -87,10 +87,15 @@ inputs:
     required: false
 
   - id: observability_urls
-    type: ARRAY
-    description: Observability source URLs
+    type: JSON
+    description: |
+      Observability source configurations as JSON array. Each source should have:
+      - type: "prometheus" | "loki" | "grafana" | "datadog" | "health_check"
+      - url: The observability endpoint URL
+      - token: API token for authentication
+      - userId: (Required for Grafana Cloud) The user/instance ID for Basic Auth
+      Example: [{"type": "prometheus", "url": "https://...", "token": "glc_...", "userId": "123456"}]
     required: false
-    itemType: STRING
 
 variables:
   repo_name: "{{ inputs.repo_url | replace({'https://github.com/': '', '.git': ''}) | trim('/') }}"
@@ -412,12 +417,19 @@ tasks:
       import os
       import re
       import json
+      import sys
       
       repo_description = os.environ.get('REPO_DESCRIPTION', '')
       repo_url = os.environ.get('REPO_URL', '')
       watcher_name = os.environ.get('WATCHER_NAME', '')
-      api_key = os.environ.get('GOOGLE_API_KEY')
-      llm_model = os.environ.get('LLM_MODEL')
+      api_key = os.environ.get('GOOGLE_API_KEY', '')
+      llm_model = os.environ.get('LLM_MODEL', '')
+      
+      # DEBUG: Print environment status
+      print(f"[DEBUG] API Key present: {bool(api_key)}")
+      print(f"[DEBUG] API Key length: {len(api_key) if api_key else 0}")
+      print(f"[DEBUG] API Key starts with: {api_key[:10] if api_key else 'EMPTY'}...")
+      print(f"[DEBUG] LLM Model: {llm_model}")
       
       with open('discovery.json', 'r') as f:
           discovery = json.load(f)
@@ -427,6 +439,8 @@ tasks:
       
       with open('codebase.txt', 'r', errors='ignore') as f:
           codebase = f.read()
+      
+      print(f"[DEBUG] Codebase size: {len(codebase)} chars")
       
       result = {
           "llm_enabled": False,
@@ -441,15 +455,20 @@ tasks:
       }
       
       if not api_key:
+          print("[FATAL] Google AI API key is EMPTY or not configured")
           result["error"] = "Google AI API key not configured"
-      else:
-          try:
-              from google import genai
-              client = genai.Client(api_key=api_key)
-              
-              summary = discovery.get("summary", {})
-              
-              system_prompt = """You are a senior software architect performing a comprehensive codebase audit. Your analysis will directly influence automated monitoring decisions, so precision and depth are critical.
+          sys.exit(1)
+      
+      try:
+          print("[DEBUG] Importing google-genai...")
+          from google import genai
+          print("[DEBUG] Creating client...")
+          client = genai.Client(api_key=api_key)
+          print("[DEBUG] Client created successfully")
+          
+          summary = discovery.get("summary", {})
+          
+          system_prompt = """You are a senior software architect performing a comprehensive codebase audit. Your analysis will directly influence automated monitoring decisions, so precision and depth are critical.
 
       CRITICAL CONSTRAINTS:
       - Output MUST be valid, parseable JSON - no markdown, no explanations outside JSON
@@ -479,8 +498,8 @@ tasks:
           "high_risk_areas": ["List specific SERVICE CATEGORIES at risk - e.g., 'Authentication APIs', 'Payment Processing', 'Legacy Cron Jobs', 'Notification Workers'. DO NOT list individual files or assets - focus on business-critical service areas that may become zombies."]
         }
       }"""
-              
-              user_prompt = f"""Perform a deep analysis of this repository. Your findings will be used to identify zombie (unused/dead) SERVICES.
+          
+          user_prompt = f"""Perform a deep analysis of this repository. Your findings will be used to identify zombie (unused/dead) SERVICES.
 
       IMPORTANT: We are monitoring SERVICES - API endpoints, cron jobs, queue workers, serverless functions. NOT individual files, assets, or static resources.
 
@@ -508,43 +527,51 @@ tasks:
       ════════════════════════════════════════════════════════════════════════════════
 
       Respond with ONLY the JSON object. No preamble, no explanation, no markdown formatting."""
+          
+          print("[DEBUG] Sending request to LLM...")
+          response = client.models.generate_content(
+              model=llm_model,
+              contents=[
+                  {"role": "user", "parts": [{"text": system_prompt}]},
+                  {"role": "model", "parts": [{"text": "I will analyze and return valid JSON only."}]},
+                  {"role": "user", "parts": [{"text": user_prompt}]}
+              ]
+          )
+          print("[DEBUG] Got response from LLM")
+          
+          if response.text:
+              print(f"[DEBUG] Response length: {len(response.text)}")
+              json_match = re.search(r'\{[\s\S]*\}', response.text)
+              if json_match:
+                  llm_json = json.loads(json_match.group())
+                  result["llm_enabled"] = True
+                  result["llm_business_context"] = llm_json.get("business_context", "")
+                  result["llm_tech_stack"] = llm_json.get("tech_stack", {})
+                  result["llm_architecture"] = llm_json.get("architecture", "")
+                  result["llm_health"] = llm_json.get("health", {})
+                  result["llm_zombie_risk"] = llm_json.get("zombie_risk", {})
+                  result["llm_raw_response"] = llm_json
+                  print(f"[OK] LLM repo analysis complete (model: {llm_model})")
+              else:
+                  print(f"[ERROR] No JSON found in response: {response.text[:200]}")
+                  result["error"] = "No JSON in LLM response"
+          else:
+              print("[ERROR] Empty response from LLM")
+              result["error"] = "Empty LLM response"
               
-              response = client.models.generate_content(
-                  model=llm_model,
-                  contents=[
-                      {"role": "user", "parts": [{"text": system_prompt}]},
-                      {"role": "model", "parts": [{"text": "I will analyze and return valid JSON only."}]},
-                      {"role": "user", "parts": [{"text": user_prompt}]}
-                  ]
-              )
-              
-              if response.text:
-                  json_match = re.search(r'\{[\s\S]*\}', response.text)
-                  if json_match:
-                      llm_json = json.loads(json_match.group())
-                      result["llm_enabled"] = True
-                      result["llm_business_context"] = llm_json.get("business_context", "")
-                      result["llm_tech_stack"] = llm_json.get("tech_stack", {})
-                      result["llm_architecture"] = llm_json.get("architecture", "")
-                      result["llm_health"] = llm_json.get("health", {})
-                      result["llm_zombie_risk"] = llm_json.get("zombie_risk", {})
-                      result["llm_raw_response"] = llm_json
-                      print(f"[OK] LLM repo analysis complete (model: {llm_model})")
-          except Exception as e:
-              error_msg = str(e)[:500]
-              result["error"] = error_msg
-              print(f"[ERROR] LLM analysis failed: {error_msg}")
-              
-              # FAIL the task - don't silently continue with NULL data
-              import sys
-              sys.exit(1)
+      except Exception as e:
+          import traceback
+          error_msg = str(e)[:500]
+          result["error"] = error_msg
+          print(f"[ERROR] LLM analysis failed: {error_msg}")
+          print(f"[ERROR] Full traceback:\n{traceback.format_exc()}")
+          sys.exit(1)
       
       # Only write output if we have valid LLM data
       if not result["llm_enabled"]:
           print(f"[ERROR] LLM analysis did not produce valid results")
           if result["error"]:
               print(f"[ERROR] Reason: {result['error']}")
-          import sys
           sys.exit(1)
       
       with open('llm_repo_analysis.json', 'w') as f:
@@ -556,12 +583,8 @@ tasks:
   - id: detect_dependencies
     type: io.kestra.plugin.scripts.python.Script
     description: |
-      Advanced dependency detection using multiple strategies:
-      1. Direct path matching (strings, template literals)
-      2. HTTP client patterns (fetch, axios, got, request, ky, ofetch)
-      3. Route-based detection (Next.js API routes, Express patterns)
-      4. Import/require analysis for internal modules
-      5. Function call tracking between candidates
+      Dependency detection using simple string matching to avoid Pebble template conflicts.
+      Scans codebase for references to discovered endpoints, functions, and queues.
     timeout: PT15M
     taskRunner:
       type: io.kestra.plugin.scripts.runner.docker.Docker
@@ -577,19 +600,15 @@ tasks:
       import re
       import json
       from pathlib import Path
-      
-      # Escape braces for Kestra Pebble template engine
-      OPEN_BRACE = "{"
-      CLOSE_BRACE = "}"
-      
+
       REPO_DIR = os.environ.get('REPO_DIR', '.')
-      
+
       with open('candidates_with_code.json', 'r') as f:
           candidates = json.load(f)
-      
+
       CODE_EXT = ('.py', '.js', '.ts', '.jsx', '.tsx', '.go', '.java', '.mjs', '.cjs')
       SKIP_DIRS = {'node_modules', 'venv', '.venv', '__pycache__', '.git', 'dist', 'build', '.next', 'coverage', '.turbo'}
-      
+
       # Read all code files
       all_files = {}
       for root, dirs, files in os.walk(REPO_DIR):
@@ -603,7 +622,7 @@ tasks:
                           all_files[rel_path] = f.read()
                   except:
                       pass
-      
+
       # Map files to candidates
       file_to_candidates = {}
       for c in candidates:
@@ -611,131 +630,26 @@ tasks:
           if fp not in file_to_candidates:
               file_to_candidates[fp] = []
           file_to_candidates[fp].append(c)
-      
+
       sig_to_id = {c['signature']: c['unique_id'] for c in candidates}
-      
+
       def build_http_patterns(path):
-          """Build comprehensive patterns for HTTP endpoint calls."""
           if not path or path == '/unknown':
               return []
-          
           patterns = []
-          
-          # Extract key path segments for flexible matching
-          # /api/currency/[country] -> ['api', 'currency']
-          segments = [s for s in path.split('/') if s and not s.startswith('[') and not s.startswith(':') and not s.startswith('{')]
-          
-          # Get the distinctive segment (usually the resource name like 'currency', 'animal', 'capital')
-          key_segment = segments[-1] if segments else ''
-          
-          # Get path without dynamic segments for exact matching
-          # /api/currency/[country] -> /api/currency
-          static_path = '/'.join([''] + [s for s in path.split('/') if s and not s.startswith('[') and not s.startswith(':') and not s.startswith('{')])
-          static_path_escaped = re.escape(static_path)
-          
-          print(f"  Building patterns for: {path}")
-          print(f"    key_segment: {key_segment}")
-          print(f"    static_path: {static_path}")
-          
-          # PATTERN GROUP 1: Match the key segment in any URL context (ALL LANGUAGES)
-          # This catches /api/currency, /currency, currency in URLs
+          path_parts = path.split('/')
+          static_segments = [p for p in path_parts if p and not p.startswith('[') and not p.startswith(':') and not p.startswith('{')]
+          key_segment = static_segments[-1] if static_segments else ''
+          static_parts = [''] + [p for p in path_parts if p and not p.startswith('[') and not p.startswith(':') and not p.startswith('{')]
+          static_path = '/'.join(static_parts)
           if key_segment and len(key_segment) > 2:
-              patterns.extend([
-                  # In JS/TS template literals: `.../${baseUrl}/api/currency/${country}...`
-                  rf'`[^`]*/{key_segment}[^`]*`',
-                  
-                  # In string literals (all languages) - match /key_segment anywhere
-                  rf'["\'][^"\']*/{key_segment}[^"\']*["\']',
-              ])
-          
-          # PATTERN GROUP 2: Match static path prefix (ALL LANGUAGES)
+              patterns.append('/' + key_segment)
           if static_path and static_path != '/':
-              patterns.extend([
-                  # JS/TS template literals
-                  rf'`[^`]*{static_path_escaped}[^`]*`',
-                  
-                  # Universal string literals (all languages)
-                  rf'["\'][^"\']*{static_path_escaped}[^"\']*["\']',
-                  
-                  # JavaScript/TypeScript: fetch/axios
-                  rf'fetch\s*\([^)]*{static_path_escaped}',
-                  rf'axios[.\w]*\([^)]*{static_path_escaped}',
-                  
-                  # Python: requests, httpx, aiohttp, urllib
-                  rf'requests\.\w+\s*\([^)]*{static_path_escaped}',
-                  rf'httpx\.\w+\s*\([^)]*{static_path_escaped}',
-                  rf'aiohttp\.\w+\s*\([^)]*{static_path_escaped}',
-                  rf'urlopen\s*\([^)]*{static_path_escaped}',
-                  rf'urllib\.\w+\.\w+\s*\([^)]*{static_path_escaped}',
-                  
-                  # Go: http.Get, http.Post, http.NewRequest
-                  rf'http\.\w+\s*\([^)]*{static_path_escaped}',
-                  rf'http\.NewRequest\s*\([^)]*{static_path_escaped}',
-                  
-                  # Java: HttpClient, RestTemplate, WebClient
-                  rf'HttpClient[^)]*{static_path_escaped}',
-                  rf'RestTemplate[^)]*{static_path_escaped}',
-                  rf'WebClient[^)]*{static_path_escaped}',
-                  rf'\.uri\s*\([^)]*{static_path_escaped}',
-                  rf'\.url\s*\([^)]*{static_path_escaped}',
-                  
-                  # Ruby: Net::HTTP, HTTParty, Faraday
-                  rf'Net::HTTP[^)]*{static_path_escaped}',
-                  rf'HTTParty\.\w+\s*\([^)]*{static_path_escaped}',
-                  rf'Faraday\.\w+\s*\([^)]*{static_path_escaped}',
-                  
-                  # PHP: curl, Guzzle, file_get_contents
-                  rf'curl_\w+\s*\([^)]*{static_path_escaped}',
-                  rf'Guzzle[^)]*{static_path_escaped}',
-                  rf'file_get_contents\s*\([^)]*{static_path_escaped}',
-                  
-                  # C#/.NET: HttpClient
-                  rf'HttpClient[^)]*{static_path_escaped}',
-                  rf'\.GetAsync\s*\([^)]*{static_path_escaped}',
-                  rf'\.PostAsync\s*\([^)]*{static_path_escaped}',
-              ])
-          
-          # PATTERN GROUP 3: API endpoint references in config objects
-          if key_segment:
-              patterns.extend([
-                  # { endpoint: '/api/currency' } or routes: { currency: '...' }
-                  rf'{key_segment}\s*[=:]\s*[`"\'][^`"\']*{static_path_escaped}' if static_path else None,
-                  
-                  # apiEndpoints.currency or routes['currency']
-                  rf'\.{key_segment}\b' if len(key_segment) > 3 else None,
-                  rf'\[[\'"]{key_segment}[\'"]\]',
-              ])
-          
-          # PATTERN GROUP 4: Internal API calls / String interpolation (multiple languages)
-          if static_path:
-              patterns.extend([
-                  # JS/TS: `${origin}/api/currency...`
-                  rf'\$\{{[^}}]*\}}{static_path_escaped}',
-                  # String concatenation: baseUrl + '/api/currency'
-                  rf'\+\s*[`"\'][^`"\']*{static_path_escaped}',
-                  # Python f-strings: f"{base_url}/api/currency"
-                  rf'\{{[^}}]*\}}{static_path_escaped}',
-                  # Python .format(): "{}/api/currency".format(...)
-                  rf'\.format\s*\([^)]*\)[^"\']*{static_path_escaped}',
-              ])
-          
-          # PATTERN GROUP 5: Route/path declarations (ALL LANGUAGES)
-          patterns.extend([
-              # path: '/api/currency' or route: '/api/currency'
-              rf'(?:path|route|url|endpoint|uri)\s*[=:]\s*[`"\'][^`"\']*{static_path_escaped}' if static_path else None,
-          ])
-          
-          # Filter out None patterns
-          valid_patterns = [p for p in patterns if p]
-          print(f"    Generated {len(valid_patterns)} patterns")
-          
-          return valid_patterns
-      
+              patterns.append(static_path)
+          return patterns
+
       def build_function_patterns(snippet, entity_name):
-          """Build patterns for function/method calls."""
           patterns = []
-          
-          # Extract function name from code snippet
           func_patterns = [
               r'(?:def|function|const|let|var|async function|async)\s+(\w+)',
               r'export\s+(?:default\s+)?(?:async\s+)?function\s+(\w+)',
@@ -743,80 +657,50 @@ tasks:
               r'module\.exports\s*=\s*(?:async\s+)?function\s+(\w+)',
               r'class\s+(\w+)',
           ]
-          
           func_names = set()
           for fp in func_patterns:
               for match in re.finditer(fp, snippet):
                   func_names.add(match.group(1))
-          
-          # Also use entity_name if it looks like a function name
           if entity_name and re.match(r'^[a-zA-Z_]\w*$', entity_name):
               func_names.add(entity_name)
-          
           for func_name in func_names:
-              if len(func_name) > 2:  # Skip very short names
-                  patterns.extend([
-                      rf'\b{func_name}\s*\(',           # Direct call
-                      rf'\.{func_name}\s*\(',           # Method call
-                      rf'await\s+{func_name}\s*\(',     # Async call
-                      rf'{func_name}\s*\.\s*call\s*\(', # .call()
-                      rf'{func_name}\s*\.\s*apply\s*\(', # .apply()
-                  ])
-          
+              if len(func_name) > 2:
+                  patterns.append(func_name)
           return patterns
-      
+
       def build_queue_patterns(queue_name):
-          """Build patterns for queue/message calls."""
           if not queue_name:
               return []
-          
-          queue_escaped = re.escape(queue_name)
-          patterns = [
-              rf'["\']({queue_escaped})["\']',
-              rf'queue\s*\(\s*["\']({queue_escaped})["\']',
-              rf'publish\s*\(\s*["\']({queue_escaped})["\']',
-              rf'send\s*\(\s*["\']({queue_escaped})["\']',
-              rf'emit\s*\(\s*["\']({queue_escaped})["\']',
-              rf'dispatch\s*\(\s*["\']({queue_escaped})["\']',
-              rf'channel\s*\.\s*\w+\s*\(\s*["\']({queue_escaped})["\']',
-              rf'producer\s*\.\s*\w+\s*\(\s*["\']({queue_escaped})["\']',
-          ]
-          return patterns
-      
+          return [queue_name]
+
       # Build patterns for each candidate
       sig_to_patterns = {}
       for candidate in candidates:
           sig = candidate['signature']
           entity_type = candidate['entity_type']
           patterns = []
-          
           if entity_type == 'http_endpoint':
               entity_data = candidate.get('entity_data', {})
               path = entity_data.get('path', '')
               patterns.extend(build_http_patterns(path))
-          
           elif entity_type in ('cron_job', 'serverless_function', 'scheduled_task'):
               snippet = candidate.get('code_snippet', '')
               entity_name = candidate.get('entity_name', '')
               patterns.extend(build_function_patterns(snippet, entity_name))
-          
           elif entity_type in ('queue_worker', 'message_handler', 'event_handler'):
               entity_data = candidate.get('entity_data', {})
               queue_name = entity_data.get('queue_name', '') or entity_data.get('event_name', '')
               patterns.extend(build_queue_patterns(queue_name))
-              # Also add function patterns for the handler
               snippet = candidate.get('code_snippet', '')
               entity_name = candidate.get('entity_name', '')
               patterns.extend(build_function_patterns(snippet, entity_name))
-          
           elif entity_type in ('grpc_service', 'graphql_resolver', 'websocket_handler'):
               snippet = candidate.get('code_snippet', '')
               entity_name = candidate.get('entity_name', '')
               patterns.extend(build_function_patterns(snippet, entity_name))
-          
           if patterns:
               sig_to_patterns[sig] = patterns
-      
+
       # Initialize dependency tracking
       dependencies = {}
       for candidate in candidates:
@@ -833,104 +717,60 @@ tasks:
               "dependency_count": 0,
               "is_potentially_unused": True
           }
-      
-      # Scan all files for dependency relationships
+
+      # Scan files using simple string matching
       print(f"\nScanning {len(all_files)} files for dependencies...")
-      print(f"Looking for patterns in {len(sig_to_patterns)} candidates")
-      
       matches_found = 0
       for rel_path, content in all_files.items():
           candidates_in_file = file_to_candidates.get(rel_path, [])
           candidate_sigs_in_file = {c['signature'] for c in candidates_in_file}
-          
           for target_sig, patterns in sig_to_patterns.items():
-              # Skip self-references (don't look for calls to an endpoint IN the same file that defines it)
               if target_sig in candidate_sigs_in_file:
                   continue
-              
               for pattern in patterns:
-                  try:
-                      for match in re.finditer(pattern, content, re.IGNORECASE | re.MULTILINE):
-                          matches_found += 1
-                          line_num = content[:match.start()].count('\n') + 1
-                          lines = content.split('\n')
-                          start = max(0, line_num - 2)
-                          end = min(len(lines), line_num + 2)
-                          context = '\n'.join(lines[start:end])
-                          
-                          print(f"  MATCH FOUND: {target_sig}")
-                          print(f"    File: {rel_path}:{line_num}")
-                          print(f"    Pattern: {pattern[:60]}...")
-                          print(f"    Match: {match.group(0)[:80]}")
-                          
-                          caller_info = {
-                              "file": rel_path,
-                              "line": line_num,
-                              "match": match.group(0)[:100],
-                              "context": context[:300],
-                              "pattern_matched": pattern[:50]
-                          }
-                          
-                          # Add to target's callers
-                          existing_callers = [f"{c['file']}:{c['line']}" for c in dependencies[target_sig]["callers"]]
-                          caller_key = f"{rel_path}:{line_num}"
-                          if caller_key not in existing_callers:
-                              dependencies[target_sig]["callers"].append(caller_info)
-                          
-                          # Link to calling candidate if in same file
-                          for caller_candidate in candidates_in_file:
-                              caller_line = caller_candidate.get('line', 0)
-                              # Expand range to 100 lines for better matching in larger files
-                              if abs(line_num - caller_line) < 100:
-                                  caller_sig = caller_candidate['signature']
-                                  if target_sig not in dependencies[caller_sig]["depends_on_signatures"]:
-                                      dependencies[caller_sig]["depends_on_signatures"].append(target_sig)
-                                  if caller_sig not in dependencies[target_sig]["called_by_signatures"]:
-                                      dependencies[target_sig]["called_by_signatures"].append(caller_sig)
-                  except re.error as e:
-                      print(f"  REGEX ERROR: {pattern[:50]}... -> {e}")
-      
-      print(f"\nTotal matches found: {matches_found}")
-      
+                  if pattern in content:
+                      matches_found += 1
+                      line_num = content[:content.find(pattern)].count('\n') + 1
+                      caller_info = {
+                          "file": rel_path,
+                          "line": line_num,
+                          "match": pattern,
+                          "context": "",
+                          "pattern_matched": pattern
+                      }
+                      existing_callers = [f"{c['file']}:{c['line']}" for c in dependencies[target_sig]["callers"]]
+                      caller_key = f"{rel_path}:{line_num}"
+                      if caller_key not in existing_callers:
+                          dependencies[target_sig]["callers"].append(caller_info)
+                      for caller_candidate in candidates_in_file:
+                          caller_line = caller_candidate.get('line', 0)
+                          if abs(line_num - caller_line) < 100:
+                              caller_sig = caller_candidate['signature']
+                              if target_sig not in dependencies[caller_sig]["depends_on_signatures"]:
+                                  dependencies[caller_sig]["depends_on_signatures"].append(target_sig)
+                              if caller_sig not in dependencies[target_sig]["called_by_signatures"]:
+                                  dependencies[target_sig]["called_by_signatures"].append(caller_sig)
+
       # Finalize counts
       for sig in dependencies:
           dependencies[sig]["caller_count"] = len(dependencies[sig]["callers"])
           dependencies[sig]["dependency_count"] = len(dependencies[sig]["depends_on_signatures"])
           dependencies[sig]["callers"] = dependencies[sig]["callers"][:20]
           dependencies[sig]["is_potentially_unused"] = dependencies[sig]["caller_count"] == 0
-      
+
       with open('dependencies.json', 'w') as f:
           json.dump(dependencies, f, indent=2)
-      
-      # Print detailed summary
+
+      # Print summary
       deps_found = sum(1 for d in dependencies.values() if d['dependency_count'] > 0)
       callers_found = sum(1 for d in dependencies.values() if d['caller_count'] > 0)
       unused = sum(1 for d in dependencies.values() if d['is_potentially_unused'])
-      
-      print(f"\n{'='*60}")
-      print(f"DEPENDENCY ANALYSIS COMPLETE")
-      print(f"{'='*60}")
-      print(f"Total candidates analyzed: {len(dependencies)}")
-      print(f"Candidates with dependencies (call others): {deps_found}")
-      print(f"Candidates with callers (called by others): {callers_found}")
-      print(f"Potentially unused (no callers): {unused}")
-      print(f"{'='*60}")
-      
-      # Show specific relationships found
-      if deps_found > 0:
-          print(f"\nDependency relationships found:")
-          for sig, data in dependencies.items():
-              if data['dependency_count'] > 0:
-                  print(f"  {sig}")
-                  print(f"    -> depends on: {data['depends_on_signatures']}")
-      
-      if callers_found > 0:
-          print(f"\nCaller relationships found:")
-          for sig, data in dependencies.items():
-              if data['caller_count'] > 0:
-                  print(f"  {sig}")
-                  print(f"    <- called by: {data['called_by_signatures'][:5]}")
-                  print(f"    <- from files: {[c['file'] for c in data['callers'][:3]]}")
+      print(f"\nDEPENDENCY ANALYSIS COMPLETE")
+      print(f"Total candidates: {len(dependencies)}")
+      print(f"With dependencies: {deps_found}")
+      print(f"With callers: {callers_found}")
+      print(f"Potentially unused: {unused}")
+      print(f"Total matches found: {matches_found}")
 
   # ============================================================================
   # STAGE 4: Per-Candidate LLM Analysis
@@ -1215,11 +1055,49 @@ tasks:
       conn = psycopg2.connect(db_url, sslmode='require')
       cur = conn.cursor()
       
+      # Parse observability URLs and extract userId from Grafana tokens
       obs_urls = os.environ.get('OBSERVABILITY_URLS', '[]')
       try:
           obs_urls = json.loads(obs_urls) if obs_urls else []
       except:
           obs_urls = []
+      
+      # Function to extract userId from Grafana Cloud tokens
+      def extract_grafana_user_id(token):
+          """
+          Grafana Cloud tokens (glc_*) contain base64-encoded JSON with userId.
+          Format: glc_<base64({"o": "userId", "n": "name", "k": "key", "m": {...}})>
+          The 'o' field is the organization/user ID needed for Basic Auth.
+          """
+          import base64
+          if not token or not isinstance(token, str):
+              return None
+          if not (token.startswith('glc_') or token.startswith('glsa_')):
+              return None
+          try:
+              # Remove prefix and decode
+              token_data = token[4:] if token.startswith('glc_') else token[5:]
+              decoded = base64.b64decode(token_data).decode('utf-8')
+              data = json.loads(decoded)
+              return str(data.get('o', ''))
+          except:
+              return None
+      
+      # Enrich observability sources with extracted userId
+      enriched_obs_urls = []
+      for source in obs_urls:
+          if isinstance(source, dict):
+              token = source.get('token', '')
+              # Extract userId from token if not already provided
+              if token and not source.get('userId'):
+                  extracted_id = extract_grafana_user_id(token)
+                  if extracted_id:
+                      source['userId'] = extracted_id
+                      print(f"[W1] Extracted userId {extracted_id} from {source.get('type', 'unknown')} token")
+              enriched_obs_urls.append(source)
+          elif isinstance(source, str):
+              enriched_obs_urls.append(source)
+      obs_urls = enriched_obs_urls
       
       last_date = metadata.get('last_commit_date', '').strip()
       if last_date:
@@ -1509,8 +1387,8 @@ tasks:
     env:
       GITHUB_TOKEN: "{{ inputs.github_token ?? '' }}"
       REPO_URL: "{{ inputs.repo_url }}"
-      KESTRA_URL: "{{ secret('KESTRA_URL') ?? 'http://100.27.208.37:8080' }}"
-      WEBHOOK_SECRET: "{{ secret('GITHUB_WEBHOOK_SECRET') ?? '' }}"
+      KESTRA_URL: "http://100.27.208.37:8080"
+      WEBHOOK_SECRET: ""
     outputFiles:
       - webhook_result.json
     script: |

@@ -39,10 +39,3 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
-
-./logo/
-./web/pgsql_ca.pem
-./kestra_workflows/w1_test_input.json
-./kestra_workflows/w1_flow_diagram.md
-./kestra_workflows/docker-compose.yml
-./web/scripts/
