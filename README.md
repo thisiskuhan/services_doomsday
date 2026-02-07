@@ -520,13 +520,6 @@ Watch the magic happen! 🧟💀
 
 ---
 
-## Blog Posts
-
-- [**Finally, I Finished My First Hackathon**](#) *(Coming Soon)*
-- [**Building an AI Zombie Service Hunter with Kestra**](#) *(Coming Soon)*
-
----
-
 ## License
 
 This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
@@ -553,7 +546,7 @@ This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) 
 
 <div align="center">
 
-**Made with ❤️ by Kuhan**
+**Built by Kuhan & Claude.**
 
 *Still in development, but if this project helped you clean up your codebase, give it a ⭐!*
 
